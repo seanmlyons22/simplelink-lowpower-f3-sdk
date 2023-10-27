@@ -163,48 +163,48 @@ ti_export_package()
 #
 # Targets for TrustZone support
 #
-ti_init_package(NAMESPACE TrustZone)
+# ti_init_package(NAMESPACE TrustZone)
 
-ti_add_library(tfm_dependencies_cc26x4 INTERFACE ARCH all)
+# ti_add_library(tfm_dependencies_cc26x4 INTERFACE ARCH all)
 
-# This must appear ahead of the TFM includes to find the correct sid.h
-target_include_directories(tfm_dependencies_cc26x4 BEFORE INTERFACE ${CMAKE_SOURCE_DIR}/tfm_s/cc26x4/build_dependencies)
+# # This must appear ahead of the TFM includes to find the correct sid.h
+# target_include_directories(tfm_dependencies_cc26x4 BEFORE INTERFACE ${CMAKE_SOURCE_DIR}/tfm_s/cc26x4/build_dependencies)
 
-if(TI_INTERNAL_BUILD)
-    target_include_directories(
-        tfm_dependencies_cc26x4
-        INTERFACE ${TFM_INSTALL_DIR}/source/ ${TFM_INSTALL_DIR}/source/third_party/tfm/interface/include
-                  ${MBEDCRYPTO_INSTALL_DIR}/source ${MBEDCRYPTO_INSTALL_DIR}/source/third_party/mbedcrypto/include
-                  ${MBEDCRYPTO_INSTALL_DIR}/source/third_party/mbedcrypto/ti
-    )
-else()
-    target_include_directories(
-        tfm_dependencies_cc26x4
-        INTERFACE ${CMAKE_SOURCE_DIR}/source/ ${CMAKE_SOURCE_DIR}/source/third_party/tfm/interface/include
-                  ${CMAKE_SOURCE_DIR}/source/third_party/mbedcrypto/include
-                  ${CMAKE_SOURCE_DIR}/source/third_party/mbedcrypto/ti
-    )
-endif()
+# if(TI_INTERNAL_BUILD)
+#     target_include_directories(
+#         tfm_dependencies_cc26x4
+#         INTERFACE ${TFM_INSTALL_DIR}/source/ ${TFM_INSTALL_DIR}/source/third_party/tfm/interface/include
+#                   ${MBEDCRYPTO_INSTALL_DIR}/source ${MBEDCRYPTO_INSTALL_DIR}/source/third_party/mbedcrypto/include
+#                   ${MBEDCRYPTO_INSTALL_DIR}/source/third_party/mbedcrypto/ti
+#     )
+# else()
+#     target_include_directories(
+#         tfm_dependencies_cc26x4
+#         INTERFACE ${CMAKE_SOURCE_DIR}/source/ ${CMAKE_SOURCE_DIR}/source/third_party/tfm/interface/include
+#                   ${CMAKE_SOURCE_DIR}/source/third_party/mbedcrypto/include
+#                   ${CMAKE_SOURCE_DIR}/source/third_party/mbedcrypto/ti
+#     )
+# endif()
 
-ti_add_library(tfm_dependencies_cc27xx INTERFACE ARCH all)
+# ti_add_library(tfm_dependencies_cc27xx INTERFACE ARCH all)
 
-# This must appear ahead of the TFM includes to find the correct sid.h
-target_include_directories(tfm_dependencies_cc27xx BEFORE INTERFACE ${CMAKE_SOURCE_DIR}/tfm_s/cc27xx/build_dependencies)
+# # This must appear ahead of the TFM includes to find the correct sid.h
+# target_include_directories(tfm_dependencies_cc27xx BEFORE INTERFACE ${CMAKE_SOURCE_DIR}/tfm_s/cc27xx/build_dependencies)
 
-if(TI_INTERNAL_BUILD)
-    target_include_directories(
-        tfm_dependencies_cc27xx
-        INTERFACE ${TFM_INSTALL_DIR}/source/ ${TFM_INSTALL_DIR}/source/third_party/tfm/interface/include
-                  ${MBEDCRYPTO_INSTALL_DIR}/source ${MBEDCRYPTO_INSTALL_DIR}/source/third_party/mbedcrypto/include
-                  ${MBEDCRYPTO_INSTALL_DIR}/source/third_party/mbedcrypto/ti
-    )
-else()
-    target_include_directories(
-        tfm_dependencies_cc27xx
-        INTERFACE ${CMAKE_SOURCE_DIR}/source/ ${CMAKE_SOURCE_DIR}/source/third_party/tfm/interface/include
-                  ${CMAKE_SOURCE_DIR}/source/third_party/mbedcrypto/include
-                  ${CMAKE_SOURCE_DIR}/source/third_party/mbedcrypto/ti
-    )
-endif()
+# if(TI_INTERNAL_BUILD)
+#     target_include_directories(
+#         tfm_dependencies_cc27xx
+#         INTERFACE ${TFM_INSTALL_DIR}/source/ ${TFM_INSTALL_DIR}/source/third_party/tfm/interface/include
+#                   ${MBEDCRYPTO_INSTALL_DIR}/source ${MBEDCRYPTO_INSTALL_DIR}/source/third_party/mbedcrypto/include
+#                   ${MBEDCRYPTO_INSTALL_DIR}/source/third_party/mbedcrypto/ti
+#     )
+# else()
+#     target_include_directories(
+#         tfm_dependencies_cc27xx
+#         INTERFACE ${CMAKE_SOURCE_DIR}/source/ ${CMAKE_SOURCE_DIR}/source/third_party/tfm/interface/include
+#                   ${CMAKE_SOURCE_DIR}/source/third_party/mbedcrypto/include
+#                   ${CMAKE_SOURCE_DIR}/source/third_party/mbedcrypto/ti
+#     )
+# endif()
 
-ti_export_package()
+# ti_export_package()

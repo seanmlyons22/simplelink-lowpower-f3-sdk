@@ -23,6 +23,12 @@ xcuserdata/
 *.xcworkspace/*
 TAGS
 
+# Cmake build folder
+build/
+
+# Exclude build folders
+**/lib
+
 # Text editors
 .*.sw[a-z]
 

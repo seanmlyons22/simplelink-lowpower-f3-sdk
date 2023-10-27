@@ -31,7 +31,6 @@ endmacro()
 ####################################################################################
 
 find_package("Driverlib" REQUIRED)
-find_package("DriverlibCC23X0R2" REQUIRED)
 find_package("DriverlibCC23X0R5" REQUIRED)
 
 include("${CMAKE_CURRENT_LIST_DIR}/NoRtosM0PTargets.cmake")

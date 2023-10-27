@@ -936,7 +936,7 @@ static RCL_CommandStatus RCL_Handler_BLE_CS_findPbeErrorEndStatus(uint16_t pbeEn
         status = RCL_CommandStatus_Error_UnknownOp;
         break;
     default:
-        Log(RclCore, Log_ERROR, "Unexpected error 0x%04X from PBE", pbeEndStatus);
+        Log_printf(RclCore, Log_ERROR, "Unexpected error 0x%04X from PBE", pbeEndStatus);
         status = RCL_CommandStatus_Error;
         break;
     }
@@ -964,7 +964,7 @@ RCL_Events RCL_Handler_BLE_CS(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Events
         if ((plldiv0 != 3U) && (plldiv0 != 12U))
         {
             /* Override to use PLLDIV0=12, gives FREF0=4MHz */
-            Log(RclCore, Log_WARN, "Unsupported RFE_PRE0_PLLDIV0 synth setting detected. Will override to use 12 (FREF=4MHz)");
+            Log_printf(RclCore, Log_WARN, "Unsupported RFE_PRE0_PLLDIV0 synth setting detected. Will override to use 12 (FREF=4MHz)");
             S_RFE_PRE0 = ((12U << RFE_PRE0_PLLDIV0) & RFE_PRE0_PLLDIV0_BM) |
                         ((12U << RFE_PRE0_PLLDIV1) & RFE_PRE0_PLLDIV1_BM);
         }
@@ -1018,7 +1018,7 @@ RCL_Events RCL_Handler_BLE_CS(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Events
              /* Forward fill more steps */
              RCL_Handler_BLE_CS_fillTxBuffer(pCmd);
 
-             //Log(RclCore, Log_INFO5, "Starting BLE CS");
+             //Log_printf(RclCore, Log_INFO5, "Starting BLE CS");
          }
      }
 

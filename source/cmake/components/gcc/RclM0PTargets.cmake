@@ -19,7 +19,7 @@ set(CMAKE_IMPORT_FILE_VERSION 1)
 set(_cmake_targets_defined "")
 set(_cmake_targets_not_defined "")
 set(_cmake_expected_targets "")
-foreach(_cmake_expected_target IN ITEMS Drivers::display_cc23x0r5)
+foreach(_cmake_expected_target IN ITEMS Rcl::rcl_cc23x0r5)
   list(APPEND _cmake_expected_targets "${_cmake_expected_target}")
   if(TARGET "${_cmake_expected_target}")
     list(APPEND _cmake_targets_defined "${_cmake_expected_target}")
@@ -56,12 +56,12 @@ if(_IMPORT_PREFIX STREQUAL "/")
   set(_IMPORT_PREFIX "")
 endif()
 
-# Create imported target Drivers::display_cc23x0r5
-add_library(Drivers::display_cc23x0r5 STATIC IMPORTED)
+# Create imported target Rcl::rcl_cc23x0r5
+add_library(Rcl::rcl_cc23x0r5 STATIC IMPORTED)
 
-set_target_properties(Drivers::display_cc23x0r5 PROPERTIES
+set_target_properties(Rcl::rcl_cc23x0r5 PROPERTIES
   INTERFACE_INCLUDE_DIRECTORIES "${_IMPORT_PREFIX}/source"
-  INTERFACE_LINK_LIBRARIES "Driverlib::cc23x0r5;grlib_m0p;TOOLCHAIN_gcc_m0p"
+  INTERFACE_LINK_LIBRARIES "Driverlib::cc23x0r5;TOOLCHAIN_gcc_m0p"
 )
 
 if(CMAKE_VERSION VERSION_LESS 2.8.12)
@@ -69,7 +69,7 @@ if(CMAKE_VERSION VERSION_LESS 2.8.12)
 endif()
 
 # Load information for each installed configuration.
-file(GLOB _cmake_config_files "${CMAKE_CURRENT_LIST_DIR}/DriversDisplayM0PTargets-*.cmake")
+file(GLOB _cmake_config_files "${CMAKE_CURRENT_LIST_DIR}/RclM0PTargets-*.cmake")
 foreach(_cmake_config_file IN LISTS _cmake_config_files)
   include("${_cmake_config_file}")
 endforeach()

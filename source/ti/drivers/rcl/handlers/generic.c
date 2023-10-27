@@ -169,7 +169,7 @@ RCL_Events RCL_Handler_Generic_Fs(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Ev
             S_DBELL_IMASK0 |= LRF_EventOpDone.value | LRF_EventOpError.value;
 
             /* Post cmd */
-            Log(RclCore, Log_INFO5, "Starting FS");
+            Log_printf(RclCore, Log_INFO5, "Starting FS");
             LRF_waitForTopsmReady();
             S_PBE_API = PBE_GENERIC_REGDEF_API_OP_FS;
         }
@@ -250,7 +250,7 @@ RCL_Events RCL_Handler_Generic_FsOff(RCL_Command *cmd, LRF_Events lrfEvents, RCL
             S_DBELL_IMASK0 |= LRF_EventOpDone.value | LRF_EventOpError.value;
 
             /* Post cmd */
-            Log(RclCore, Log_INFO5, "Turning off FS");
+            Log_printf(RclCore, Log_INFO5, "Turning off FS");
             LRF_waitForTopsmReady();
             S_PBE_API = PBE_GENERIC_REGDEF_API_OP_STOPFS;
         }
@@ -374,7 +374,7 @@ RCL_Events RCL_Handler_Generic_Tx(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Ev
                     S_DBELL_IMASK0 |= LRF_EventOpDone.value | LRF_EventOpError.value;
 
                     /* Post cmd */
-                    Log(RclCore, Log_INFO5, "Starting TX");
+                    Log_printf(RclCore, Log_INFO5, "Starting TX");
                     LRF_waitForTopsmReady();
                     RCL_Profiling_eventHook(RCL_ProfilingEvent_PreprocStop);
                     S_PBE_API = PBE_GENERIC_REGDEF_API_OP_TX;
@@ -673,7 +673,7 @@ RCL_Events RCL_Handler_Generic_TxRepeat(RCL_Command *cmd, LRF_Events lrfEvents, 
             S_DBELL_IMASK0 |= LRF_EventOpDone.value | LRF_EventOpError.value;
 
             /* Post cmd */
-            Log(RclCore, Log_INFO5, "Starting TX");
+            Log_printf(RclCore, Log_INFO5, "Starting TX");
 
             LRF_waitForTopsmReady();
             S_PBE_API = PBE_GENERIC_REGDEF_API_OP_TX;
@@ -808,7 +808,7 @@ RCL_Events RCL_Handler_Generic_TxTest(RCL_Command *cmd, LRF_Events lrfEvents, RC
                 S_DBELL_IMASK0 |= LRF_EventOpDone.value | LRF_EventOpError.value;
 
                 /* Post cmd */
-                Log(RclCore, Log_INFO5, "Starting infinite TX");
+                Log_printf(RclCore, Log_INFO5, "Starting infinite TX");
 
                 LRF_waitForTopsmReady();
                 S_PBE_API = PBE_GENERIC_REGDEF_API_OP_TX;
@@ -997,7 +997,7 @@ RCL_Events RCL_Handler_Generic_Rx(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Ev
                                                                            fifoCfg);
 
                 /* Post cmd */
-                Log(RclCore, Log_INFO5, "Starting Rx");
+                Log_printf(RclCore, Log_INFO5, "Starting Rx");
                 LRF_waitForTopsmReady();
                 RCL_Profiling_eventHook(RCL_ProfilingEvent_PreprocStop);
                 S_PBE_API = PBE_GENERIC_REGDEF_API_OP_RX;
@@ -1395,13 +1395,13 @@ RCL_Events RCL_Handler_Nesb_Ptx(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Even
                 /* Attempt to retransmit the packet */
                 if (genericHandlerState.tx.txCount <= txCmd->maxRetrans)
                 {
-                    Log(RclCore, Log_INFO5, "PTX needs to retransmit");
+                    Log_printf(RclCore, Log_INFO5, "PTX needs to retransmit");
 
                     /* Set a new transmit time according to retransDelay. If unattainable, retransmit as soon as possible */
                     RCL_CommandStatus startTimeStatus = RCL_Scheduler_setNewStartRelTime(txCmd->retransDelay);
                     if (startTimeStatus >= RCL_CommandStatus_Finished)
                     {
-                        Log(RclCore, Log_INFO5, "Unattainable retranmission delay. Retransmitting as soon as possible");
+                        Log_printf(RclCore, Log_INFO5, "Unattainable retranmission delay. Retransmitting as soon as possible");
                         RCL_Scheduler_setNewStartNow();
                     }
                     runTx = true;
@@ -1460,7 +1460,7 @@ RCL_Events RCL_Handler_Nesb_Ptx(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Even
                 S_DBELL_IMASK0 |= LRF_EventOpDone.value | LRF_EventOpError.value;
             }
             /* Post cmd */
-            Log(RclCore, Log_INFO5, "Start of PTX operation");
+            Log_printf(RclCore, Log_INFO5, "Start of PTX operation");
             LRF_waitForTopsmReady();
             RCL_Profiling_eventHook(RCL_ProfilingEvent_PreprocStop);
             S_PBE_API = PBE_GENERIC_REGDEF_API_OP_TX;
@@ -1649,7 +1649,7 @@ RCL_Events RCL_Handler_Nesb_Prx(RCL_Command *cmd, LRF_Events lrfEvents,  RCL_Eve
                                                                            LRF_EventRxIgnored.value,
                                                                            fifoCfg);
                 /* Post cmd */
-                Log(RclCore, Log_INFO5, "Starting of PRX operation");
+                Log_printf(RclCore, Log_INFO5, "Starting of PRX operation");
                 LRF_waitForTopsmReady();
                 RCL_Profiling_eventHook(RCL_ProfilingEvent_PreprocStop);
                 S_PBE_API = PBE_GENERIC_REGDEF_API_OP_RX;
@@ -1847,7 +1847,7 @@ static RCL_CommandStatus RCL_Handler_Generic_findPbeErrorEndStatus(uint16_t pbeE
         status = RCL_CommandStatus_Error_UnknownOp;
         break;
     default:
-        Log(RclCore, Log_ERROR, "Unexpected error 0x%04X from PBE", pbeEndStatus);
+        Log_printf(RclCore, Log_ERROR, "Unexpected error 0x%04X from PBE", pbeEndStatus);
         status = RCL_CommandStatus_Error;
         break;
     }

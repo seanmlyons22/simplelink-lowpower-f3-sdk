@@ -12,8 +12,8 @@ set_target_properties(NoRtos::nortos_cc23x0r5 PROPERTIES
   IMPORTED_LOCATION_RELEASE "${_IMPORT_PREFIX}/kernel/nortos/lib/gcc/m0p/nortos_cc23x0r5.a"
   )
 
-list(APPEND _IMPORT_CHECK_TARGETS NoRtos::nortos_cc23x0r5 )
-list(APPEND _IMPORT_CHECK_FILES_FOR_NoRtos::nortos_cc23x0r5 "${_IMPORT_PREFIX}/kernel/nortos/lib/gcc/m0p/nortos_cc23x0r5.a" )
+list(APPEND _cmake_import_check_targets NoRtos::nortos_cc23x0r5 )
+list(APPEND _cmake_import_check_files_for_NoRtos::nortos_cc23x0r5 "${_IMPORT_PREFIX}/kernel/nortos/lib/gcc/m0p/nortos_cc23x0r5.a" )
 
 # Commands beyond this point should not need to know the version.
 set(CMAKE_IMPORT_FILE_VERSION)

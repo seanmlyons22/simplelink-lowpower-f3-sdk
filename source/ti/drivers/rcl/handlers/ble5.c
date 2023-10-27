@@ -723,7 +723,7 @@ RCL_Events RCL_Handler_BLE5_adv(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Even
                     }
 
                     /* Post cmd */
-                    Log(RclCore, Log_INFO5, "Starting advertiser on channel %1d", curChannel);
+                    Log_printf(RclCore, Log_INFO5, "Starting advertiser on channel %1d", curChannel);
 
                     LRF_waitForTopsmReady();
                     RCL_Profiling_eventHook(RCL_ProfilingEvent_PreprocStop);
@@ -1029,7 +1029,7 @@ RCL_Events RCL_Handler_BLE5_scan_init(RCL_Command *cmd, LRF_Events lrfEvents, RC
 
                     if (ble5HandlerState.scanInit.initiator)
                     {
-                        Log(RclCore, Log_INFO5, "Starting initiator");
+                        Log_printf(RclCore, Log_INFO5, "Starting initiator");
                         LRF_waitForTopsmReady();
                         RCL_Profiling_eventHook(RCL_ProfilingEvent_PreprocStop);
                         /* Post cmd */
@@ -1048,7 +1048,7 @@ RCL_Events RCL_Handler_BLE5_scan_init(RCL_Command *cmd, LRF_Events lrfEvents, RC
                     }
                     else
                     {
-                        Log(RclCore, Log_INFO5, "Starting scanner");
+                        Log_printf(RclCore, Log_INFO5, "Starting scanner");
                         LRF_waitForTopsmReady();
                         RCL_Profiling_eventHook(RCL_ProfilingEvent_PreprocStop);
                         /* Post cmd */
@@ -1194,7 +1194,7 @@ RCL_Events RCL_Handler_BLE5_scan_init(RCL_Command *cmd, LRF_Events lrfEvents, RC
                 {
                     if (!(rclSchedulerState.hardStopInfo.apiStopEnabled || rclSchedulerState.gracefulStopInfo.apiStopEnabled))
                     {
-                        Log(RclCore, Log_INFO5, "Restarting scanner");
+                        Log_printf(RclCore, Log_INFO5, "Restarting scanner");
                         /* Reset TXFIFO - needed due to LPRF_PHY-511 */
                         S_PBE_FCMD = PBE_FCMD_DATA_TXFIFO_RESET;
                         /* Post cmd */
@@ -1232,7 +1232,7 @@ RCL_Events RCL_Handler_BLE5_scan_init(RCL_Command *cmd, LRF_Events lrfEvents, RC
                     {
                         transmitWindowOffset = ble5HandlerState.scanInit.transmitWindowOffset;
                     }
-                    Log(RclCore, Log_INFO5, "Connection formed, transmit window offset %1d", transmitWindowOffset);
+                    Log_printf(RclCore, Log_INFO5, "Connection formed, transmit window offset %1d", transmitWindowOffset);
                     uint32_t referenceTime = eventTime +
                         RCL_Handler_BLE5_findPacketDuration(ble5HandlerState.scanInit.advPktLen, ble5HandlerState.common.phyFeatures) +
                         BLE_T_IFS + RCL_Handler_BLE5_findPacketDuration(BLE_CONNECT_MSG_LEN, ble5HandlerState.common.phyFeatures) +
@@ -1244,12 +1244,12 @@ RCL_Events RCL_Handler_BLE5_scan_init(RCL_Command *cmd, LRF_Events lrfEvents, RC
                         /* Check that the connect time is within the bounds expected; if not (due to timer drift), report a different connect time */
                         if (connectTime > referenceTime + 2 * BLE_CONNECT_INT_UNIT)
                         {
-                            Log(RclCore, Log_WARN, "Transmitted window offset did not match requested transmit time. Reporting a different connect time");
+                            Log_printf(RclCore, Log_WARN, "Transmitted window offset did not match requested transmit time. Reporting a different connect time");
                             connectTime = referenceTime + BLE_CONNECT_INT_UNIT/2;
                         }
                         else
                         {
-                            Log(RclCore, Log_INFO1, "Margins: %1d us and %1d us", (connectTime - referenceTime + 2)/4, (referenceTime + 2 * BLE_CONNECT_INT_UNIT - connectTime + 2)/4);
+                            Log_printf(RclCore, Log_INFO1, "Margins: %1d us and %1d us", (connectTime - referenceTime + 2)/4, (referenceTime + 2 * BLE_CONNECT_INT_UNIT - connectTime + 2)/4);
                         }
                     }
                     else
@@ -1448,7 +1448,7 @@ RCL_Events RCL_Handler_BLE5_conn(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Eve
                         /* Set timeout */
                         S_PBE_BLE5_RAM_FIRSTRXTIMEOUT = relRxTimeoutTime;
 
-                        Log(RclCore, Log_INFO5, "Starting peripheral");
+                        Log_printf(RclCore, Log_INFO5, "Starting peripheral");
                         LRF_waitForTopsmReady();
                         RCL_Profiling_eventHook(RCL_ProfilingEvent_PreprocStop);
                         /* Post cmd */
@@ -1457,7 +1457,7 @@ RCL_Events RCL_Handler_BLE5_conn(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Eve
                 }
                 else
                 {
-                    Log(RclCore, Log_INFO5, "Starting central");
+                    Log_printf(RclCore, Log_INFO5, "Starting central");
                     LRF_waitForTopsmReady();
                     RCL_Profiling_eventHook(RCL_ProfilingEvent_PreprocStop);
                     /* Post cmd */
@@ -1848,7 +1848,7 @@ RCL_Events RCL_Handler_BLE5_dtmTx(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Ev
                         uint16_t whitenInit = RCL_Handler_BLE5_findWhitenInit(channel);
                         S_PBE32_MDMSYNCA = DTM_ACCESS_ADDRESS ^ (whitenInit << 24);
                     }
-                    Log(RclCore, Log_INFO5, "Starting DTM TX");
+                    Log_printf(RclCore, Log_INFO5, "Starting DTM TX");
                     LRF_waitForTopsmReady();
                     /* Post cmd */
                     S_PBE_API = PBE_BLE5_REGDEF_API_OP_TXRAW;
@@ -1867,12 +1867,12 @@ RCL_Events RCL_Handler_BLE5_dtmTx(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Ev
     {
         if (rclEventsIn.timerStart != 0)
         {
-            Log(RclCore, Log_INFO5, "DTM TX started");
+            Log_printf(RclCore, Log_INFO5, "DTM TX started");
             rclEvents.cmdStarted = 1;
         }
         if (lrfEvents.opDone != 0 || lrfEvents.opError != 0)
         {
-            Log(RclCore, Log_INFO5, "TX raw done");
+            Log_printf(RclCore, Log_INFO5, "TX raw done");
             RCL_CommandStatus endStatus = ble5HandlerState.common.endStatus;
             if (endStatus == RCL_CommandStatus_Finished && lrfEvents.opError != 0)
             {
@@ -2021,7 +2021,7 @@ RCL_Events RCL_Handler_BLE5_genericRx(RCL_Command *cmd, LRF_Events lrfEvents, RC
                                                                             LRF_EventRxNok.value,
                                                                             fifoCfg);
 
-                    Log(RclCore, Log_INFO5, "Starting generic RX");
+                    Log_printf(RclCore, Log_INFO5, "Starting generic RX");
                     LRF_waitForTopsmReady();
                     /* Post cmd */
                     S_PBE_API = PBE_BLE5_REGDEF_API_OP_RXRAW;
@@ -2093,7 +2093,7 @@ RCL_Events RCL_Handler_BLE5_genericRx(RCL_Command *cmd, LRF_Events lrfEvents, RC
         }
         if (rclEventsIn.timerStart != 0)
         {
-            Log(RclCore, Log_INFO5, "Generic RX started");
+            Log_printf(RclCore, Log_INFO5, "Generic RX started");
             rclEvents.cmdStarted = 1;
         }
         if (lrfEvents.opDone != 0 || lrfEvents.opError != 0)
@@ -2227,7 +2227,7 @@ RCL_Events RCL_Handler_BLE5_genericTx(RCL_Command *cmd, LRF_Events lrfEvents, RC
                     {
                         S_PBE32_MDMSYNCA = accessAddress ^ (whitenInit << 24);
                     }
-                    Log(RclCore, Log_INFO5, "Starting generic TX");
+                    Log_printf(RclCore, Log_INFO5, "Starting generic TX");
                     LRF_waitForTopsmReady();
                     /* Post cmd */
                     S_PBE_API = PBE_BLE5_REGDEF_API_OP_TXRAW;
@@ -2251,7 +2251,7 @@ RCL_Events RCL_Handler_BLE5_genericTx(RCL_Command *cmd, LRF_Events lrfEvents, RC
         }
         if (lrfEvents.opDone != 0 || lrfEvents.opError != 0)
         {
-            Log(RclCore, Log_INFO5, "TX raw done");
+            Log_printf(RclCore, Log_INFO5, "TX raw done");
             RCL_CommandStatus endStatus = ble5HandlerState.common.endStatus;
             if (endStatus == RCL_CommandStatus_Finished && lrfEvents.opError != 0)
             {
@@ -2380,7 +2380,7 @@ RCL_Events RCL_Handler_Ble5_txTest(RCL_Command *cmd, LRF_Events lrfEvents, RCL_E
                 S_DBELL_IMASK0 |= LRF_EventOpDone.value | LRF_EventOpError.value;
 
                 /* Post cmd */
-                Log(RclCore, Log_INFO5, "Starting BLE5 infinite TX");
+                Log_printf(RclCore, Log_INFO5, "Starting BLE5 infinite TX");
 
                 LRF_waitForTopsmReady();
                 S_PBE_API = PBE_BLE5_REGDEF_API_OP_TXRAW;
@@ -2820,7 +2820,7 @@ static RCL_CommandStatus RCL_Handler_BLE5_findPbeErrorEndStatus(uint16_t pbeEndS
         status = RCL_CommandStatus_Error_TxFifo;
         break;
     case PBE_COMMON_RAM_ENDCAUSE_STAT_ERR_SYNTH:
-        Log(RclCore, Log_ERROR, "Synth error. RFEMSGBOX = %04X", S_RFE_MSGBOX);
+        Log_printf(RclCore, Log_ERROR, "Synth error. RFEMSGBOX = %04X", S_RFE_MSGBOX);
         status = RCL_CommandStatus_Error_Synth;
         break;
     case PBE_COMMON_RAM_ENDCAUSE_STAT_ERR_STOP:
@@ -2833,7 +2833,7 @@ static RCL_CommandStatus RCL_Handler_BLE5_findPbeErrorEndStatus(uint16_t pbeEndS
         status = RCL_CommandStatus_Error_UnknownOp;
         break;
     default:
-        Log(RclCore, Log_ERROR, "Unexpected error 0x%04X from PBE", pbeEndStatus);
+        Log_printf(RclCore, Log_ERROR, "Unexpected error 0x%04X from PBE", pbeEndStatus);
         status = RCL_CommandStatus_Error;
         break;
     }
@@ -3298,7 +3298,7 @@ static uint32_t RCL_Handler_BLE5_prepareConnectTime(uint32_t *connectTime, uint3
     *connectTime = newConnectTime;
 
     uint32_t subIntervalStart = ((newConnectTime - referenceTime) / RCL_BLE5_CONNECT_SUB_INT);
-    Log (RclCore, Log_INFO1, "subIntervalStart = %d", subIntervalStart);
+    Log_printf(RclCore, Log_INFO1, "subIntervalStart = %d", subIntervalStart);
     return subIntervalStart;
 }
 
@@ -3323,7 +3323,7 @@ static uint32_t RCL_Handler_BLE5_findConnectTime(uint32_t initialConnectTime, ui
         uint32_t intervalAdjust = (timeDiff + (interval * BLE_CONNECT_INT_UNIT) - 1) / (interval * BLE_CONNECT_INT_UNIT);
         connectTime = initialConnectTime + intervalAdjust * (interval * BLE_CONNECT_INT_UNIT);
     }
-    Log (RclCore, Log_INFO1, "referenceTime = 0x%08X, connectTime = 0x%08X", referenceTime, connectTime);
+    Log_printf(RclCore, Log_INFO1, "referenceTime = 0x%08X, connectTime = 0x%08X", referenceTime, connectTime);
 
     return connectTime;
 }

@@ -54,17 +54,17 @@ foreach(TI_PLATFORM ${SUPPORTED_PLATFORMS})
     endif()
 
     # Include boards/cc23x0rx to get the necessary rcl settings
-    include_directories(${CMAKE_SOURCE_DIR}/source/ti/boards/cc23x0rx/)
+    include_directories(${CMAKE_SOURCE_DIR}/source/ti/boards/cc23x0r5/)
 
     # Only rcl_settings_adc_noise.c is needed at this time. Other rcl settings are used on a per need basis.
     list(APPEND SOURCES
-        ${CMAKE_SOURCE_DIR}/source/ti/boards/cc23x0rx/rcl_settings_adc_noise.c
+        ${CMAKE_SOURCE_DIR}/source/ti/boards/cc23x0r5/rcl_settings_adc_noise.c
     )
 
     ti_add_library(rcl_${TI_PLATFORM}
         # Contents of the library. Include LRF binaries in library
         SOURCES ${SOURCES}
-        $<TARGET_OBJECTS:lrf_${TI_PLATFORM}>
+        #$<TARGET_OBJECTS:lrf_${TI_PLATFORM}>
         # This library has public link dependencies on Driverlib, and the CC23X0RX device
         LINK_PUBLIC Driverlib::${TI_PLATFORM}
                     CMakeCommon::${TI_TOOLCHAIN_NAME}_${ARCH_${TI_PLATFORM}}

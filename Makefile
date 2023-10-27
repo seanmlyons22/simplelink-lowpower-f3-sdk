@@ -9,7 +9,7 @@ export TICLANG_ARMCOMPILER
 export GCC_ARMCOMPILER
 export IAR_ARMCOMPILER
 
-GENERATOR="Unix Makefiles"
+GENERATOR="Ninja"
 
 build: build-ticlang build-gcc build-iar build-sdk-specific
 

@@ -45,10 +45,6 @@
 #include DeviceFamily_constructPath(rf_patches/lrf_rfe_binary_ble5.h)
 #include DeviceFamily_constructPath(rf_patches/lrf_rfe_binary_ble5_nopll.h)
 
-#include DeviceFamily_constructPath(settings/lrf_rfe_cfg_fe_common.h)
-#include DeviceFamily_constructPath(settings/lrf_rfe_cfg_synth_common.h)
-#include DeviceFamily_constructPath(settings/lrf_rfe_cfg_synth_common_ram.h)
-
 #include DeviceFamily_constructPath(driverlib/mdm_regs.h)
 #include DeviceFamily_constructPath(driverlib/pbe_ble5_ram_regs.h)
 #include DeviceFamily_constructPath(driverlib/pbe_common_ram_regs.h)

@@ -7,7 +7,7 @@
 
 ####### Expanded from @PACKAGE_INIT@ by configure_package_config_file() #######
 ####### Any changes to this file will be overwritten by the next CMake run ####
-####### The input file was ConfigDriverslog.cmake.in                            ########
+####### The input file was ConfigRcl.cmake.in                            ########
 
 get_filename_component(PACKAGE_PREFIX_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../../" ABSOLUTE)
 
@@ -30,9 +30,8 @@ endmacro()
 
 ####################################################################################
 
-find_package("TiUtils" REQUIRED)
 find_package("DriverlibCC23X0R5" REQUIRED)
 
-include("${CMAKE_CURRENT_LIST_DIR}/DriverslogM0PTargets.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/RclM0PTargets.cmake")
 
-check_required_components(Driverslog)
+check_required_components(Rcl)
