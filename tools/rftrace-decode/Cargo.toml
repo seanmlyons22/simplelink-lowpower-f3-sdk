@@ -1,0 +1,21 @@
+[package]
+name = "rftrace-decode"
+version = "0.1.0"
+edition = "2021"
+description = "Logic-analyzer backend for the CC-series RF-core (LRFDTRC) trace sink: samples -> deframe -> packet -> dbgid -> Wireshark/stdout, output identical to the ITM/UART tilogger path."
+
+# Skeleton is intentionally std-only (zero deps) so it compiles and tests offline.
+# Fable may add: clap (CLI), zip + serde_json (.sal), thiserror/anyhow (errors).
+[dependencies]
+
+[lib]
+name = "rftrace_decode"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tracedecode"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
