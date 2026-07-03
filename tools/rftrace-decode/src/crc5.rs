@@ -7,10 +7,9 @@
 //!     assembler so they are self-consistent. It feeds `word[7:0]` for SOP/TS/HDR/DATA and
 //!     the top 3 bits of EOP, per the RTL description.
 //!
-//! TODO(fable): confirm the exact bit convention (MSB-first here) and residue behaviour
-//! against the golden `tx_burst_example.sal` packets. The RTL uses a 256-entry LUT on
-//! `data XOR (crcReg<<3)`; if the golden CRCs don't validate, switch `Crc5` to the
-//! reflected form (`crc5_usb` shows that arithmetic).
+//! Bit convention CONFIRMED against the golden `tx_burst_example.sal`: the MSB-first form
+//! below validates 28/28 real packets (the RTL's 256-entry LUT on `data XOR (crcReg<<3)`
+//! is this same arithmetic). The reflected `crc5_usb` form does NOT match the wire (1/28).
 
 /// Textbook CRC-5/USB over whole bytes (reflected). `check("123456789") == 0x19`.
 pub fn crc5_usb(data: &[u8]) -> u8 {

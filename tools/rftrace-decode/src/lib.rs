@@ -12,13 +12,11 @@
 //! Confirmed deframe (from `tx_burst_example.sal`): inverted async-serial, 10 data bits,
 //! MSB-first, 24 Mbaud, 1 start/1 stop, no parity, trace pin = LA channel 4, 500 MS/s.
 //!
-//! IMPLEMENTED here: types, dbgid parser, CRC-5/USB, word classify, printf, timestamp
-//! reconstruct, pcap+stdout emit (`||` tilogger-identical), synth encoder, raw reader,
-//! `.sal` zip+meta parse, golden-`.txt` parser.
-//!
-//! STUB (Fable to implement — marked `TODO(fable)`): `deframe::deframe` (clock recovery +
-//! bit sampling), `packet::PacketAssembler` state machine, `.sal` `digital-N.bin` transition
-//! decode. Their `#[ignore]`d tests flip green once done.
+//! Fully implemented: types, dbgid parser, CRC-5 (MSB-first — validated 28/28 against the
+//! golden capture), word classify, packet state machine, printf, timestamp reconstruct,
+//! pcap+stdout emit (`||` tilogger-identical), synth encoder, raw reader, `.sal` reader
+//! (block/varint run-length format, reverse-engineered; see `sample::decode_saleae_runs`),
+//! edge-based deframer, extcap/retain/tail subcommands.
 
 pub mod types;
 pub mod dbgid;

@@ -175,10 +175,9 @@ fn golden_txt_parser() {
     assert!(recs[0].2.starts_with("RCL_open: Git SHA"));
 }
 
-// ================= #[ignore] until Fable implements the stubs =================
+// ================= end-to-end tests over the implemented deframe / .sal path =================
 
 #[test]
-#[ignore = "TODO(fable): implement deframe::deframe, then this passes"]
 fn synth_roundtrip_via_deframe() {
     use rftrace_decode::deframe::deframe;
     let cfg = DeframeCfg::default();
@@ -201,12 +200,78 @@ fn synth_roundtrip_via_deframe() {
     assert!(p.crc_ok);
 }
 
+/// Normalize decoded/golden text for content comparison: the golden `.txt` double-encoded
+/// UTF-8 ("µ" -> "Âµ") and its generator collapsed some doubled spaces in format strings.
+fn norm(s: &str) -> String {
+    let mut t = s.replace('\u{c2}', ""); // strip the mojibake 'Â'
+    while t.contains("  ") {
+        t = t.replace("  ", " ");
+    }
+    t.trim().to_string()
+}
+
+const SAL: &str = "/home/seanlyons/Downloads/tx_burst_example.sal";
+const GOLDEN: &str = "/home/seanlyons/Pictures/tx_burst_example_decoded.txt";
+const DBGID_APP: &str =
+    "/home/seanlyons/Downloads/rcl_generic_tx_burst_lp_em_cc2745r10_q1_nortos_llvm_dbgid.h";
+const DBGID_PBE: &str = "/home/seanlyons/Downloads/_dbgid_pbe_generic.h";
+
 #[test]
-#[ignore = "TODO(fable): needs .sal decode + deframe; run against the real capture"]
 fn golden_sal_end_to_end() {
-    // Wire up once decode_saleae_digital + deframe are done:
-    //   let cap = read_sal("~/Downloads/tx_burst_example.sal", 4).unwrap();
-    //   let cfg = cfg_from_sal(cap.samplerate_hz);
-    //   run pipeline -> collect (file,line,text); compare to parse_golden(read tx_burst_example_decoded.txt)
-    //   assert the app+pbe subset matches in order.
+    use rftrace_decode::deframe::deframe_edges;
+    use rftrace_decode::record::resolve;
+    use rftrace_decode::sample::{cfg_from_sal, read_sal};
+    use rftrace_decode::timestamp::TsState;
+
+    for p in [SAL, GOLDEN, DBGID_APP, DBGID_PBE] {
+        if !std::path::Path::new(p).exists() {
+            eprintln!("golden_sal_end_to_end: oracle file {p} missing; skipping");
+            return;
+        }
+    }
+
+    let db = dbgid::load(&[DBGID_APP, DBGID_PBE]).expect("load dbgid files");
+    assert!(db.len() >= 190, "expected ~193 dbgid defs, got {}", db.len());
+
+    let cap = read_sal(SAL, 4).expect("read .sal channel 4");
+    assert_eq!(cap.samplerate_hz, 500_000_000.0);
+    let cfg = cfg_from_sal(cap.samplerate_hz);
+    let (words, framing) =
+        deframe_edges(cap.runs.initial_level, &cap.runs.edges, cap.runs.total, &cfg);
+    assert!(words.len() > 1_000_000, "deframe produced too few words");
+
+    let mut asm = PacketAssembler::new();
+    let mut health = Health::default();
+    let mut ts = TsState::new();
+    let mut got: Vec<(String, u32, String)> = Vec::new();
+    let mut crc_bad = 0u64;
+    let mut last_ticks = 0u64;
+    for w in words {
+        if let Some(p) = asm.push(classify(w), &mut health) {
+            if !p.crc_ok {
+                crc_bad += 1;
+                continue;
+            }
+            if let Some(r) = resolve(&p, &db, "rftrc", &mut ts, cfg.divide_time_by_2) {
+                assert!(r.ts_ticks >= last_ticks, "timestamps must be monotonic");
+                last_ticks = r.ts_ticks;
+                got.push((r.file.clone(), r.line, norm(&r.text)));
+            }
+        }
+    }
+    assert_eq!(crc_bad, 0, "all real packets must pass CRC-5 (MSB-first)");
+    eprintln!("[golden] words framing_errors={framing} records={}", got.len());
+
+    // Expected = golden records whose file appears in the loaded DBs (radio rfe/mce
+    // dbgids are not provided -> skipped, matching resolve() returning None).
+    let known: std::collections::HashSet<&str> =
+        db.by_key.values().map(|d| d.basename()).collect();
+    let golden_txt = std::fs::read_to_string(GOLDEN).expect("read golden");
+    let expected: Vec<(String, u32, String)> = parse_golden(&golden_txt)
+        .into_iter()
+        .filter(|(f, _, _)| known.contains(f.as_str()))
+        .map(|(f, l, t)| (f, l, norm(&t)))
+        .collect();
+    assert_eq!(expected.len(), 23, "golden app+pbe subset should be 23 records");
+    assert_eq!(got, expected, "decoded records must match the golden app+pbe subset");
 }

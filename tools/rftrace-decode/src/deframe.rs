@@ -1,7 +1,7 @@
-//! Physical deframe: LA sample levels -> 10-bit tracer words (§11.1).
+//! Physical deframe: LA sample levels / transition lists -> 10-bit tracer words (§11.1).
 //!
-//! `decode_frame` (deterministic) is IMPLEMENTED and shared with the synth encoder.
-//! `deframe` (clock recovery + bit-center sampling) is the one hot-path STUB — TODO(fable).
+//! `decode_frame`/`encode_frame` are shared with the synth encoder; `deframe_edges` is the
+//! hot path (edge-based, so the 11.5 G-sample golden capture never expands per-sample).
 
 use crate::types::{DeframeCfg, Word};
 
@@ -48,17 +48,117 @@ pub fn encode_frame(word: Word, cfg: &DeframeCfg) -> Vec<u8> {
 
 /// Recover 10-bit words from a stream of per-sample line levels (0/1) for the trace channel.
 ///
-/// TODO(fable) — the core hot loop. Algorithm (§11.1, ADR-005/007):
-///  1. De-invert if `cfg.invert` (idle should read high).
-///  2. Track frame period from start-pulse edges: nominal `cfg.samples_per_bit()` (~20.83 @
-///     500 MS/s / 24 Mbaud); maintain a low-passed estimate; resync phase on each start edge.
-///  3. On a detected start bit, place bit centers with a fractional accumulator and sample
-///     `2 + data_bits` bits; validate the stop bit (count framing errors otherwise).
-///  4. `decode_frame(bits, cfg)` -> Word; push. Idle NOP words (0x000) stream continuously.
+/// Thin wrapper over [`deframe_edges`]: compresses the sample vector into a transition list
+/// (Saleae-native representation) and runs the edge-based deframer.
+pub fn deframe(levels: &[u8], cfg: &DeframeCfg) -> Vec<Word> {
+    if levels.is_empty() {
+        return Vec::new();
+    }
+    let initial = levels[0] & 1;
+    let mut edges = Vec::new();
+    for i in 1..levels.len() {
+        if levels[i] & 1 != levels[i - 1] & 1 {
+            edges.push(i as u64);
+        }
+    }
+    deframe_edges(initial, &edges, levels.len() as u64, cfg).0
+}
+
+/// Edge-based deframer: `initial_level` + transition positions (sample index where the line
+/// flips) + total sample count -> 10-bit words. Returns `(words, framing_errors)`.
 ///
-/// Verify: `synth::words_to_samples` -> `deframe` round-trips the word stream (see the
-/// `#[ignore]`d `synth_roundtrip` test — un-ignore once implemented).
-pub fn deframe(_levels: &[u8], _cfg: &DeframeCfg) -> Vec<Word> {
-    // Not yet implemented — returns nothing so the pipeline runs gracefully.
-    Vec::new()
+/// Algorithm (§11.1, ADR-005/007): find each start-bit edge, place `2 + data_bits` bit
+/// centers at nominal `samples_per_bit()` spacing from it, sample, verify the stop bit, and
+/// lift the word with `decode_frame`. Phase resyncs on every start edge, so only intra-frame
+/// (12-bit) clock drift matters.
+///
+/// ponytail: no low-passed period estimate — LA and tracer clocks are both crystal-derived,
+/// so intra-frame drift is <<0.5 bit; add period tracking only if a capture shows drift.
+///
+/// Start-bit polarity is auto-detected: the tracer streams NOP frames (1 start bit + 11 zero
+/// bits) whenever it is on, so the start-bit level is always the minority level over the
+/// capture. This resolves the "inverted" ambiguity between the Saleae analyzer convention
+/// (start = high on the real `tx_burst_example.sal` wire) and the synth encoder convention
+/// (start = low when `cfg.invert`), so `cfg.invert` is only a hint here.
+pub fn deframe_edges(
+    initial_level: u8,
+    edges: &[u64],
+    total: u64,
+    cfg: &DeframeCfg,
+) -> (Vec<Word>, u64) {
+    let spb = cfg.samples_per_bit();
+    let bits_per_frame = 2 + cfg.data_bits as usize;
+    let mut words = Vec::new();
+    let mut framing_errors = 0u64;
+    if total == 0 {
+        return (words, framing_errors);
+    }
+
+    // Time spent at level 1 vs 0 -> start bit is the minority level (see above).
+    let mut hi = 0u64;
+    let mut lvl = initial_level & 1;
+    let mut prev = 0u64;
+    for &e in edges {
+        if lvl == 1 {
+            hi += e - prev;
+        }
+        prev = e;
+        lvl ^= 1;
+    }
+    if lvl == 1 {
+        hi += total - prev;
+    }
+    let start_level: u8 = if hi * 2 > total {
+        0
+    } else if hi * 2 < total {
+        1
+    } else if cfg.invert {
+        0 // tie: fall back to the cfg hint (synth convention: invert => start low)
+    } else {
+        1
+    };
+
+    // level_at(pos) via a monotonic cursor: level = initial ^ (edges <= pos).
+    let mut cur = 0usize; // number of edges consumed
+    let level_at = |pos: f64, cur: &mut usize| -> u8 {
+        while *cur < edges.len() && (edges[*cur] as f64) <= pos {
+            *cur += 1;
+        }
+        initial_level ^ ((*cur & 1) as u8)
+    };
+
+    // Runs: run i starts at (i==0 ? 0 : edges[i-1]) with level initial ^ (i&1).
+    let mut frame_bits = vec![0u8; bits_per_frame];
+    let mut pos_limit = 0f64;
+    for i in 0..=edges.len() {
+        let s = if i == 0 { 0 } else { edges[i - 1] };
+        let lvl = initial_level ^ ((i & 1) as u8);
+        if lvl != start_level || (s as f64) < pos_limit {
+            continue;
+        }
+        // Candidate frame starting at s: sample bit centers.
+        let sf = s as f64;
+        if sf + (bits_per_frame as f64 - 0.5) * spb > total as f64 {
+            break; // frame would run past the capture
+        }
+        for (k, b) in frame_bits.iter_mut().enumerate() {
+            let raw = level_at(sf + (k as f64 + 0.5) * spb, &mut cur);
+            *b = (raw == start_level) as u8; // start bit = logical 1
+        }
+        if frame_bits[bits_per_frame - 1] != 0 {
+            framing_errors += 1;
+            pos_limit = sf + 1.0;
+            // cursor may have run ahead; rewind so later, earlier positions still resolve
+            while cur > 0 && edges[cur - 1] as f64 > pos_limit {
+                cur -= 1;
+            }
+            continue;
+        }
+        words.push(decode_frame(&frame_bits, cfg));
+        pos_limit = sf + (bits_per_frame as f64 - 0.5) * spb;
+        while cur > 0 && edges[cur - 1] as f64 > pos_limit {
+            cur -= 1;
+        }
+    }
+    (words, framing_errors)
 }
