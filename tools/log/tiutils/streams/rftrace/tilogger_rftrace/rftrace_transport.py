@@ -59,6 +59,7 @@ import shlex
 import struct
 import subprocess
 import sys
+import time
 
 logger = logging.getLogger("RFTrace Transport")
 
@@ -306,10 +307,19 @@ class RFTrace_Transport(_TransportBase):
     def _pick_device(self, mgr, automation):
         if self._l2_device:
             return self._l2_device
-        devs = [d for d in mgr.get_devices() if not getattr(d, "is_simulation", False)]
-        if not devs:
-            raise SystemExit("rftrace --logic2: no Saleae device found "
-                             "(is Logic 2 running with the device connected?)")
+        # Logic 2's automation port starts listening a beat before the USB device
+        # is enumerated, so right after a fresh (headless) launch get_devices() is
+        # briefly empty. Poll instead of bailing — otherwise this transport thread
+        # SystemExits silently and the whole capture tears down at startup.
+        deadline = time.time() + 15
+        while True:
+            devs = [d for d in mgr.get_devices() if not getattr(d, "is_simulation", False)]
+            if devs:
+                break
+            if time.time() >= deadline:
+                raise SystemExit("rftrace --logic2: no Saleae device found "
+                                 "(is Logic 2 running with the device connected?)")
+            time.sleep(0.5)
         pros = (automation.DeviceType.LOGIC_PRO_8, automation.DeviceType.LOGIC_PRO_16)
         for d in devs:
             if d.device_type in pros:
