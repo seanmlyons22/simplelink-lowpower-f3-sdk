@@ -1,5 +1,6 @@
-//! Golden-vector + unit tests. The `#[ignore]`d tests depend on the STUBs
-//! (`deframe`, `.sal` transition decode) — un-ignore them as Fable implements each.
+//! Golden-vector + unit tests, plus a subprocess test proving the built `tracedecode`
+//! binary emits pcap output the shared `tilogger` dissector consumes (same DLT + `||`
+//! columns as the ITM/UART path).
 
 use rftrace_decode::crc5::crc5_usb;
 use rftrace_decode::dbgid;
@@ -274,4 +275,78 @@ fn golden_sal_end_to_end() {
         .collect();
     assert_eq!(expected.len(), 23, "golden app+pbe subset should be 23 records");
     assert_eq!(got, expected, "decoded records must match the golden app+pbe subset");
+}
+
+// ============ subprocess: binary launches + emits dissector-compatible pcap ============
+
+/// Parse the tilogger `||` fields the Lua dissector splits from a DLT_USER0 payload.
+/// Mirrors `tilogger_dissector.lua`: 8 columns, alias/ts/opcode/module/level/file/line/string.
+fn dissector_columns(payload: &[u8]) -> Vec<String> {
+    std::str::from_utf8(payload)
+        .unwrap()
+        .split("||")
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// End-to-end through the *installed CLI* (as tilogger/Wireshark/extcap launch it): synth a
+/// raw capture, then `decode ... pcap --out -`, and assert the emitted pcap is byte-shaped
+/// exactly like the ITM/UART path — DLT_USER0=147 + the 8 `||` columns the shared dissector
+/// reads. This is the real "swap ITM for rftrace" contract: same presentation, same wire.
+#[test]
+fn cli_emits_tilogger_pcap_over_stdout() {
+    use std::io::Write;
+    use std::process::Command;
+
+    let bin = env!("CARGO_BIN_EXE_tracedecode");
+    let dir = std::env::temp_dir().join(format!("rftrace-cli-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dbgid_path = dir.join("t_dbgid.h");
+    let raw_path = dir.join("synth.raw");
+    std::fs::File::create(&dbgid_path)
+        .unwrap()
+        .write_all(b"DBG_DEF(DBGID_t_c_42, 5, DBGCH1, -1, \"val %08X\", \"t.c\", 42)\n")
+        .unwrap();
+
+    // synth a raw capture on channel 4 from that single dbgid def.
+    let synth = Command::new(bin)
+        .args(["synth", "--dbgid"])
+        .arg(&dbgid_path)
+        .args(["--channel", "4", "--out"])
+        .arg(&raw_path)
+        .output()
+        .expect("run tracedecode synth");
+    assert!(synth.status.success(), "synth failed: {}", String::from_utf8_lossy(&synth.stderr));
+
+    // decode -> pcap on stdout, exactly as the sigrok pipe / extcap fifo consume it.
+    let decode = Command::new(bin)
+        .args(["decode", "--raw"])
+        .arg(&raw_path)
+        .args(["--channel", "4", "--dbgid"])
+        .arg(&dbgid_path)
+        .args(["pcap", "--out", "-"])
+        .output()
+        .expect("run tracedecode decode");
+    assert!(decode.status.success(), "decode failed: {}", String::from_utf8_lossy(&decode.stderr));
+    let pcap = decode.stdout;
+
+    // pcap global header: magic + DLT_USER0.
+    assert!(pcap.len() > 24, "no pcap emitted");
+    assert_eq!(&pcap[0..4], &0xA1B2C3D4u32.to_le_bytes(), "pcap magic");
+    let dlt = u32::from_le_bytes(pcap[20..24].try_into().unwrap());
+    assert_eq!(dlt, 147, "must be DLT_USER0 so tilogger_dissector.lua binds it");
+
+    // first record payload -> dissector columns.
+    let caplen = u32::from_le_bytes(pcap[32..36].try_into().unwrap()) as usize;
+    let cols = dissector_columns(&pcap[40..40 + caplen]);
+    assert_eq!(cols.len(), 8, "dissector expects 8 || columns, got {cols:?}");
+    assert_eq!(cols[0], "rftrc", "alias");
+    assert_eq!(cols[2], "LOG_OPCODE_FORMATED_TEXT", "opcode");
+    assert_eq!(cols[3], "DBGCH1", "module = channel");
+    assert_eq!(cols[4], "INFO", "level");
+    assert_eq!(cols[5], "t.c", "file from dbgid");
+    assert_eq!(cols[6], "42", "line from dbgid");
+    assert_eq!(cols[7], "val 00001000", "printf-formatted text");
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

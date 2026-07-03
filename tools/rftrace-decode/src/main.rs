@@ -138,9 +138,13 @@ fn build_outputs(cli: &Cli) -> Result<Vec<Box<dyn Output>>, String> {
         match name.as_str() {
             "stdout" => outs.push(Box::new(StdoutSink)),
             "pcap" => {
-                let path = cli.out.clone().ok_or("pcap/wireshark output needs --out <file>")?;
-                let f = File::create(&path).map_err(|e| e.to_string())?;
-                outs.push(Box::new(PcapSink::new(f).map_err(|e| e.to_string())?));
+                let path = cli.out.clone().ok_or("pcap/wireshark output needs --out <file> (use - for stdout)")?;
+                if path == "-" {
+                    outs.push(Box::new(PcapSink::new(std::io::stdout()).map_err(|e| e.to_string())?));
+                } else {
+                    let f = File::create(&path).map_err(|e| e.to_string())?;
+                    outs.push(Box::new(PcapSink::new(f).map_err(|e| e.to_string())?));
+                }
             }
             _ => {}
         }
