@@ -79,7 +79,9 @@ with the `||`-delimited payload — so it reuses `tools/log/tiutils/streams/wire
    Edit > Preferences > Protocols > DLT_USER > Edit… > add `DLT=147`, payload `tilogger`.
    (tilogger's own launcher passes this as `-o uat:user_dlts:...`; the extcap path can't, so
    set it once in preferences.)
-2. Build the binary: `cargo build --release` → `target/release/tracedecode`.
+2. Put the binary on `PATH`: `cargo install --path .` (→ `~/.cargo/bin/tracedecode`).
+   Or just build it — `cargo build --release` → `target/release/tracedecode` — and set
+   `$TRACEDECODE` / pass `--tracedecode <path>`.
 
 ### Launch from Wireshark (extcap — replay a `.sal`)
 
@@ -132,8 +134,9 @@ all CPU-side logs straight from the binary** — the transport reads the ELF's d
 tilogger's own ELF parser (`elf_dbgid.py`, verified byte-identical to `elf2dbgid`), so no
 manual elf2dbgid step is needed; extra `--dbgid` headers add modem/LRF (pbe/rfe/mce). The Rust
 decoder itself still only reads DBG_DEF `--dbgid` files (ADR-013 — never parses ELF); the
-transport bridges the ELF to it. Point it at the binary via `--tracedecode`, `$TRACEDECODE`,
-or `PATH`. See `tools/log/tiutils/README.md` → "RF-core Trace (rftrace) Transport".
+transport bridges the ELF to it. Install the binary with `cargo install --path .` so it's on
+`PATH`; otherwise point at it via `--tracedecode` or `$TRACEDECODE`. See
+`tools/log/tiutils/README.md` → "RF-core Trace (rftrace) Transport".
 
 The same change made tilogger's **Wireshark output work on Linux** (`streams/wireshark`): the
 win32 named-pipe path was guarded and a FIFO path added, so `wireshark --start` auto-launches

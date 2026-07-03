@@ -304,10 +304,23 @@ Options:
 ### RF-core Trace (rftrace) Transport
 
 Decodes the CC-series RF-core (LRFDTRC) trace pin captured by a logic analyzer,
-using the native `tracedecode` backend (`tools/rftrace-decode`, build with
-`cargo build --release`). It is a drop-in transport: pick a source and any
-existing output (`stdout`, `wireshark`, `to-replayfile`) — the logs appear
-identically to ITM/UART.
+using the native `tracedecode` backend (`tools/rftrace-decode`). It is a drop-in
+transport: pick a source and any existing output (`stdout`, `wireshark`,
+`to-replayfile`) — the logs appear identically to ITM/UART.
+
+**Setup (two one-time steps):**
+
+1. **`tracedecode` binary on `PATH`** (the Rust decode backend):
+   ```
+   cargo install --path tools/rftrace-decode      # puts `tracedecode` in ~/.cargo/bin
+   ```
+   No `$TRACEDECODE` env or `--tracedecode` flag needed once it's on `PATH`.
+2. **The `rftrace` transport** is installed by `requirements.txt` (with the
+   `[logic2]` extra for the Saleae `--logic2` path). If you set up your venv
+   before that line existed, add it:
+   ```
+   pip install -e streams/rftrace[logic2]         # or drop [logic2] for --sal/--sigrok/--raw only
+   ```
 
 **Metadata**: pass `--elf <app.out>` and all CPU-side logs are resolved straight
 from the binary — no manual `elf2dbgid` step. (The transport reads the ELF's
@@ -370,8 +383,9 @@ pulse-high|pulse-low` (with `--trigger-channel`, `--after`) for event capture; a
 
 * `--elf` reads the ELF once at startup (via `pyelftools`, already a tilogger
   dependency); the extracted table is verified byte-identical to `elf2dbgid`'s.
-* Point `--tracedecode` at the built binary, or put it on `PATH`, or set
-  `$TRACEDECODE`.
+* `tracedecode` is found on `PATH` (after `cargo install --path
+  tools/rftrace-decode`). To use a specific build instead, pass `--tracedecode
+  <path>` or set `$TRACEDECODE`.
 * `--divide-time-by-2` is needed for 48 MHz tracer variants (0.25 us ticks, e.g.
   CC2745) so device time matches wall time.
 * Live `--sigrok` capture runs **endlessly** — the decoder streams (chunked, with
@@ -481,16 +495,27 @@ Options:
 
 #### Configure Wireshark
 
-Copy `streams/wireshark/tilog_dissector.lua` to `[Wireshark install
-dir]/plugins/x.y/tilogger_dissector.lua`. This will teach Wireshark to
-understand the TI Logger's packet format.
+Install the dissector so Wireshark understands the TI Logger packet format. Find
+your plugins dir via Help > About Wireshark > Folders > "Personal Lua Plugins".
+
+* **Windows:** copy `streams/wireshark/tilogger_dissector.lua` into
+  `[Wireshark install dir]/plugins/x.y/`, and set `WIRESHARK_EXE_PATH` to the
+  directory holding `Wireshark.exe`.
+* **Linux:** symlink it into the personal Lua plugins dir (Wireshark is found on
+  `PATH`, so no `WIRESHARK_EXE_PATH` needed):
+  ```
+  mkdir -p ~/.local/lib/wireshark/plugins
+  ln -s "$PWD/streams/wireshark/tilogger_dissector.lua" ~/.local/lib/wireshark/plugins/
+  ```
+  Also add your user to the `wireshark` group so Wireshark can run `dumpcap` on
+  the capture pipe, then log out/in (or prefix the run with `sg wireshark -c`):
+  ```
+  sudo usermod -aG wireshark $USER
+  ```
 
 >*Warning*: If you have previously
 used an older version of the TI logger tool, make sure to remove the previous
 `dissector.lua` containing the old TI Logger from Wireshark.
-
-Set an environment variable named `WIRESHARK_EXE_PATH`, setting it to the
-directory path where Wireshark.exe is installed.
 
 To automatically start wireshark when starting the logger, supply `--start` to
 the `wireshark` command. `tilogger` adds columns to the default view for
