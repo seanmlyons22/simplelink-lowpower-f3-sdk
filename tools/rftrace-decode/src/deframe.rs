@@ -86,15 +86,17 @@ pub fn deframe_edges(
     total: u64,
     cfg: &DeframeCfg,
 ) -> (Vec<Word>, u64) {
-    let spb = cfg.samples_per_bit();
-    let bits_per_frame = 2 + cfg.data_bits as usize;
-    let mut words = Vec::new();
-    let mut framing_errors = 0u64;
-    if total == 0 {
-        return (words, framing_errors);
-    }
+    let start_level = minority_start_level(initial_level, edges, total, cfg);
+    let (words, fe, _consumed) = deframe_edges_core(initial_level, edges, total, cfg, start_level);
+    (words, fe)
+}
 
-    // Time spent at level 1 vs 0 -> start bit is the minority level (see above).
+/// Start-bit polarity = the minority line level over the window (the tracer idles with NOP
+/// frames, so idle dominates and the start pulse is the minority). See the note above.
+pub fn minority_start_level(initial_level: u8, edges: &[u64], total: u64, cfg: &DeframeCfg) -> u8 {
+    if total == 0 {
+        return if cfg.invert { 0 } else { 1 };
+    }
     let mut hi = 0u64;
     let mut lvl = initial_level & 1;
     let mut prev = 0u64;
@@ -108,7 +110,7 @@ pub fn deframe_edges(
     if lvl == 1 {
         hi += total - prev;
     }
-    let start_level: u8 = if hi * 2 > total {
+    if hi * 2 > total {
         0
     } else if hi * 2 < total {
         1
@@ -116,7 +118,27 @@ pub fn deframe_edges(
         0 // tie: fall back to the cfg hint (synth convention: invert => start low)
     } else {
         1
-    };
+    }
+}
+
+/// Core deframer with an explicit `start_level`. Returns `(words, framing_errors, consumed)`
+/// where `consumed` is the sample index up to which framing is complete — i.e. the end of the
+/// last emitted frame. Streaming callers keep samples `[consumed..]` as carry for the next
+/// chunk; any frame that would run past `total` is left for that carry.
+pub fn deframe_edges_core(
+    initial_level: u8,
+    edges: &[u64],
+    total: u64,
+    cfg: &DeframeCfg,
+    start_level: u8,
+) -> (Vec<Word>, u64, u64) {
+    let spb = cfg.samples_per_bit();
+    let bits_per_frame = 2 + cfg.data_bits as usize;
+    let mut words = Vec::new();
+    let mut framing_errors = 0u64;
+    if total == 0 {
+        return (words, framing_errors, 0);
+    }
 
     // level_at(pos) via a monotonic cursor: level = initial ^ (edges <= pos).
     let mut cur = 0usize; // number of edges consumed
@@ -139,7 +161,7 @@ pub fn deframe_edges(
         // Candidate frame starting at s: sample bit centers.
         let sf = s as f64;
         if sf + (bits_per_frame as f64 - 0.5) * spb > total as f64 {
-            break; // frame would run past the capture
+            break; // frame would run past the window; streaming carry re-tries it next chunk
         }
         for (k, b) in frame_bits.iter_mut().enumerate() {
             let raw = level_at(sf + (k as f64 + 0.5) * spb, &mut cur);
@@ -160,5 +182,5 @@ pub fn deframe_edges(
             cur -= 1;
         }
     }
-    (words, framing_errors)
+    (words, framing_errors, pos_limit as u64)
 }

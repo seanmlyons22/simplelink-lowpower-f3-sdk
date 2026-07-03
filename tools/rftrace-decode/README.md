@@ -18,9 +18,27 @@ samples(u8) → deframe → Word(10b) → classify → WordKind
 
 ## Status
 
-**Complete, std-only, `cargo test` fully green** (11 pass, 0 ignored), including the
+**Complete, std-only, `cargo test` fully green** (13 pass, 0 ignored), including the
 golden end-to-end gate: `tx_burst_example.sal` decodes to the exact app+pbe record
 sequence of `tx_burst_example_decoded.txt` (23/23, 0 framing errors, 0 CRC errors).
+
+## Performance (live capture)
+
+`decode` **streams** — reads samples in 1 MiB chunks with a one-frame carry, emits records
+live, and runs **endlessly** with bounded memory. It never buffers the whole capture, so a
+live `sigrok-cli … | tracedecode decode --raw -` keeps up with a 500 MS/s pipe forever.
+
+Measured single-core (300 MB raw, `/usr/bin/time -v`):
+
+| Input                         | Throughput  | vs 500 MS/s line | Peak RSS |
+|-------------------------------|-------------|------------------|----------|
+| idle / static line (scan)     | ~1070 MS/s  | 2.1×             | 5.2 MB   |
+| dense packets (worst case)    | ~790 MS/s   | 1.6×             | 5.4 MB   |
+
+Real traffic is mostly idle NOPs, so it sits near the top row. Memory is O(chunk), not
+O(capture): a 300 MB input decodes in ~5 MB RSS. `stream_decode_crosses_chunk_boundaries`
+tests that frames straddling a chunk boundary are neither dropped nor duplicated.
+`.sal` replay stays batch (finite, edge-compressed — 11.5 G samples in ~1.2 s).
 
 Empirically resolved against the golden capture:
 - **CRC-5**: the MSB-first convention (`crc5::Crc5`, poly 0x05, init 0x1F) is correct —
@@ -78,13 +96,19 @@ decoded logs in. (Set `TRACEDECODE=/path/to/tracedecode` if the binary isn't on 
 
 ```
 scripts/sigrok-to-wireshark.sh --dbgid app_dbgid.h --dbgid pbe_dbgid.h \
-    --driver saleae-logic-pro-16 --channel 4 --samplerate 500M --samples 500M \
-    --divide-time-by-2
+    --driver saleae-logic-pro-16 --channel 4 --samplerate 500M --divide-time-by-2
 ```
 
 One pipe: `sigrok-cli -O binary | tracedecode decode --raw - … pcap --out - | wireshark -k -i -`.
-Drive it with a bounded `--samples`/`--time` — the decoder buffers the whole capture before
-emitting (fine for a burst; a streaming deframer is the upgrade for unbounded live tail).
+Runs **endlessly** (omit `--samples`/`--time`); the decoder streams with bounded memory.
+
+## Launcher scripts
+
+| Script | End-to-end flow |
+|--------|-----------------|
+| `scripts/tilogger-rftrace.sh <rftrace args…> <output>` | Builds the binary if needed, sets `$TRACEDECODE`, runs `tilogger rftrace …` (the integrated path). |
+| `scripts/sigrok-to-wireshark.sh --dbgid … [opts]` | Standalone `sigrok-cli \| tracedecode \| wireshark` pipe (no Python). |
+| `extcap/rftrace-decode` | Wireshark-launched extcap wrapper (symlink into Wireshark's extcap dir). |
 
 ## Integration with `tilogger` (primary UX)
 
@@ -97,7 +121,7 @@ tilogger rftrace --sal cap.sal --dbgid app_dbgid.h --dbgid pbe_dbgid.h \
     --channel 4 --divide-time-by-2 stdout
 tilogger rftrace --sal cap.sal --dbgid app_dbgid.h --divide-time-by-2 wireshark --start
 tilogger rftrace --sigrok "--driver saleae-logic-pro-16 --config samplerate=500M \
-    -C D4 --samples 500M" --dbgid app_dbgid.h --channel 0 --divide-time-by-2 stdout
+    -C D4" --dbgid app_dbgid.h --channel 0 --divide-time-by-2 stdout   # endless live
 ```
 
 The transport (`tools/log/tiutils/streams/rftrace/`) runs this `tracedecode` binary with

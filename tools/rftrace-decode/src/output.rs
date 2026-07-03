@@ -94,6 +94,8 @@ impl<W: Write> PcapSink<W> {
 impl<W: Write> Output for PcapSink<W> {
     fn on_record(&mut self, r: &LogRecord) {
         let _ = self.write_record(r);
+        // Flush each record so live consumers (Wireshark fifo, tilogger transport) see it now.
+        let _ = self.w.flush();
     }
     fn finish(&mut self) {
         let _ = self.w.flush();

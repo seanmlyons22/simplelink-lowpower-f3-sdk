@@ -13,7 +13,7 @@ use rftrace_decode::deframe::deframe_edges;
 use rftrace_decode::output::{stdout_line, Output, PcapSink, StdoutSink};
 use rftrace_decode::packet::{classify, PacketAssembler};
 use rftrace_decode::record::resolve;
-use rftrace_decode::sample::{levels_from_raw, read_raw, read_sal, SalRuns};
+use rftrace_decode::sample::{read_sal, SalRuns};
 use rftrace_decode::synth;
 use rftrace_decode::timestamp::TsState;
 use rftrace_decode::types::{DeframeCfg, Health, LogRecord, Word};
@@ -155,7 +155,34 @@ fn build_outputs(cli: &Cli) -> Result<Vec<Box<dyn Output>>, String> {
     Ok(outs)
 }
 
-/// Words -> packets -> records -> outputs. Shared by every input path.
+/// One word -> (maybe) a record -> outputs. The per-word core shared by batch + streaming.
+#[allow(clippy::too_many_arguments)]
+fn feed_word(
+    w: Word,
+    asm: &mut PacketAssembler,
+    ts: &mut TsState,
+    db: &DbgIdDb,
+    alias: &str,
+    divide_time_by_2: bool,
+    health: &mut Health,
+    outs: &mut [Box<dyn Output>],
+) {
+    if let Some(pkt) = asm.push(classify(w), health) {
+        if !pkt.crc_ok {
+            return;
+        }
+        match resolve(&pkt, db, alias, ts, divide_time_by_2) {
+            Some(rec) => {
+                for o in outs.iter_mut() {
+                    o.on_record(&rec);
+                }
+            }
+            None => health.unknown_dbgid += 1,
+        }
+    }
+}
+
+/// Batch: a whole word slice -> outputs (finite inputs: replay, tests).
 fn run_words(
     words: &[Word],
     framing_errors: u64,
@@ -166,27 +193,101 @@ fn run_words(
 ) {
     let mut asm = PacketAssembler::new();
     let mut ts = TsState::new();
-    let mut health = Health::default();
-    health.framing_errors = framing_errors;
+    let mut health = Health {
+        framing_errors,
+        ..Health::default()
+    };
     for &w in words {
-        if let Some(pkt) = asm.push(classify(w), &mut health) {
-            if !pkt.crc_ok {
-                continue;
-            }
-            match resolve(&pkt, db, alias, &mut ts, cfg.divide_time_by_2) {
-                Some(rec) => {
-                    for o in outs.iter_mut() {
-                        o.on_record(&rec);
-                    }
-                }
-                None => health.unknown_dbgid += 1,
-            }
-        }
+        feed_word(w, &mut asm, &mut ts, db, alias, cfg.divide_time_by_2, &mut health, outs);
     }
     for o in outs.iter_mut() {
         o.on_health(&health);
         o.finish();
     }
+}
+
+/// Streaming decode: read samples in chunks and emit records live, with bounded memory, so a
+/// live `sigrok-cli … | tracedecode decode --raw -` can run **endlessly**. Never buffers the
+/// whole capture: it keeps only the current chunk plus a one-frame carry that holds a frame
+/// straddling the chunk boundary (§11.1, ADR-005/007).
+fn stream_decode(
+    mut reader: impl std::io::Read,
+    cfg: &DeframeCfg,
+    db: &DbgIdDb,
+    channel: u8,
+    alias: &str,
+    outs: &mut [Box<dyn Output>],
+) -> std::io::Result<()> {
+    use rftrace_decode::deframe::{deframe_edges_core, minority_start_level};
+
+    let bits_per_frame = 2 + cfg.data_bits as usize;
+    let frame_span = (bits_per_frame as f64 * cfg.samples_per_bit()).ceil() as usize + 1;
+
+    let mut asm = PacketAssembler::new();
+    let mut ts = TsState::new();
+    let mut health = Health::default();
+
+    let mut buf = vec![0u8; 1 << 20]; // 1 MiB samples/read
+    let mut carry: Vec<u8> = Vec::new(); // trailing levels from the previous chunk
+    let mut edges: Vec<u64> = Vec::new();
+    let mut start_level: Option<u8> = None;
+
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break; // EOF (sigrok ended); a truly-live pipe never reaches here
+        }
+        // window = carry ++ this chunk's per-sample levels for `channel`.
+        let mut window = std::mem::take(&mut carry);
+        window.reserve(n);
+        for &b in &buf[..n] {
+            window.push((b >> channel) & 1);
+        }
+
+        edges.clear();
+        for i in 1..window.len() {
+            if window[i] != window[i - 1] {
+                edges.push(i as u64);
+            }
+        }
+        let initial = window[0];
+
+        // Lock start-bit polarity from the first window with enough edges to be reliable.
+        let sl = match start_level {
+            Some(v) => v,
+            None => {
+                let v = minority_start_level(initial, &edges, window.len() as u64, cfg);
+                if edges.len() >= 64 {
+                    start_level = Some(v);
+                }
+                v
+            }
+        };
+
+        let (words, fe, consumed) =
+            deframe_edges_core(initial, &edges, window.len() as u64, cfg, sl);
+        health.framing_errors += fe;
+        for w in words {
+            feed_word(w, &mut asm, &mut ts, db, alias, cfg.divide_time_by_2, &mut health, outs);
+        }
+
+        // Carry the un-framed tail (holds a boundary-straddling frame). If that tail has no
+        // edges it is a static idle run with no possible frame — keep only one frame_span so
+        // memory stays bounded on an endless idle line.
+        let cons = (consumed as usize).min(window.len());
+        let mut new_carry = window.split_off(cons);
+        if new_carry.len() > 4 * frame_span && !edges.iter().any(|&e| e as usize >= cons) {
+            let keep = frame_span.min(new_carry.len());
+            new_carry.drain(..new_carry.len() - keep);
+        }
+        carry = new_carry;
+    }
+
+    for o in outs.iter_mut() {
+        o.on_health(&health);
+        o.finish();
+    }
+    Ok(())
 }
 
 fn deframe_sal(runs: &SalRuns, cfg: &DeframeCfg) -> (Vec<Word>, u64) {
@@ -313,14 +414,17 @@ fn main() -> ExitCode {
         "wireshark" => extcap(&cli),
         "decode" => (|| {
             let path = cli.input.clone().unwrap_or_else(|| "-".to_string());
-            let bytes = read_raw(&path).map_err(|e| format!("reading raw: {e}"))?;
-            let levels = levels_from_raw(&bytes, cli.channel);
             let cfg = build_cfg(&cli, 500_000_000.0);
             let db = load_db(&cli)?;
             let mut outs = build_outputs(&cli)?;
-            let words = rftrace_decode::deframe::deframe(&levels, &cfg);
-            run_words(&words, 0, &cfg, &db, &cli.alias, &mut outs);
-            Ok(())
+            // Stream: read samples in chunks, emit records live, bounded memory, endless.
+            let reader: Box<dyn std::io::Read> = if path == "-" {
+                Box::new(std::io::stdin().lock())
+            } else {
+                Box::new(std::fs::File::open(&path).map_err(|e| format!("opening {path}: {e}"))?)
+            };
+            stream_decode(reader, &cfg, &db, cli.channel, &cli.alias, &mut outs)
+                .map_err(|e| format!("decode: {e}"))
         })(),
         "synth" => (|| {
             let cfg = build_cfg(&cli, 500_000_000.0);

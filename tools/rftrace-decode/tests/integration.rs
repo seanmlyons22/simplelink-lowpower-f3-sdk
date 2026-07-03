@@ -350,3 +350,58 @@ fn cli_emits_tilogger_pcap_over_stdout() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ============ streaming decode: bounded memory, correct across chunk boundaries ============
+
+/// The `decode` path streams in 1 MiB chunks with a one-frame carry. Synth one capture, tile
+/// it past several chunk boundaries, decode, and assert every packet survives — i.e. frames
+/// straddling a chunk boundary are neither dropped nor duplicated (guards `stream_decode`).
+#[test]
+fn stream_decode_crosses_chunk_boundaries() {
+    use std::io::Write;
+    use std::process::Command;
+
+    let bin = env!("CARGO_BIN_EXE_tracedecode");
+    let dir = std::env::temp_dir().join(format!("rftrace-stream-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dbgid_path = dir.join("t_dbgid.h");
+    let one = dir.join("one.raw");
+    let big = dir.join("big.raw");
+    std::fs::File::create(&dbgid_path)
+        .unwrap()
+        .write_all(b"DBG_DEF(DBGID_t_c_42, 5, DBGCH1, -1, \"val %08X\", \"t.c\", 42)\n")
+        .unwrap();
+
+    // one synth capture = 1 packet.
+    let s = Command::new(bin)
+        .args(["synth", "--dbgid"]).arg(&dbgid_path)
+        .args(["--channel", "4", "--out"]).arg(&one)
+        .output().unwrap();
+    assert!(s.status.success());
+    let onebytes = std::fs::read(&one).unwrap();
+
+    // tile past 3 MiB (>= 3 chunk boundaries at 1 MiB/chunk).
+    let tiles = (3 * (1 << 20) / onebytes.len()) + 4;
+    let mut f = std::fs::File::create(&big).unwrap();
+    for _ in 0..tiles {
+        f.write_all(&onebytes).unwrap();
+    }
+    drop(f);
+
+    let out = Command::new(bin)
+        .args(["decode", "--raw"]).arg(&big)
+        .args(["--channel", "4", "--dbgid"]).arg(&dbgid_path)
+        .arg("stdout")
+        .output().unwrap();
+    assert!(out.status.success());
+    let records = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| l.starts_with("rftrc "))
+        .count();
+    assert_eq!(records, tiles, "one packet per tile must survive chunk boundaries");
+    // health line reports zero framing/crc errors across the boundaries.
+    let health = String::from_utf8_lossy(&out.stderr);
+    assert!(health.contains("framing=0 crc=0"), "no boundary framing/crc errors: {health}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

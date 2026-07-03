@@ -342,9 +342,10 @@ Pick exactly one source: `--sal`, `--raw`, or `--sigrok`.
   `$TRACEDECODE`.
 * `--divide-time-by-2` is needed for 48 MHz tracer variants (0.25 us ticks, e.g.
   CC2745) so device time matches wall time.
-* Live `--sigrok` capture must be bounded (`--samples`/`--time`) for now: the
-  decoder buffers the whole capture before emitting. `--sal`/`--raw` replay is
-  unaffected.
+* Live `--sigrok` capture runs **endlessly** — the decoder streams (chunked, with
+  bounded ~5 MB memory) and emits records live, at >780 MS/s worst-case /
+  >1 GS/s idle on one core, comfortably above the 500 MS/s line rate. Omit
+  sigrok's `--samples`/`--time` to capture continuously.
 
 ### From Replay File Transport
 
