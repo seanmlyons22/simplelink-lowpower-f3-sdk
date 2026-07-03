@@ -307,15 +307,22 @@ Decodes the CC-series RF-core (LRFDTRC) trace pin captured by a logic analyzer,
 using the native `tracedecode` backend (`tools/rftrace-decode`, build with
 `cargo build --release`). It is a drop-in transport: pick a source and any
 existing output (`stdout`, `wireshark`, `to-replayfile`) — the logs appear
-identically to ITM/UART. **No ELF is needed**; metadata comes from `elf2dbgid`
-`--dbgid` header(s).
+identically to ITM/UART.
+
+**Metadata**: pass `--elf <app.out>` and all CPU-side logs are resolved straight
+from the binary — no manual `elf2dbgid` step. (The transport reads the ELF's
+dbgid table directly via tilogger's own ELF parser, producing the exact same
+table `elf2dbgid` would.) Add `--dbgid <file>` for modem/LRF traces (pbe/rfe/mce),
+which live in separate headers, not the app ELF. At least one of `--elf`/`--dbgid`
+is required.
 
 ```text
 $ tilogger rftrace --help
   Add the RF-core (LRFDTRC) trace decoder as a log input.
 
 Options:
-  --dbgid PATH          elf2dbgid DBG_DEF header(s); repeatable  [required]
+  --elf PATH            application .out; CPU-side logs read straight from it
+  --dbgid PATH          extra DBG_DEF header(s) for modem/LRF (pbe/rfe/mce); repeatable
   --sal PATH            Saleae .sal capture to replay
   --raw PATH            raw 1 byte/sample file, or - for stdin
   --sigrok TEXT         sigrok-cli args for live capture, piped into the decoder
@@ -329,15 +336,20 @@ Pick exactly one source: `--sal`, `--raw`, or `--sigrok`.
 
 #### Examples
 
-* Replay a Saleae capture to stdout:
-    * `tilogger rftrace --sal cap.sal --dbgid app_dbgid.h --dbgid pbe_dbgid.h --channel 4 --divide-time-by-2 stdout`
+* Replay a Saleae capture to stdout, metadata from the ELF (no elf2dbgid):
+    * `tilogger rftrace --sal cap.sal --elf app.out --channel 4 --divide-time-by-2 stdout`
+* Add modem/LRF traces on top of the ELF:
+    * `tilogger rftrace --sal cap.sal --elf app.out --dbgid pbe_dbgid.h --channel 4 --divide-time-by-2 stdout`
 * Replay to Wireshark (auto-launch + configure, works on Linux and Windows):
-    * `tilogger rftrace --sal cap.sal --dbgid app_dbgid.h --divide-time-by-2 wireshark --start`
-* Live from a logic analyzer via sigrok:
-    * `tilogger rftrace --sigrok "--driver saleae-logic-pro-16 --config samplerate=500M -C D4 --samples 500M" --dbgid app_dbgid.h --channel 0 --divide-time-by-2 stdout`
+    * `tilogger rftrace --sal cap.sal --elf app.out --divide-time-by-2 wireshark --start`
+* Live from a logic analyzer via sigrok (endless):
+    * `tilogger rftrace --sigrok "--driver saleae-logic-pro-16 --config samplerate=500M -C D4" --elf app.out --channel 0 --divide-time-by-2 stdout`
+* Pre-extracted headers still work (no ELF): `--dbgid app_dbgid.h --dbgid pbe_dbgid.h`.
 
 #### rftrace Transport Considerations
 
+* `--elf` reads the ELF once at startup (via `pyelftools`, already a tilogger
+  dependency); the extracted table is verified byte-identical to `elf2dbgid`'s.
 * Point `--tracedecode` at the built binary, or put it on `PATH`, or set
   `$TRACEDECODE`.
 * `--divide-time-by-2` is needed for 48 MHz tracer variants (0.25 us ticks, e.g.

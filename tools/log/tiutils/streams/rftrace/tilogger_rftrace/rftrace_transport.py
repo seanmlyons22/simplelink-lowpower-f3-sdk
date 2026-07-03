@@ -152,7 +152,7 @@ class RFTrace_Transport(_TransportBase):
     """tilogger transport that fronts the native `tracedecode` backend."""
 
     def __init__(self, *, tracedecode, sal, raw, sigrok, channel, samplerate, baud,
-                 divide_time_by_2, dbgid, alias):
+                 divide_time_by_2, dbgid, elf, alias):
         self._td = _resolve_tracedecode(tracedecode)
         self._sal = sal
         self._raw = raw
@@ -161,9 +161,11 @@ class RFTrace_Transport(_TransportBase):
         self._samplerate = samplerate
         self._baud = baud
         self._divide = divide_time_by_2
-        self._dbgid = dbgid
+        self._dbgid = list(dbgid)
+        self._elf = elf
         self._alias = alias or "rftrc"
         self._procs = []
+        self._elf_tmp = None  # temp DBG_DEF file extracted from --elf
 
     @property
     def alias(self):
@@ -209,6 +211,13 @@ class RFTrace_Transport(_TransportBase):
         from tilogger.interface import LogPacket, LogLevel
         from tilogger.tracedb import Opcode
 
+        # --elf: extract the CPU-side dbgid table straight from the ELF (no manual elf2dbgid).
+        # It goes first so any explicit --dbgid (modem/LRF: pbe/rfe/mce) layers on top.
+        if self._elf is not None:
+            from .elf_dbgid import elf_to_dbgid_file
+            self._elf_tmp = elf_to_dbgid_file(self._elf)
+            self._dbgid = [self._elf_tmp] + self._dbgid
+
         stream = self._spawn()
         for ts, cols in parse_pcap_records(stream):
             alias, _ts_str, _opcode, module, level, filename, lineno, text = cols
@@ -238,6 +247,12 @@ class RFTrace_Transport(_TransportBase):
             except Exception:
                 p.kill()
 
+        if self._elf_tmp is not None:
+            try:
+                os.unlink(self._elf_tmp)
+            except OSError:
+                pass
+
     def stop(self):
         for p in self._procs:
             try:
@@ -261,7 +276,8 @@ def transport_factory_cli(app):
     @app.command(name="rftrace")
     def transport_factory_cb(
         ctx: typer.Context,
-        dbgid: List[Path] = typer.Option([], "--dbgid", help="elf2dbgid DBG_DEF header(s); repeatable"),
+        elf: Optional[Path] = typer.Option(None, "--elf", help="application .out; CPU-side logs are read straight from it (no manual elf2dbgid)"),
+        dbgid: List[Path] = typer.Option([], "--dbgid", help="extra DBG_DEF header(s) for modem/LRF (pbe/rfe/mce); repeatable"),
         sal: Optional[Path] = typer.Option(None, "--sal", help="Saleae .sal capture to replay"),
         raw: Optional[Path] = typer.Option(None, "--raw", help="raw 1 byte/sample file, or - for stdin"),
         sigrok: Optional[str] = typer.Option(None, "--sigrok", help="sigrok-cli args for live capture, piped into the decoder"),
@@ -276,23 +292,26 @@ def transport_factory_cli(app):
 
         Drop-in for `itm`/`uart`: pick a source and one or more outputs, e.g.
 
-            tilogger rftrace --sal cap.sal --dbgid app_dbgid.h --dbgid pbe_dbgid.h \\
+            tilogger rftrace --sal cap.sal --elf app.out \\
                 --channel 4 --divide-time-by-2 wireshark --start
 
+        Metadata: pass `--elf <app.out>` to resolve all CPU-side logs straight from the
+        binary (no manual elf2dbgid step). Add `--dbgid <file>` for modem/LRF traces
+        (pbe/rfe/mce), which aren't in the app ELF. At least one of --elf / --dbgid is required.
+
         Sources (exactly one): --sal <file>, --raw <file|->, or --sigrok "<args>".
-        No ELF is needed — metadata comes from the elf2dbgid --dbgid header(s).
         """
         ctx.ensure_object(LoggerCliCtx)
         if sum(x is not None for x in (sal, raw, sigrok)) != 1:
             typer.secho("rftrace: specify exactly one of --sal, --raw, --sigrok", fg=typer.colors.BRIGHT_RED, err=True)
             raise typer.Exit(2)
-        if not dbgid:
-            typer.secho("rftrace: need at least one --dbgid <file>", fg=typer.colors.BRIGHT_RED, err=True)
+        if elf is None and not dbgid:
+            typer.secho("rftrace: need --elf <app.out> and/or --dbgid <file>", fg=typer.colors.BRIGHT_RED, err=True)
             raise typer.Exit(2)
         return RFTrace_Transport(
             tracedecode=tracedecode, sal=sal, raw=raw, sigrok=sigrok, channel=channel,
             samplerate=samplerate, baud=baud, divide_time_by_2=divide_time_by_2,
-            dbgid=dbgid, alias=alias,
+            dbgid=dbgid, elf=elf, alias=alias,
         )
 
 

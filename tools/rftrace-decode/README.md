@@ -117,18 +117,23 @@ so it swaps in for `itm`/`uart` with the same command shape and reuses every til
 output (`stdout`, `wireshark`, `to-replayfile`) unchanged:
 
 ```
-tilogger rftrace --sal cap.sal --dbgid app_dbgid.h --dbgid pbe_dbgid.h \
-    --channel 4 --divide-time-by-2 stdout
-tilogger rftrace --sal cap.sal --dbgid app_dbgid.h --divide-time-by-2 wireshark --start
+tilogger rftrace --sal cap.sal --elf app.out \
+    --channel 4 --divide-time-by-2 stdout                            # metadata from the ELF
+tilogger rftrace --sal cap.sal --elf app.out --dbgid pbe_dbgid.h \
+    --divide-time-by-2 wireshark --start                            # + modem/LRF headers
 tilogger rftrace --sigrok "--driver saleae-logic-pro-16 --config samplerate=500M \
-    -C D4" --dbgid app_dbgid.h --channel 0 --divide-time-by-2 stdout   # endless live
+    -C D4" --elf app.out --channel 0 --divide-time-by-2 stdout       # endless live
 ```
 
 The transport (`tools/log/tiutils/streams/rftrace/`) runs this `tracedecode` binary with
 `pcap --out -` and adapts its `||` records into tilogger `LogPacket`s (the `from-replayfile`
-pattern), so metadata resolution and formatting stay here and presentation stays shared with
-ITM/UART. Point it at the binary via `--tracedecode`, `$TRACEDECODE`, or `PATH`. See
-`tools/log/tiutils/README.md` → "RF-core Trace (rftrace) Transport".
+pattern), so formatting/presentation stay shared with ITM/UART. **`--elf <app.out>` resolves
+all CPU-side logs straight from the binary** — the transport reads the ELF's dbgid table via
+tilogger's own ELF parser (`elf_dbgid.py`, verified byte-identical to `elf2dbgid`), so no
+manual elf2dbgid step is needed; extra `--dbgid` headers add modem/LRF (pbe/rfe/mce). The Rust
+decoder itself still only reads DBG_DEF `--dbgid` files (ADR-013 — never parses ELF); the
+transport bridges the ELF to it. Point it at the binary via `--tracedecode`, `$TRACEDECODE`,
+or `PATH`. See `tools/log/tiutils/README.md` → "RF-core Trace (rftrace) Transport".
 
 The same change made tilogger's **Wireshark output work on Linux** (`streams/wireshark`): the
 win32 named-pipe path was guarded and a FIFO path added, so `wireshark --start` auto-launches
