@@ -36,7 +36,7 @@ import logging
 import platform
 from struct import pack
 import typing
-import pkg_resources
+from importlib.metadata import entry_points
 import argparse
 import typer
 import click
@@ -65,7 +65,7 @@ class Logger:
         # Note that any duplicate formatters are resolved to a single formatter last-come-first-served
         self._formatters: Dict[str, LogFormatterABC] = {
             entry_point.name: entry_point.load()
-            for entry_point in pkg_resources.iter_entry_points("tilogger.formatter")
+            for entry_point in entry_points(group="tilogger.formatter")
         }
 
         self.timebase = None
@@ -73,7 +73,7 @@ class Logger:
         self.subscribers: DefaultDict[str, List[LogSubscriberABC]] = defaultdict(list)
 
         # Subscribers are slightly more difficult, because we need to handle duplicates explicitly
-        for entry_point in pkg_resources.iter_entry_points("tilogger.subscriber"):
+        for entry_point in entry_points(group="tilogger.subscriber"):
             self.subscribers[entry_point.name].append(entry_point.load())
 
         self.transports: List[TransportABC] = transports
@@ -223,13 +223,13 @@ def main():
     Generates argparse parsers, reads command line arguments and starts a Logger.
     """
     # Plug in transports that are installed, add them as subcommands
-    for entry_point in pkg_resources.iter_entry_points("tilogger.transport"):
+    for entry_point in entry_points(group="tilogger.transport"):
         subtyper = entry_point.load()
         subtyper(logger_cli)
         # logger_cli.add_typer(subtyper, name=entry_point.name)
 
     # Plug in outputs that are installed, add them as subcommands
-    for entry_point in pkg_resources.iter_entry_points("tilogger.output"):
+    for entry_point in entry_points(group="tilogger.output"):
         subtyper = entry_point.load()
         subtyper(logger_cli)
         # logger_cli.add_typer(subtyper, name=entry_point.name)

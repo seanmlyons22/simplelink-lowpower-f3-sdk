@@ -37,7 +37,6 @@ import platform
 from struct import pack
 from threading import local
 import typing
-import pkg_resources
 import argparse
 
 # win32 pipes are Windows-only; on Linux/macOS we use a FIFO instead (see below), so
