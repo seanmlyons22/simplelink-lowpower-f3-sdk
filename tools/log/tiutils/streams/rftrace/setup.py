@@ -1,5 +1,5 @@
 """
-Copyright (C) 2021-2025, Texas Instruments Incorporated
+Copyright (C) 2026, Texas Instruments Incorporated
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions
@@ -33,14 +33,14 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 import setuptools
 
 setuptools.setup(
-    name="tilogger-wireshark-output",
-    version="0.2.0",
+    name="tilogger_rftrace_transport",
+    version="0.1.0",
     packages=setuptools.find_packages(),
     include_package_data=True,
     entry_points={
-        "tilogger.output": [
-            "wireshark = tilogger_wireshark.main:output_factory_cli",
+        "tilogger.transport": [
+            "rftrace = tilogger_rftrace.rftrace_transport:transport_factory_cli",
         ],
     },
-    install_requires=["pywin32==308; platform_system=='Windows'", "typer==0.15.1", "colorama==0.4.6"],
+    install_requires=["typer==0.15.1", "colorama==0.4.6"],
 )

@@ -86,17 +86,35 @@ One pipe: `sigrok-cli -O binary | tracedecode decode --raw - … pcap --out - | 
 Drive it with a bounded `--samples`/`--time` — the decoder buffers the whole capture before
 emitting (fine for a burst; a streaming deframer is the upgrade for unbounded live tail).
 
-> Note: tilogger's own Python Wireshark output (`streams/wireshark`) is Windows-only
-> (win32 named pipes). This decoder's extcap + `pcap --out -` paths are the cross-platform
-> route and produce byte-identical records, so logs are indistinguishable from ITM in the UI.
+## Integration with `tilogger` (primary UX)
 
-## Relationship to `tilogger`
+This decoder is wired into the existing `tilogger` tool as a first-class **transport**,
+so it swaps in for `itm`/`uart` with the same command shape and reuses every tilogger
+output (`stdout`, `wireshark`, `to-replayfile`) unchanged:
 
-This is a **standalone native backend** (architecture ADR-017), not a `tilogger` Python
-transport plugin — nothing registers it into `python -m tilogger`. It replaces the whole
-ITM/UART *acquisition + decode* chain and hands the shared *presentation* layer (the pcap
-DLT_USER0 stream + `tilogger_dissector.lua`) the exact same bytes. The `cli_emits_tilogger_pcap_over_stdout`
-integration test launches the built binary as a subprocess and asserts that contract (DLT
-147 + the 8 dissector columns). If you instead want `python -m tilogger rftrace … wireshark`
-to launch it as a first-class transport, that's a separate `TransportABC` plugin under
-`streams/` — ask and it can be added.
+```
+tilogger rftrace --sal cap.sal --dbgid app_dbgid.h --dbgid pbe_dbgid.h \
+    --channel 4 --divide-time-by-2 stdout
+tilogger rftrace --sal cap.sal --dbgid app_dbgid.h --divide-time-by-2 wireshark --start
+tilogger rftrace --sigrok "--driver saleae-logic-pro-16 --config samplerate=500M \
+    -C D4 --samples 500M" --dbgid app_dbgid.h --channel 0 --divide-time-by-2 stdout
+```
+
+The transport (`tools/log/tiutils/streams/rftrace/`) runs this `tracedecode` binary with
+`pcap --out -` and adapts its `||` records into tilogger `LogPacket`s (the `from-replayfile`
+pattern), so metadata resolution and formatting stay here and presentation stays shared with
+ITM/UART. Point it at the binary via `--tracedecode`, `$TRACEDECODE`, or `PATH`. See
+`tools/log/tiutils/README.md` → "RF-core Trace (rftrace) Transport".
+
+The same change made tilogger's **Wireshark output work on Linux** (`streams/wireshark`): the
+win32 named-pipe path was guarded and a FIFO path added, so `wireshark --start` auto-launches
+and configures Wireshark on Linux and Windows alike.
+
+## Standalone use (no tilogger)
+
+The `replay`/`decode`/`tail`/`retain`/`wireshark` subcommands, the `extcap/` wrapper, and
+`scripts/sigrok-to-wireshark.sh` above run the decoder directly without the Python tool —
+same pcap DLT_USER0 stream, same `tilogger_dissector.lua`. Per architecture ADR-017 the
+decode core is a standalone native backend; the tilogger transport is a thin adapter on top,
+not a rewrite. The `cli_emits_tilogger_pcap_over_stdout` test asserts the binary's pcap
+contract (DLT 147 + the 8 dissector columns).

@@ -39,8 +39,16 @@ from threading import local
 import typing
 import pkg_resources
 import argparse
-import win32pipe
-import win32file
+
+# win32 pipes are Windows-only; on Linux/macOS we use a FIFO instead (see below), so
+# guard the import so this output plugin still loads and works on those platforms.
+try:
+    import win32pipe
+    import win32file
+except ImportError:
+    win32pipe = None
+    win32file = None
+
 import typer
 import click
 import subprocess
@@ -83,9 +91,29 @@ class WiresharkOutput(LogOutputABC):
         self._pipe = None
         self._pipe_inited = False
         self._pipe_backlog = []
-        self._create_try_connect_pipe()
+        self._is_windows = platform.system() == "Windows"
+        self._launch_ws = ws_pipe is not None  # --start passed a pipe name; else don't auto-launch
+        self._fifo = None  # Linux/macOS FIFO handle
+        if self._is_windows:
+            self._create_try_connect_pipe()
+        else:
+            self._create_fifo()
 
     def start(self):
+        if not self._is_windows:
+            if self._launch_ws:
+                start_wireshark(self.ws_pipe)
+            else:
+                logger.warning("Wireshark not auto-started; open it on this FIFO: %s", self.ws_pipe)
+            # Opening the FIFO for write blocks until Wireshark opens it for read.
+            self._fifo = open(self.ws_pipe, "wb")
+            self._fifo.write(self._pcap_global_header())
+            for x in self._pipe_backlog:
+                self._fifo.write(x)
+            self._fifo.flush()
+            self._pipe_backlog = []
+            self._pipe_inited = True
+            return
         start_wireshark(self.ws_pipe)
         # Try flushing backlog until Pipe is initialized
         while not self._pipe_inited:
@@ -123,24 +151,45 @@ class WiresharkOutput(LogOutputABC):
                 except Exception:
                     pass
 
-    def _send_internal(self, data: bytes):
-        if platform.system() == "Windows":
-            if not self._pipe_inited:
-                try:
-                    clientpid = win32pipe.GetNamedPipeClientProcessId(self._pipe)
-                    # Assume exception happens above if pipe not yet open. If open, assume below works.
-                    self._connect_send_initial_pipe()
-                    for x in self._pipe_backlog:
-                        win32file.WriteFile(self._pipe, x)
-                    win32file.WriteFile(self._pipe, data)
-                except Exception:
-                    logger.warn("Could not send to Wireshark - packet stored in backlog")
-                    self._pipe_backlog.append(data)
+    def _pcap_global_header(self) -> bytes:
+        # Magic, major/minor, 2x reserved, max packet length, LinkType.
+        return struct.pack(
+            "IHHIIII", self.PCAP_MAGIC_NUMBER, self.PCAP_MAJOR_VER, self.PCAP_MINOR_VER, 0, 0, 256, self.PCAP_LINK_TYPE
+        )
 
+    def _send_internal(self, data: bytes):
+        if not self._is_windows:
+            # Linux/macOS FIFO path. Buffer until start() has opened the FIFO.
+            if not self._pipe_inited or self._fifo is None:
+                self._pipe_backlog.append(data)
             else:
+                self._fifo.write(data)
+                self._fifo.flush()
+            return
+
+        if not self._pipe_inited:
+            try:
+                clientpid = win32pipe.GetNamedPipeClientProcessId(self._pipe)
+                # Assume exception happens above if pipe not yet open. If open, assume below works.
+                self._connect_send_initial_pipe()
+                for x in self._pipe_backlog:
+                    win32file.WriteFile(self._pipe, x)
                 win32file.WriteFile(self._pipe, data)
+            except Exception:
+                logger.warn("Could not send to Wireshark - packet stored in backlog")
+                self._pipe_backlog.append(data)
+
         else:
-            raise NotImplementedError("No support for Linux in this beta")
+            win32file.WriteFile(self._pipe, data)
+
+    def _create_fifo(self):
+        # A unique FIFO path Wireshark reads with `-i`. Windows uses a named pipe instead.
+        import tempfile
+
+        fifo_dir = tempfile.mkdtemp(prefix="tilogger-ws-")
+        self.ws_pipe = os.path.join(fifo_dir, "tilogger-wireshark.pcap")
+        os.mkfifo(self.ws_pipe)
+        logger.info("Wireshark FIFO: %s", self.ws_pipe)
 
     def _create_try_connect_pipe(self):
         # pipename should be of the form \\.\pipe\mypipename
@@ -180,10 +229,20 @@ class WiresharkOutput(LogOutputABC):
 
     def _close(self):
         logger.info("Closing pipe")
-        win32file.CloseHandle(self._pipe)
+        if self._is_windows:
+            win32file.CloseHandle(self._pipe)
+        elif self._fifo is not None:
+            self._fifo.close()
 
 
 def find_wireshark():
+    # On Linux/macOS Wireshark is normally on PATH.
+    import shutil
+
+    which = shutil.which("wireshark")
+    if which:
+        return which
+
     alternatives = [
         Path(os.getenv("%PROGRAMFILES(x86)%", "")) / "Wireshark/Wireshark.exe",
         Path(os.getenv("ProgramFiles", "")) / "Wireshark/Wireshark.exe",

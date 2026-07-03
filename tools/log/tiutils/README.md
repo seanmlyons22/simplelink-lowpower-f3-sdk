@@ -13,6 +13,7 @@ modules is displayed in the list below.
 
 * itm
 * uart
+* rftrace (RF-core LRFDTRC trace pin, via the native `tracedecode` backend)
 * from-replayfile
 
 #### Output modules
@@ -299,6 +300,51 @@ Options:
   > "Application/User UART".
 * Waiting for a reset frame is not necessary for UART transport, in this case
   `tilogger` can attach to a running data stream.
+
+### RF-core Trace (rftrace) Transport
+
+Decodes the CC-series RF-core (LRFDTRC) trace pin captured by a logic analyzer,
+using the native `tracedecode` backend (`tools/rftrace-decode`, build with
+`cargo build --release`). It is a drop-in transport: pick a source and any
+existing output (`stdout`, `wireshark`, `to-replayfile`) — the logs appear
+identically to ITM/UART. **No ELF is needed**; metadata comes from `elf2dbgid`
+`--dbgid` header(s).
+
+```text
+$ tilogger rftrace --help
+  Add the RF-core (LRFDTRC) trace decoder as a log input.
+
+Options:
+  --dbgid PATH          elf2dbgid DBG_DEF header(s); repeatable  [required]
+  --sal PATH            Saleae .sal capture to replay
+  --raw PATH            raw 1 byte/sample file, or - for stdin
+  --sigrok TEXT         sigrok-cli args for live capture, piped into the decoder
+  --channel INTEGER     LA channel of the rfctrc_out pin  [default: 4]
+  --divide-time-by-2    48 MHz tracer / 0.25 us ticks (e.g. CC2745)
+  --alias TEXT          device alias shown in the log
+  --tracedecode PATH    path to the tracedecode binary ($TRACEDECODE or PATH otherwise)
+```
+
+Pick exactly one source: `--sal`, `--raw`, or `--sigrok`.
+
+#### Examples
+
+* Replay a Saleae capture to stdout:
+    * `tilogger rftrace --sal cap.sal --dbgid app_dbgid.h --dbgid pbe_dbgid.h --channel 4 --divide-time-by-2 stdout`
+* Replay to Wireshark (auto-launch + configure, works on Linux and Windows):
+    * `tilogger rftrace --sal cap.sal --dbgid app_dbgid.h --divide-time-by-2 wireshark --start`
+* Live from a logic analyzer via sigrok:
+    * `tilogger rftrace --sigrok "--driver saleae-logic-pro-16 --config samplerate=500M -C D4 --samples 500M" --dbgid app_dbgid.h --channel 0 --divide-time-by-2 stdout`
+
+#### rftrace Transport Considerations
+
+* Point `--tracedecode` at the built binary, or put it on `PATH`, or set
+  `$TRACEDECODE`.
+* `--divide-time-by-2` is needed for 48 MHz tracer variants (0.25 us ticks, e.g.
+  CC2745) so device time matches wall time.
+* Live `--sigrok` capture must be bounded (`--samples`/`--time`) for now: the
+  decoder buffers the whole capture before emitting. `--sal`/`--raw` replay is
+  unaffected.
 
 ### From Replay File Transport
 
