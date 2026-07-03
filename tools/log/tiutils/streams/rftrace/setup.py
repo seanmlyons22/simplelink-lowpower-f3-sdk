@@ -43,4 +43,7 @@ setuptools.setup(
         ],
     },
     install_requires=["typer==0.15.1", "colorama==0.4.6"],
+    # --logic2 (drive Logic 2 to capture from a Saleae Logic Pro) is optional:
+    #   pip install -e streams/rftrace[logic2]
+    extras_require={"logic2": ["logic2-automation>=1.0.0"]},
 )

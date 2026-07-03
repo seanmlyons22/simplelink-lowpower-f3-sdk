@@ -152,7 +152,11 @@ class RFTrace_Transport(_TransportBase):
     """tilogger transport that fronts the native `tracedecode` backend."""
 
     def __init__(self, *, tracedecode, sal, raw, sigrok, channel, samplerate, baud,
-                 divide_time_by_2, dbgid, elf, alias):
+                 divide_time_by_2, dbgid, elf, alias,
+                 logic2=False, duration=None, trigger=None, trigger_channel=None,
+                 after=None, buffer_mb=None, loop=False, count=None,
+                 logic2_port=10430, logic2_address="127.0.0.1", logic2_device=None,
+                 threshold=1.8):
         self._td = _resolve_tracedecode(tracedecode)
         self._sal = sal
         self._raw = raw
@@ -166,6 +170,22 @@ class RFTrace_Transport(_TransportBase):
         self._alias = alias or "rftrc"
         self._procs = []
         self._elf_tmp = None  # temp DBG_DEF file extracted from --elf
+        # --logic2: drive Logic 2 (Automation API) in a capture loop; each window is
+        # saved to a temp .sal and fed through the same replay path. Batched, not
+        # streaming (the Pro 8 + Automation API can't stream mid-capture).
+        self._logic2 = logic2
+        self._duration = duration
+        self._trigger = trigger
+        self._trigger_channel = trigger_channel
+        self._after = after
+        self._buffer_mb = buffer_mb
+        self._loop = loop
+        self._count = count
+        self._l2_port = logic2_port
+        self._l2_address = logic2_address
+        self._l2_device = logic2_device
+        self._threshold = threshold
+        self._stopping = False
 
     @property
     def alias(self):
@@ -218,42 +238,144 @@ class RFTrace_Transport(_TransportBase):
             self._elf_tmp = elf_to_dbgid_file(self._elf)
             self._dbgid = [self._elf_tmp] + self._dbgid
 
-        stream = self._spawn()
-        for ts, cols in parse_pcap_records(stream):
-            alias, _ts_str, _opcode, module, level, filename, lineno, text = cols
-            level_name = _LEVEL_NAMES.get(level.upper(), "Log_INFO")
-            packet = LogPacket(
-                alias=alias,
-                module=module,
-                # REPLAY_FILE opcode => logger.log() skips ELF re-formatting (we have none).
-                opcode=Opcode.REPLAY_FILE.value,
-                level=LogLevel[level_name],
-                filename=filename,
-                lineno=lineno,
-                timestamp=ts,
-                timestamp_local=ts,
-                data=None,
-                trace_db=None,
-            )
-            packet._str_data = text
-            if logger_core:
-                logger_core.log(packet)
-            else:
-                print(f"{alias} | {ts:.9f} | {module} | {level_name} | {filename}:{lineno} | {text}")
+        def emit(stream):
+            for ts, cols in parse_pcap_records(stream):
+                alias, _ts_str, _opcode, module, level, filename, lineno, text = cols
+                level_name = _LEVEL_NAMES.get(level.upper(), "Log_INFO")
+                packet = LogPacket(
+                    alias=alias,
+                    module=module,
+                    # REPLAY_FILE opcode => logger.log() skips ELF re-formatting (we have none).
+                    opcode=Opcode.REPLAY_FILE.value,
+                    level=LogLevel[level_name],
+                    filename=filename,
+                    lineno=lineno,
+                    timestamp=ts,
+                    timestamp_local=ts,
+                    data=None,
+                    trace_db=None,
+                )
+                packet._str_data = text
+                if logger_core:
+                    logger_core.log(packet)
+                else:
+                    print(f"{alias} | {ts:.9f} | {module} | {level_name} | {filename}:{lineno} | {text}")
 
+        try:
+            if self._logic2:
+                self._run_logic2(emit)
+            else:
+                emit(self._spawn())
+                self._reap()
+        finally:
+            if self._elf_tmp is not None:
+                try:
+                    os.unlink(self._elf_tmp)
+                except OSError:
+                    pass
+
+    def _reap(self):
         for p in self._procs:
             try:
-                p.wait(timeout=5)
+                p.wait(timeout=10)
             except Exception:
                 p.kill()
+        self._procs = []
 
-        if self._elf_tmp is not None:
+    def _capture_config(self, automation):
+        """Build a CaptureConfiguration from the --duration / --trigger knobs."""
+        if self._trigger:
+            tt = {
+                "rising": automation.DigitalTriggerType.RISING,
+                "falling": automation.DigitalTriggerType.FALLING,
+                "pulse-high": automation.DigitalTriggerType.PULSE_HIGH,
+                "pulse-low": automation.DigitalTriggerType.PULSE_LOW,
+            }[self._trigger]
+            ch = self._trigger_channel if self._trigger_channel is not None else self._channel
+            mode = automation.DigitalTriggerCaptureMode(
+                trigger_type=tt,
+                trigger_channel_index=ch,
+                after_trigger_seconds=self._after if self._after is not None else 1.0,
+            )
+        else:
+            mode = automation.TimedCaptureMode(duration_seconds=self._duration)
+        return automation.CaptureConfiguration(
+            capture_mode=mode, buffer_size_megabytes=self._buffer_mb
+        )
+
+    def _pick_device(self, mgr, automation):
+        if self._l2_device:
+            return self._l2_device
+        devs = [d for d in mgr.get_devices() if not getattr(d, "is_simulation", False)]
+        if not devs:
+            raise SystemExit("rftrace --logic2: no Saleae device found "
+                             "(is Logic 2 running with the device connected?)")
+        pros = (automation.DeviceType.LOGIC_PRO_8, automation.DeviceType.LOGIC_PRO_16)
+        for d in devs:
+            if d.device_type in pros:
+                return d.device_id
+        return devs[0].device_id
+
+    def _run_logic2(self, emit):
+        """Loop: capture a window via the Logic 2 Automation API, save it to a temp
+        .sal, and decode it through the same replay path — repeat per --loop/--count."""
+        import tempfile
+        try:
+            from saleae import automation
+        except ImportError:
+            raise SystemExit("rftrace --logic2 needs the Saleae automation package: "
+                             "pip install logic2-automation")
+
+        sr = int(self._samplerate) if self._samplerate else 500_000_000
+        devcfg = automation.LogicDeviceConfiguration(
+            enabled_digital_channels=[self._channel],
+            digital_sample_rate=sr,
+            digital_threshold_volts=self._threshold,
+        )
+        mgr = automation.Manager.connect(address=self._l2_address, port=self._l2_port)
+        try:
+            device_id = self._pick_device(mgr, automation)
+            n = 0
+            while not self._stopping:
+                cap = mgr.start_capture(
+                    device_id=device_id,
+                    device_configuration=devcfg,
+                    capture_configuration=self._capture_config(automation),
+                )
+                fd, tmp = tempfile.mkstemp(prefix="rftrace_l2_", suffix=".sal")
+                os.close(fd)
+                try:
+                    cap.wait()  # blocks until the timed window / trigger+after completes
+                    cap.save_capture(tmp)
+                finally:
+                    try:
+                        cap.close()
+                    except Exception:
+                        pass
+                self._sal = tmp
+                try:
+                    emit(self._spawn())
+                    self._reap()
+                finally:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                n += 1
+                if self._count and n >= self._count:
+                    break
+                if not self._loop and not self._count:
+                    break  # single capture unless --loop / --count
+        except KeyboardInterrupt:
+            pass
+        finally:
             try:
-                os.unlink(self._elf_tmp)
-            except OSError:
+                mgr.close()
+            except Exception:
                 pass
 
     def stop(self):
+        self._stopping = True
         for p in self._procs:
             try:
                 p.terminate()
@@ -281,6 +403,18 @@ def transport_factory_cli(app):
         sal: Optional[Path] = typer.Option(None, "--sal", help="Saleae .sal capture to replay"),
         raw: Optional[Path] = typer.Option(None, "--raw", help="raw 1 byte/sample file, or - for stdin"),
         sigrok: Optional[str] = typer.Option(None, "--sigrok", help="sigrok-cli args for live capture, piped into the decoder"),
+        logic2: bool = typer.Option(False, "--logic2", help="capture via the Logic 2 Automation API (Saleae Logic Pro), looped"),
+        duration: Optional[float] = typer.Option(None, "--duration", help="[--logic2] timed capture window, seconds"),
+        trigger: Optional[str] = typer.Option(None, "--trigger", help="[--logic2] digital trigger: rising|falling|pulse-high|pulse-low"),
+        trigger_channel: Optional[int] = typer.Option(None, "--trigger-channel", help="[--logic2] trigger channel (default: --channel)"),
+        after: Optional[float] = typer.Option(None, "--after", help="[--logic2] seconds to capture after the trigger (default 1.0)"),
+        buffer_mb: Optional[int] = typer.Option(None, "--buffer-mb", help="[--logic2] capture RAM buffer bound, MB"),
+        loop: bool = typer.Option(False, "--loop", help="[--logic2] keep capturing windows until stopped"),
+        count: Optional[int] = typer.Option(None, "--count", help="[--logic2] capture exactly N windows then stop"),
+        logic2_port: int = typer.Option(10430, "--logic2-port", help="[--logic2] automation server port"),
+        logic2_address: str = typer.Option("127.0.0.1", "--logic2-address", help="[--logic2] automation server address"),
+        logic2_device: Optional[str] = typer.Option(None, "--logic2-device", help="[--logic2] device id (default: first Logic Pro found)"),
+        threshold: float = typer.Option(1.8, "--threshold", help="[--logic2] digital threshold volts"),
         channel: int = typer.Option(4, "--channel", help="LA channel of the rfctrc_out pin"),
         samplerate: Optional[float] = typer.Option(None, "--samplerate", help="override sample rate (Hz)"),
         baud: Optional[float] = typer.Option(None, "--baud", help="override tracer baud (Hz)"),
@@ -299,12 +433,29 @@ def transport_factory_cli(app):
         binary (no manual elf2dbgid step). Add `--dbgid <file>` for modem/LRF traces
         (pbe/rfe/mce), which aren't in the app ELF. At least one of --elf / --dbgid is required.
 
-        Sources (exactly one): --sal <file>, --raw <file|->, or --sigrok "<args>".
+        Sources (exactly one): --sal <file>, --raw <file|->, --sigrok "<args>", or
+        --logic2 (drive Logic 2's Automation API to capture from a Saleae Logic Pro;
+        needs `pip install logic2-automation` and Logic 2 running with automation
+        enabled). With --logic2 set --duration <s> or --trigger <edge>; add --loop or
+        --count N for rolling windows. Batched, not continuous (the hardware can't stream).
+
+            tilogger rftrace --logic2 --duration 2 --loop --elf app.out \\
+                --channel 4 --divide-time-by-2 wireshark --start
+            tilogger rftrace --logic2 --trigger rising --trigger-channel 4 --after 1 \\
+                --count 5 --elf app.out stdout
         """
         ctx.ensure_object(LoggerCliCtx)
-        if sum(x is not None for x in (sal, raw, sigrok)) != 1:
-            typer.secho("rftrace: specify exactly one of --sal, --raw, --sigrok", fg=typer.colors.BRIGHT_RED, err=True)
+        nsources = sum(x is not None for x in (sal, raw, sigrok)) + (1 if logic2 else 0)
+        if nsources != 1:
+            typer.secho("rftrace: specify exactly one source: --sal, --raw, --sigrok, or --logic2", fg=typer.colors.BRIGHT_RED, err=True)
             raise typer.Exit(2)
+        if logic2:
+            if trigger is None and duration is None:
+                typer.secho("rftrace --logic2: need --duration <s> or --trigger <edge>", fg=typer.colors.BRIGHT_RED, err=True)
+                raise typer.Exit(2)
+            if trigger is not None and trigger not in ("rising", "falling", "pulse-high", "pulse-low"):
+                typer.secho("rftrace --trigger: one of rising|falling|pulse-high|pulse-low", fg=typer.colors.BRIGHT_RED, err=True)
+                raise typer.Exit(2)
         if elf is None and not dbgid:
             typer.secho("rftrace: need --elf <app.out> and/or --dbgid <file>", fg=typer.colors.BRIGHT_RED, err=True)
             raise typer.Exit(2)
@@ -312,6 +463,10 @@ def transport_factory_cli(app):
             tracedecode=tracedecode, sal=sal, raw=raw, sigrok=sigrok, channel=channel,
             samplerate=samplerate, baud=baud, divide_time_by_2=divide_time_by_2,
             dbgid=dbgid, elf=elf, alias=alias,
+            logic2=logic2, duration=duration, trigger=trigger, trigger_channel=trigger_channel,
+            after=after, buffer_mb=buffer_mb, loop=loop, count=count,
+            logic2_port=logic2_port, logic2_address=logic2_address,
+            logic2_device=logic2_device, threshold=threshold,
         )
 
 
@@ -343,6 +498,29 @@ def _selfcheck():
     s2 = io.BytesIO(ghdr + struct.pack("<IIII", 0, 0, len(p2), len(p2)) + p2)
     _, c2 = list(parse_pcap_records(s2))[0]
     assert c2[7] == "x||y", c2[7]
+
+    # If the Saleae automation package is present, exercise the --logic2 config builder.
+    try:
+        from saleae import automation
+    except ImportError:
+        pass
+    else:
+        def _mk(**kw):
+            base = dict(tracedecode=None, sal=None, raw=None, sigrok=None, channel=4,
+                        samplerate=None, baud=None, divide_time_by_2=False, dbgid=["x"],
+                        elf=None, alias=None, logic2=True)
+            base.update(kw)
+            return RFTrace_Transport(**base)
+        c = _mk(duration=2.0)._capture_config(automation)
+        assert isinstance(c.capture_mode, automation.TimedCaptureMode)
+        assert c.capture_mode.duration_seconds == 2.0
+        c = _mk(trigger="rising", after=0.5, buffer_mb=256)._capture_config(automation)
+        assert isinstance(c.capture_mode, automation.DigitalTriggerCaptureMode)
+        assert c.capture_mode.trigger_type == automation.DigitalTriggerType.RISING
+        assert c.capture_mode.after_trigger_seconds == 0.5
+        assert c.buffer_size_megabytes == 256
+        print("rftrace_transport logic2 config self-check OK")
+
     print("rftrace_transport self-check OK")
 
 

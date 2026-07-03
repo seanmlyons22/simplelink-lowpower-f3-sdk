@@ -326,13 +326,29 @@ Options:
   --sal PATH            Saleae .sal capture to replay
   --raw PATH            raw 1 byte/sample file, or - for stdin
   --sigrok TEXT         sigrok-cli args for live capture, piped into the decoder
+  --logic2              capture via Logic 2 Automation API (Saleae Logic Pro), looped
+  --duration FLOAT      [--logic2] timed capture window, seconds
+  --trigger TEXT        [--logic2] rising|falling|pulse-high|pulse-low
+  --after FLOAT         [--logic2] seconds to capture after the trigger
+  --loop / --count N    [--logic2] rolling windows / exactly N windows
+  --buffer-mb INTEGER   [--logic2] capture RAM buffer bound, MB
   --channel INTEGER     LA channel of the rfctrc_out pin  [default: 4]
   --divide-time-by-2    48 MHz tracer / 0.25 us ticks (e.g. CC2745)
   --alias TEXT          device alias shown in the log
   --tracedecode PATH    path to the tracedecode binary ($TRACEDECODE or PATH otherwise)
 ```
 
-Pick exactly one source: `--sal`, `--raw`, or `--sigrok`.
+Pick exactly one source: `--sal`, `--raw`, `--sigrok`, or `--logic2`.
+
+`--logic2` drives Logic 2 via its Automation API (the only way to capture from a
+Saleae **Logic Pro** at full rate — sigrok's driver doesn't support the Pro 8 and caps
+at 50 MS/s). It captures a window, saves a temp `.sal`, and decodes it — looped. This is
+**batched, not continuous**: the Automation API only hands data out after each capture
+stops (no mid-capture streaming). Needs `pip install -e streams/rftrace[logic2]` (pulls
+`logic2-automation`) and Logic 2 running with automation enabled (Preferences →
+Automation). Use `--duration <s>` for timed windows or `--trigger rising|falling|
+pulse-high|pulse-low` (with `--trigger-channel`, `--after`) for event capture; add
+`--loop` or `--count N` for rolling windows, `--buffer-mb` to bound RAM.
 
 #### Examples
 
@@ -342,8 +358,12 @@ Pick exactly one source: `--sal`, `--raw`, or `--sigrok`.
     * `tilogger rftrace --sal cap.sal --elf app.out --dbgid pbe_dbgid.h --channel 4 --divide-time-by-2 stdout`
 * Replay to Wireshark (auto-launch + configure, works on Linux and Windows):
     * `tilogger rftrace --sal cap.sal --elf app.out --divide-time-by-2 wireshark --start`
-* Live from a logic analyzer via sigrok (endless):
-    * `tilogger rftrace --sigrok "--driver saleae-logic-pro-16 --config samplerate=500M -C D4" --elf app.out --channel 0 --divide-time-by-2 stdout`
+* Logic Pro live-ish via Logic 2 (rolling 2 s windows into Wireshark):
+    * `tilogger rftrace --logic2 --duration 2 --loop --elf app.out --channel 4 --divide-time-by-2 wireshark --start`
+* Logic Pro, capture 5 windows triggered on a rising edge:
+    * `tilogger rftrace --logic2 --trigger rising --trigger-channel 4 --after 1 --count 5 --elf app.out stdout`
+* Live from a sigrok-supported analyzer, e.g. DSLogic (endless streaming):
+    * `tilogger rftrace --sigrok "--driver dreamsourcelab-dslogic --config samplerate=500M -C 4" --elf app.out --channel 0 --divide-time-by-2 stdout`
 * Pre-extracted headers still work (no ELF): `--dbgid app_dbgid.h --dbgid pbe_dbgid.h`.
 
 #### rftrace Transport Considerations
