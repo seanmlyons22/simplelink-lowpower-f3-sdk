@@ -33,7 +33,6 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """Class to receive from serial port"""
 
 import threading
-import time
 import queue
 import logging
 import serial
@@ -62,7 +61,10 @@ def receive_thread(ser: serial.Serial, chunk_size, rxq: queue.Queue, stop_event)
 
     """
     while not stop_event.is_set():
-        # Read chunk bytes at a time or until read times out
+        # Read chunk bytes at a time or until read times out. The read itself
+        # blocks up to the serial timeout, so no extra sleep is needed here; a
+        # per-loop sleep plus a small chunk size used to cap throughput at
+        # about 2 MB/s, below the 3 MB/s (24 MHz SWO) design rate.
         buf = ser.read(size=chunk_size)
         # If there was data
         if len(buf) > 0:
@@ -75,7 +77,6 @@ def receive_thread(ser: serial.Serial, chunk_size, rxq: queue.Queue, stop_event)
                 rxq.put(buf, timeout=1)
             except Exception as exc:  # pylint: disable=broad-except
                 logger.error(exc)
-        time.sleep(0.0001)
 
 
 class SerialRx:
@@ -99,7 +100,10 @@ class SerialRx:
         port,
         baud=12000000,
         timeout=0.001,
-        chunk_size=1024,
+        # 64 KiB: at 3 MB/s a chunk fills in ~20 ms but the 1 ms read timeout
+        # still delivers data with low latency; 1 KiB chunks made the reader
+        # loop itself the throughput ceiling.
+        chunk_size=65536,
         parity=serial.PARITY_NONE,
         stopbits=serial.STOPBITS_ONE,
         bytesize=serial.EIGHTBITS,
@@ -131,14 +135,22 @@ class SerialRx:
         self._rx_thread.daemon = True
         self._rx_thread.start()
 
-    def receive(self):
+    def receive(self, timeout=None):
         """Try to read received data from internal queue
+
+        Args:
+            timeout: seconds to wait for data; None returns immediately. The
+                transport loop passes a short timeout so it sleeps here
+                instead of busy-polling when the line is idle.
 
         Returns:
             bytes of data or empty bytes
         """
         try:
-            result = self._rxq.get(block=False)
+            if timeout:
+                result = self._rxq.get(block=True, timeout=timeout)
+            else:
+                result = self._rxq.get(block=False)
         except queue.Empty:
             return bytes()
 

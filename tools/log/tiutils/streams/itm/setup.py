@@ -34,9 +34,12 @@ import setuptools
 
 setuptools.setup(
     name="tilogger_itm_transport",
-    version="0.2.0",
+    version="0.3.0",
     packages=setuptools.find_packages(),
     include_package_data=True,
+    # The vendored speedscope viewer (MIT) ships with the package so the
+    # PC-sampling profile view works fully offline on every OS.
+    package_data={"tilogger_itm_transport": ["speedscope/*"]},
     entry_points={
         "tilogger.transport": [
             "itm = tilogger_itm_transport.itm_transport:transport_factory_cli",
