@@ -131,7 +131,14 @@ class WiresharkOutput(LogOutputABC):
             timestamp_seconds = 0
             timestamp_microsec = 0
 
-        columns = f"{packet.alias}||{packet.timestamp_local:0.9f}||{str(Opcode(packet.opcode).name)}||{packet.module}||{str(packet.level.name)}||{str(packet.filename)}||{str(packet.lineno)}||{packet._str_data}"
+        try:
+            opcode_name = Opcode(packet.opcode).name
+        except ValueError:
+            # Custom opcodes (>= 10, e.g. the ITM transport's DWT packets)
+            # are not in the Log.h Opcode enum; show the number.
+            opcode_name = str(packet.opcode)
+
+        columns = f"{packet.alias}||{packet.timestamp_local:0.9f}||{opcode_name}||{packet.module}||{str(packet.level.name)}||{str(packet.filename)}||{str(packet.lineno)}||{packet._str_data}"
         payload = columns.encode("utf-8")
         header = struct.pack("IIII", timestamp_seconds, timestamp_microsec, len(payload), len(payload))
 

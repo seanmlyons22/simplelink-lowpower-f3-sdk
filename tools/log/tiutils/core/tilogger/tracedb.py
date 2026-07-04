@@ -132,6 +132,7 @@ class TraceDB:
         self.timestamp_fmt_32 = b""
         self.timestamp_fmt_64 = b""
         self.stringpointers = {}
+        self._function_ranges = None
 
         self.changed_event = threading.Event()
         self.change_handler = ElfWatcherHandler(self.elves, self.changed_event)
@@ -227,6 +228,25 @@ class TraceDB:
             self.changed_event.clear()
             self.init_db()
         return self._eventDB
+
+    def function_ranges(self):
+        """PC -> (CU, DIE, function, file, line) lookup built from the DWARF
+        info of the loaded ELF files (tilogger.dwarf.get_all_functions_range).
+
+        Built once on first use and cached: iterating the DWARF of a full
+        application image takes seconds, while PC samples arrive at kHz
+        rates. Not pickled; DIE objects do not survive pickling.
+        """
+        if self._function_ranges is None:
+            from tilogger.dwarf import get_all_functions_range
+
+            infos = []
+            for elfpath in self.elves:
+                elf = ELFFile(io.BytesIO(elfpath.read_bytes()))
+                if elf.has_dwarf_info():
+                    infos.append(elf.get_dwarf_info())
+            self._function_ranges = get_all_functions_range(infos)
+        return self._function_ranges
 
     def parse_elf(self, elfpath: Path):
         elf = ELFFile(io.BytesIO(elfpath.read_bytes()))

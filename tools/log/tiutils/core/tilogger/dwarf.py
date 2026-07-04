@@ -37,7 +37,8 @@ from typing import List, Dict, Optional, Tuple, Iterable, Union
 from elftools.elf.elffile import ELFFile
 from functools import lru_cache
 
-from elftools.common.py3compat import maxint, bytes2str
+# Note: elftools.common.py3compat was removed in pyelftools 0.30; the names
+# it provided were never used here.
 from elftools.dwarf.descriptions import describe_form_class
 
 from elftools.elf.elffile import ELFFile, DWARFInfo
@@ -47,25 +48,36 @@ import bisect
 
 
 class RangeDict:
-    def __init__(self, my_dict):
-        # assert not any(map(lambda x: not isinstance(x, tuple) or len(x) != 2 or x[0] > x[1], my_dict))
+    """Maps [start, end) integer ranges to values, keyed by point lookups."""
 
+    def __init__(self, my_dict):
         self._mydb = [(k[0], k[1], v) for k, v in my_dict.items()]
         self._mydb.sort()
         self._dblen = len(self._mydb)
 
+    def _lookup(self, number):
+        # (number + 1,) sorts before any (number + 1, end, value) entry, so
+        # bisect_right - 1 is the last range starting at or below number.
+        idx = bisect.bisect_right(self._mydb, (number + 1,)) - 1
+        # idx >= 0 (not a wraparound to the last entry) and end > number.
+        # The old form (idx < len) wrongly rejected hits in the last range.
+        if idx >= 0:
+            entry = self._mydb[idx]
+            if entry[1] > number:
+                return entry
+        return None
+
     def __getitem__(self, number):
-        idx = bisect.bisect_right(self._mydb, (number + 1,))
-        if idx < self._dblen and self._mydb[idx - 1][1] > number:
-            return self._mydb[idx - 1][2]
-        else:
-            raise KeyError
+        entry = self._lookup(number)
+        if entry is None:
+            raise KeyError(number)
+        return entry[2]
 
     def get(self, number, default=None):
-        try:
-            return self.__getitem__(number)
-        except KeyError:
-            return default
+        # No raise/catch here: this sits on the PC-sample hot path where a
+        # per-miss exception is measurable.
+        entry = self._lookup(number)
+        return default if entry is None else entry[2]
 
 
 # Translation of some of the DWARF attribute tags for printing
