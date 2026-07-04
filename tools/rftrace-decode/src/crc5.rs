@@ -1,15 +1,18 @@
-//! CRC-5 for the tracer packet trailer (§11.4).
+//! CRC-5 for the tracer packet trailer.
 //!
 //! Two things live here:
-//!  1. `crc5_usb` — a textbook **CRC-5/USB** (init 0x1F, poly 0x05 reflected, xorout 0x1F,
-//!     check = 0x19). Sanity anchor that our arithmetic is a real CRC-5/USB.
-//!  2. `Crc5` — an incremental accumulator used by BOTH the synth encoder and the packet
-//!     assembler so they are self-consistent. It feeds `word[7:0]` for SOP/TS/HDR/DATA and
-//!     the top 3 bits of EOP, per the RTL description.
+//!  1. `Crc5` - the incremental MSB-first CRC-5 (poly 0x05, init 0x1F, no xorout) the wire
+//!     actually uses. Both the packet assembler and the synth encoder share it so encode and
+//!     decode stay self-consistent. It accumulates `word[7:0]` of the SOP, timestamp, header,
+//!     and data words, then the top 3 bits (`word[7:5]`) of EOP; the transmitted CRC sits in
+//!     `EOP[4:0]`.
+//!  2. `crc5_usb` - a textbook reflected CRC-5/USB (init 0x1F, reflected poly, xorout 0x1F,
+//!     check("123456789") = 0x19). It does NOT match the wire; it is kept only as a self-test
+//!     anchor proving our 5-bit CRC arithmetic against a published check value.
 //!
-//! Bit convention CONFIRMED against the golden `tx_burst_example.sal`: the MSB-first form
-//! below validates 28/28 real packets (the RTL's 256-entry LUT on `data XOR (crcReg<<3)`
-//! is this same arithmetic). The reflected `crc5_usb` form does NOT match the wire (1/28).
+//! The MSB-first convention was confirmed empirically against the golden
+//! `tx_burst_example.sal` capture: it validates 28 of 28 real packets, while the reflected
+//! USB form validated only 1 of 28.
 
 /// Textbook CRC-5/USB over whole bytes (reflected). `check("123456789") == 0x19`.
 pub fn crc5_usb(data: &[u8]) -> u8 {
@@ -69,5 +72,59 @@ impl Crc5 {
 
     pub fn value(&self) -> u8 {
         self.reg & 0x1f
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usb_anchor() {
+        assert_eq!(crc5_usb(b"123456789"), 0x19);
+        assert_eq!(crc5_usb(b""), 0x00); // init ^ xorout with no data
+    }
+
+    #[test]
+    fn wire_crc_differs_from_usb() {
+        // The two conventions must not be interchangeable; if they ever agree on this
+        // input, one of them has been edited into the other by mistake.
+        let mut c = Crc5::new();
+        for b in b"123456789" {
+            c.update_byte(*b);
+        }
+        assert_ne!(c.value(), crc5_usb(b"123456789"));
+    }
+
+    #[test]
+    fn incremental_matches_bitwise_reference() {
+        // Reference: plain MSB-first polynomial division, poly 0x05, init 0x1F.
+        fn reference(bits: &[u8]) -> u8 {
+            let mut reg: u8 = 0x1f;
+            for &bit in bits {
+                let fb = ((reg >> 4) & 1) ^ (bit & 1);
+                reg = (reg << 1) & 0x1f;
+                if fb != 0 {
+                    reg ^= 0x05;
+                }
+            }
+            reg
+        }
+        let data = [0x53u8, 0x00, 0x2A, 0x05];
+        let mut bits = Vec::new();
+        for b in data {
+            for i in (0..8).rev() {
+                bits.push((b >> i) & 1);
+            }
+        }
+        bits.push(0);
+        bits.push(1);
+        bits.push(1);
+        let mut c = Crc5::new();
+        for b in data {
+            c.update_byte(b);
+        }
+        c.update_bits(0b011, 3);
+        assert_eq!(c.value(), reference(&bits));
     }
 }

@@ -1,4 +1,8 @@
-//! Physical deframe: LA sample levels / transition lists -> 10-bit tracer words (§11.1).
+//! Physical deframe: LA sample levels / transition lists -> 10-bit tracer words.
+//!
+//! The wire is a 12-bit frame: start bit, 10 data bits MSB-first, trailing zero. The idle
+//! line is a continuous stream of NOP frames (word 0x000), so a start edge arrives at least
+//! once per frame whenever the tracer is on.
 //!
 //! `decode_frame`/`encode_frame` are shared with the synth encoder; `deframe_edges` is the
 //! hot path (edge-based, so the 11.5 G-sample golden capture never expands per-sample).
@@ -67,13 +71,14 @@ pub fn deframe(levels: &[u8], cfg: &DeframeCfg) -> Vec<Word> {
 /// Edge-based deframer: `initial_level` + transition positions (sample index where the line
 /// flips) + total sample count -> 10-bit words. Returns `(words, framing_errors)`.
 ///
-/// Algorithm (§11.1, ADR-005/007): find each start-bit edge, place `2 + data_bits` bit
-/// centers at nominal `samples_per_bit()` spacing from it, sample, verify the stop bit, and
-/// lift the word with `decode_frame`. Phase resyncs on every start edge, so only intra-frame
-/// (12-bit) clock drift matters.
+/// Algorithm: find each start-bit edge, place `2 + data_bits` bit centers at nominal
+/// `samples_per_bit()` spacing from it, sample, verify the stop bit, and lift the word with
+/// `decode_frame`. Phase resyncs on every start edge, so only intra-frame (12-bit) clock
+/// drift matters.
 ///
-/// ponytail: no low-passed period estimate — LA and tracer clocks are both crystal-derived,
-/// so intra-frame drift is <<0.5 bit; add period tracking only if a capture shows drift.
+/// There is deliberately no running bit-period estimate: the LA and tracer clocks are both
+/// crystal-derived, so drift over one 12-bit frame is far below half a bit. Add period
+/// tracking only if a real capture ever shows drift.
 ///
 /// Start-bit polarity is auto-detected: the tracer streams NOP frames (1 start bit + 11 zero
 /// bits) whenever it is on, so the start-bit level is always the minority level over the
@@ -122,7 +127,7 @@ pub fn minority_start_level(initial_level: u8, edges: &[u64], total: u64, cfg: &
 }
 
 /// Core deframer with an explicit `start_level`. Returns `(words, framing_errors, consumed)`
-/// where `consumed` is the sample index up to which framing is complete — i.e. the end of the
+/// where `consumed` is the sample index up to which framing is complete, i.e. the end of the
 /// last emitted frame. Streaming callers keep samples `[consumed..]` as carry for the next
 /// chunk; any frame that would run past `total` is left for that carry.
 pub fn deframe_edges_core(
@@ -183,4 +188,102 @@ pub fn deframe_edges_core(
         }
     }
     (words, framing_errors, pos_limit as u64)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::synth;
+
+    #[test]
+    fn frame_codec_roundtrip() {
+        let cfg = DeframeCfg::default();
+        for &v in &[0x000u16, 0x3FF, 0x2AB, 0x053, 0x100] {
+            let w = Word::new(v);
+            let bits = encode_frame(w, &cfg);
+            assert_eq!(bits.len(), 12);
+            assert_eq!(bits[0], 1, "start bit");
+            assert_eq!(bits[11], 0, "trailing zero");
+            assert_eq!(decode_frame(&bits, &cfg), w);
+        }
+    }
+
+    #[test]
+    fn lsb_first_frame_codec_roundtrip() {
+        let cfg = DeframeCfg { msb_first: false, ..DeframeCfg::default() };
+        let w = Word::new(0x2AB);
+        assert_eq!(decode_frame(&encode_frame(w, &cfg), &cfg), w);
+    }
+
+    #[test]
+    fn empty_and_static_input_yield_nothing() {
+        let cfg = DeframeCfg::default();
+        assert!(deframe(&[], &cfg).is_empty());
+        // A static level run has no start edges and no minority level: no words, no errors.
+        let (words, fe) = deframe_edges(1, &[], 10_000, &cfg);
+        assert!(words.is_empty());
+        assert_eq!(fe, 0);
+    }
+
+    #[test]
+    fn idle_only_line_decodes_to_nops() {
+        let cfg = DeframeCfg::default();
+        let samples = synth::words_to_samples(&[], &cfg, 16);
+        let words = deframe(&samples, &cfg);
+        assert_eq!(words.len(), 16);
+        assert!(words.iter().all(|w| w.0 == 0));
+    }
+
+    #[test]
+    fn polarity_autodetect_handles_both_conventions() {
+        // Same words, synthesized with both line polarities; the minority rule must
+        // recover them identically with the default cfg.
+        let word = Word::new(0x2AB);
+        for invert in [true, false] {
+            let cfg = DeframeCfg { invert, ..DeframeCfg::default() };
+            let samples = synth::words_to_samples(&[word], &cfg, 8);
+            let got = deframe(&samples, &DeframeCfg::default());
+            assert_eq!(got.last().copied(), Some(word), "invert={invert}");
+        }
+    }
+
+    #[test]
+    fn corrupt_stop_bit_counts_a_framing_error() {
+        let cfg = DeframeCfg::default();
+        let words = [Word::new(0x2AB), Word::new(0x145)];
+        let mut samples = synth::words_to_samples(&words, &cfg, 8);
+        // Flatten the second frame's trailing-zero bit to the start level so the stop
+        // check fails. Frame span is 12 bits at round(spb) samples per bit.
+        let spb = cfg.samples_per_bit().round() as usize;
+        let frame = 12 * spb;
+        let second = 9 * frame + 11 * spb; // after 8 idle + 1 data frame
+        for s in &mut samples[second..second + spb] {
+            *s = 1 - *s;
+        }
+        let initial = samples[0];
+        let mut edges = Vec::new();
+        for i in 1..samples.len() {
+            if samples[i] != samples[i - 1] {
+                edges.push(i as u64);
+            }
+        }
+        let (words, fe) = deframe_edges(initial, &edges, samples.len() as u64, &cfg);
+        assert!(fe >= 1, "expected a framing error");
+        // The first data word still decodes.
+        assert!(words.contains(&Word::new(0x2AB)));
+    }
+
+    #[test]
+    fn truncated_final_frame_is_left_for_carry() {
+        let cfg = DeframeCfg::default();
+        let word = Word::new(0x2AB);
+        let mut samples = synth::words_to_samples(&[word], &cfg, 8);
+        // Chop the last frame in half: it must not decode and must not error, and
+        // `consumed` must stop before it so a streaming caller can retry with more data.
+        let spb = cfg.samples_per_bit().round() as usize;
+        samples.truncate(samples.len() - 6 * spb);
+        let words = deframe(&samples, &cfg);
+        assert_eq!(words.len(), 8, "only the idle frames decode");
+        assert!(!words.contains(&word));
+    }
 }

@@ -21,7 +21,7 @@ crate="$here/.."
 bin="${TRACEDECODE:-$crate/target/release/tracedecode}"
 
 if [[ ! -x "$bin" ]]; then
-  echo "building tracedecode…" >&2
+  echo "building tracedecode..." >&2
   ( cd "$crate" && cargo build --release )
   bin="$crate/target/release/tracedecode"
 fi

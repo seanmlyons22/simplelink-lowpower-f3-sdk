@@ -1,4 +1,4 @@
-//! Sample ingest: raw sigrok stream, and the Saleae `.sal` container (§16).
+//! Sample ingest: raw sigrok stream, and the Saleae `.sal` container.
 
 use crate::types::DeframeCfg;
 use std::io::{self, Read};
@@ -63,10 +63,9 @@ fn unzip_member(path: &Path, member: &str) -> io::Result<Vec<u8>> {
         .arg(member)
         .output()?;
     if !out.status.success() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("unzip {member} from {path:?} failed"),
-        ));
+        return Err(io::Error::other(format!(
+            "unzip {member} from {path:?} failed"
+        )));
     }
     Ok(out.stdout)
 }
@@ -216,20 +215,17 @@ pub fn decode_saleae_runs(bin: &[u8]) -> io::Result<SalRuns> {
 }
 
 /// Decode a Saleae `.sal` `digital-N.bin` into per-sample levels at `samplerate_hz`
-/// (which must match the rate the file was captured at — it is only used to guard size).
+/// (which must match the rate the file was captured at - it is only used to guard size).
 ///
 /// Convenience/API-compat wrapper over [`decode_saleae_runs`]; refuses captures that would
-/// expand to more than 1 GiB (the real trace capture is 11.5 G samples — use the runs form).
+/// expand to more than 1 GiB (the real trace capture is 11.5 G samples - use the runs form).
 pub fn decode_saleae_digital(bin: &[u8], _samplerate_hz: f64) -> io::Result<Vec<u8>> {
     let runs = decode_saleae_runs(bin)?;
     if runs.total > (1 << 30) {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "capture is {} samples; too large to expand per-sample — use decode_saleae_runs",
-                runs.total
-            ),
-        ));
+        return Err(io::Error::other(format!(
+            "capture is {} samples; too large to expand per-sample - use decode_saleae_runs",
+            runs.total
+        )));
     }
     let mut levels = Vec::with_capacity(runs.total as usize);
     let mut lvl = runs.initial_level;
@@ -246,5 +242,119 @@ pub fn cfg_from_sal(samplerate_hz: f64) -> DeframeCfg {
     DeframeCfg {
         samplerate_hz,
         ..DeframeCfg::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn levels_pick_the_channel_bit() {
+        let bytes = [0b0001_0000u8, 0b0000_0000, 0b0001_0000];
+        assert_eq!(levels_from_raw(&bytes, 4), vec![1, 0, 1]);
+        assert_eq!(levels_from_raw(&bytes, 0), vec![0, 0, 0]);
+    }
+
+    #[test]
+    fn samplerate_scanner() {
+        let meta = r#"{"data":{"sampleRate":{"digital": 500000000, "analog": 0}}}"#;
+        assert_eq!(parse_samplerate(meta), Some(500_000_000.0));
+        assert_eq!(parse_samplerate("{}"), None);
+    }
+
+    // ---- synthetic digital-N.bin builder for decoder tests ----
+
+    fn varint(v: u64) -> Vec<u8> {
+        // Big-endian: first byte carries the top 6 bits (bit6 = continue), later
+        // bytes 7 bits each (bit7 = continue).
+        if v <= 0x3F {
+            return vec![v as u8];
+        }
+        let mut groups = Vec::new();
+        let mut rest = v;
+        while rest > 0x3F {
+            groups.push((rest & 0x7F) as u8);
+            rest >>= 7;
+        }
+        let mut out = vec![(rest as u8) | 0x40];
+        for (i, g) in groups.iter().rev().enumerate() {
+            let last = i == groups.len() - 1;
+            out.push(g | if last { 0 } else { 0x80 });
+        }
+        out
+    }
+
+    fn block(begin: u64, runs: &[u64], level: u8) -> Vec<u8> {
+        let total: u64 = runs.iter().sum();
+        let mut payload = Vec::new();
+        for &r in runs {
+            payload.extend(varint(r - 1)); // stored value = run length - 1
+        }
+        let mut b = Vec::new();
+        b.extend((begin).to_le_bytes());
+        b.extend((begin + total).to_le_bytes());
+        b.extend(total.to_le_bytes());
+        b.extend(500_000_000u64.to_le_bytes());
+        b.extend(1u64.to_le_bytes());
+        b.extend((payload.len() as u64).to_le_bytes());
+        b.extend(&payload);
+        b.extend(1u32.to_le_bytes()); // jump table: one entry
+        b.extend(0u32.to_le_bytes());
+        b.extend(0u64.to_le_bytes());
+        b.extend(0u64.to_le_bytes());
+        b.extend((level as u32).to_le_bytes());
+        b
+    }
+
+    fn bin_with(blocks: &[Vec<u8>]) -> Vec<u8> {
+        let mut bin = Vec::new();
+        bin.extend(b"<SALEAE>");
+        bin.extend(1u32.to_le_bytes());
+        bin.resize(0x33, 0);
+        for b in blocks {
+            bin.extend(b);
+        }
+        bin
+    }
+
+    #[test]
+    fn runs_decode_to_edges() {
+        // One block, level 1 for 5 samples, 0 for 3, 1 for 300 (multi-byte varint).
+        let bin = bin_with(&[block(0, &[5, 3, 300], 1)]);
+        let runs = decode_saleae_runs(&bin).unwrap();
+        assert_eq!(runs.initial_level, 1);
+        assert_eq!(runs.edges, vec![5, 8]);
+        assert_eq!(runs.total, 308);
+    }
+
+    #[test]
+    fn block_boundary_level_flip_is_an_edge() {
+        // Block 1 ends at level 1 (one run), block 2 starts at level 0: that flip is
+        // an edge exactly on the block boundary.
+        let bin = bin_with(&[block(0, &[10], 1), block(10, &[10], 0)]);
+        let runs = decode_saleae_runs(&bin).unwrap();
+        assert_eq!(runs.edges, vec![10]);
+        assert_eq!(runs.total, 20);
+    }
+
+    #[test]
+    fn rejects_bad_magic_and_truncation() {
+        assert!(decode_saleae_runs(b"NOTSALEAE").is_err());
+        let mut bin = bin_with(&[block(0, &[5, 3], 1)]);
+        bin.truncate(bin.len() - 4); // chop the jump table
+        assert!(decode_saleae_runs(&bin).is_err());
+        // Version != 1 must be refused, not misparsed.
+        let mut v2 = bin_with(&[]);
+        v2[8] = 2;
+        assert!(decode_saleae_runs(&v2).is_err());
+    }
+
+    #[test]
+    fn per_sample_expansion_matches_runs() {
+        let bin = bin_with(&[block(0, &[5, 3, 4], 1)]);
+        let levels = decode_saleae_digital(&bin, 500e6).unwrap();
+        assert_eq!(levels.len(), 12);
+        assert_eq!(&levels[..], &[1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1]);
     }
 }

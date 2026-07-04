@@ -28,7 +28,7 @@ DBG_DEF(DBGID_x_770, 40, DBGCH1, 3, "GracefulStopTime (0.25us): %d, StartTime (0
     assert_eq!(defs[0].arg_count, -2);
     assert!(defs[0].fmt.contains("RCL Events"));
     assert_eq!(defs[0].expected_par_cnt(), 4); // 2 x 32-bit = 4 words
-    // field 2 has commas inside the quoted fmt — must not split
+    // field 2 has commas inside the quoted fmt - must not split
     assert_eq!(defs[2].arg_count, 3);
     assert_eq!(defs[2].expected_par_cnt(), 3);
     assert_eq!(defs[1].basename(), "pbe_ram_bank0.asm");
@@ -41,7 +41,7 @@ fn crc5_usb_check_value() {
     assert_eq!(crc5_usb(b"123456789"), 0x19);
 }
 
-// ---- word classify (§11.2) ----
+// ---- word classify ----
 
 #[test]
 fn classify_masks() {
@@ -168,7 +168,7 @@ fn parse_golden(txt: &str) -> Vec<(String, u32, String)> {
 
 #[test]
 fn golden_txt_parser() {
-    let block = "rftrc\n8.509 076 990 s\n6.478 µs\nRCL.c:884 >> RCL_open: Git SHA: 82d8ed17bae09623\n";
+    let block = "rftrc\n8.509 076 990 s\n6.478 \u{b5}s\nRCL.c:884 >> RCL_open: Git SHA: 82d8ed17bae09623\n";
     let recs = parse_golden(block);
     assert_eq!(recs.len(), 1);
     assert_eq!(recs[0].0, "RCL.c");
@@ -201,10 +201,12 @@ fn synth_roundtrip_via_deframe() {
     assert!(p.crc_ok);
 }
 
-/// Normalize decoded/golden text for content comparison: the golden `.txt` double-encoded
-/// UTF-8 ("µ" -> "Âµ") and its generator collapsed some doubled spaces in format strings.
+/// Normalize text for content comparison against the golden `.txt`: its generator
+/// double-encoded UTF-8 (micro sign u{b5} became u{c2}u{b5}) and collapsed some doubled
+/// spaces in format strings. Our decoder emits clean UTF-8, so this only really
+/// rewrites the golden side; applying it to both is harmless.
 fn norm(s: &str) -> String {
-    let mut t = s.replace('\u{c2}', ""); // strip the mojibake 'Â'
+    let mut t = s.replace('\u{c2}', ""); // strip the mojibake prefix byte
     while t.contains("  ") {
         t = t.replace("  ", " ");
     }
@@ -291,7 +293,7 @@ fn dissector_columns(payload: &[u8]) -> Vec<String> {
 
 /// End-to-end through the *installed CLI* (as tilogger/Wireshark/extcap launch it): synth a
 /// raw capture, then `decode ... pcap --out -`, and assert the emitted pcap is byte-shaped
-/// exactly like the ITM/UART path — DLT_USER0=147 + the 8 `||` columns the shared dissector
+/// exactly like the ITM/UART path - DLT_USER0=147 + the 8 `||` columns the shared dissector
 /// reads. This is the real "swap ITM for rftrace" contract: same presentation, same wire.
 #[test]
 fn cli_emits_tilogger_pcap_over_stdout() {
@@ -354,7 +356,7 @@ fn cli_emits_tilogger_pcap_over_stdout() {
 // ============ streaming decode: bounded memory, correct across chunk boundaries ============
 
 /// The `decode` path streams in 1 MiB chunks with a one-frame carry. Synth one capture, tile
-/// it past several chunk boundaries, decode, and assert every packet survives — i.e. frames
+/// it past several chunk boundaries, decode, and assert every packet survives, i.e. frames
 /// straddling a chunk boundary are neither dropped nor duplicated (guards `stream_decode`).
 #[test]
 fn stream_decode_crosses_chunk_boundaries() {

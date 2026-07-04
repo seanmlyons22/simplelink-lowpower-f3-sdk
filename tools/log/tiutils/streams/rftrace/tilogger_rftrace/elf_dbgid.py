@@ -35,7 +35,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 Ports the SDK `elf2dbgid extract` transform onto tilogger's own `TraceDB` (which already
 parses the ELF via pyelftools and exposes the identical `stringpointers` / `traceDB`
 interface elf2dbgid's `lib.elfstrings.TraceDB` uses). So `tilogger rftrace --elf app.out`
-resolves every CPU-side log with no manual elf2dbgid step — the metadata is exactly what
+resolves every CPU-side log with no manual elf2dbgid step - the metadata is exactly what
 appears on the wire.
 
 The 32-bit log pointer encodes channel (bits 27:24) and dbgid (bits 15:2); the dbgid the
@@ -97,7 +97,7 @@ def elf_to_dbgid_text(elf_path):
     # stringpointers, so the cached path yields no pointers. Matches elf2dbgid's own `TraceDB(_, True)`.
     db = TraceDB([str(elf_path)], True)
     try:
-        # tilogger's TraceDB.stringpointers is {log_data_addr: pointer_symbol_addr} — the
+        # tilogger's TraceDB.stringpointers is {log_data_addr: pointer_symbol_addr} - the
         # reverse of elf2dbgid's own TraceDB. The channel+dbgid come from the pointer-symbol
         # address (the 0x9X.. value, channel-encoded); the string is at the log_data key.
         lines = []

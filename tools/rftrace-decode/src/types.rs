@@ -16,10 +16,22 @@ impl Word {
     }
 }
 
-/// Classification of a 10-bit word per §11.2 masks.
+/// SOP payload byte: bits [7:6] = channel (1..=3), bit [4] = ts_en, bits [3:0] = seq.
+/// Single source of truth for the layout, shared by the packet assembler (CRC re-feed)
+/// and the synth encoder.
+pub fn sop_byte(ch: u8, ts_en: bool, seq: u8) -> u8 {
+    (ch << 6) | ((ts_en as u8) << 4) | (seq & 0xF)
+}
+
+/// The three EOP bits the CRC covers (`word[7:5]`): bits [7:6] = channel, bit [5] = 1.
+pub fn eop_top3(ch: u8) -> u8 {
+    ((ch << 1) | 1) & 0x7
+}
+
+/// Classification of a 10-bit word (see `packet::classify` for the mask table).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WordKind {
-    /// Idle NOP (`0x000`) — dropped.
+    /// Idle NOP (`0x000`) - dropped.
     Nop,
     /// NOP carrying per-channel overflow flags in bits [3:1] (bit3=ch3, 2=ch2, 1=ch1).
     Overflow(u8),
@@ -144,5 +156,53 @@ impl Default for DeframeCfg {
 impl DeframeCfg {
     pub fn samples_per_bit(&self) -> f64 {
         self.samplerate_hz / self.baud_hz
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn word_fields() {
+        let w = Word::new(0x2AB);
+        assert_eq!(w.chx_id(), 2);
+        assert_eq!(w.payload(), 0xAB);
+        assert_eq!(Word::new(0xFFFF).0, 0x3FF); // masked to 10 bits
+    }
+
+    #[test]
+    fn sop_eop_layout() {
+        // ch=1, ts_en, seq=3 -> 0b01_0_1_0011 = 0x53
+        assert_eq!(sop_byte(1, true, 3), 0x53);
+        assert_eq!(sop_byte(3, false, 0xF), 0xCF);
+        assert_eq!(sop_byte(2, false, 0x13), 0x83); // seq masked to 4 bits
+        // EOP word[7:5] for ch: [7:6]=ch, [5]=1
+        assert_eq!(eop_top3(1), 0b011);
+        assert_eq!(eop_top3(3), 0b111);
+    }
+
+    #[test]
+    fn dbgdef_accessors() {
+        let d = DbgDef {
+            dbgid: 5,
+            channel: 1,
+            arg_count: -2,
+            fmt: "x".into(),
+            file: r"C:\src\a.c".into(),
+            line: 1,
+        };
+        assert_eq!(d.basename(), "a.c"); // backslash paths from Windows builds
+        assert_eq!(d.expected_par_cnt(), 4); // two 32-bit args = four 16-bit words
+        let d16 = DbgDef { arg_count: 3, ..d.clone() };
+        assert_eq!(d16.expected_par_cnt(), 3);
+    }
+
+    #[test]
+    fn samples_per_bit_default() {
+        // 500 MS/s over 24 Mbaud is deliberately non-integer (20.83); the deframer
+        // must handle fractional bit spacing.
+        let cfg = DeframeCfg::default();
+        assert!((cfg.samples_per_bit() - 20.8333).abs() < 0.001);
     }
 }

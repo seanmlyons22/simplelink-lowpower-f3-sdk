@@ -1,9 +1,10 @@
-//! Synthetic wire generator (§16.3): records -> tracer words -> LA sample levels.
-//! Inverse of the decode path; used for self-tests without hardware.
+//! Synthetic wire generator: records -> tracer words -> LA sample levels.
+//! Exact inverse of the decode path; the basis of every hardware-free self-test and of
+//! the large benchmark captures.
 
 use crate::crc5::Crc5;
 use crate::deframe::encode_frame;
-use crate::types::{DeframeCfg, Word};
+use crate::types::{eop_top3, sop_byte, DeframeCfg, Word};
 
 /// Convert 32-bit args to the 16-bit wire params (`arg32` => two words per arg, low half first).
 pub fn args_to_params16(args: &[u32], arg32: bool) -> Vec<u16> {
@@ -32,10 +33,9 @@ pub fn encode_packet(
     let mut crc = Crc5::new();
     let ts_en = ts_delta.is_some();
 
-    // SOP: bits [7:6]=channel, [4]=ts_en, [3:0]=seq (top bits [9:8]=00).
-    let sop_byte = ((channel as u16) << 6) | ((ts_en as u16) << 4) | (seq as u16 & 0xF);
-    crc.update_byte(sop_byte as u8);
-    words.push(Word::new(sop_byte));
+    let sop = sop_byte(channel, ts_en, seq);
+    crc.update_byte(sop);
+    words.push(Word::new(sop as u16));
 
     let push_data = |b: u8, words: &mut Vec<Word>, crc: &mut Crc5| {
         crc.update_byte(b);
@@ -53,8 +53,7 @@ pub fn encode_packet(
     }
 
     // EOP: bits [7:6]=channel, [5]=1, [4:0]=CRC. CRC covers the 3 MSBs (word[7:5]) too.
-    let eop_top3 = ((channel << 1) | 1) & 0x7;
-    crc.update_bits(eop_top3, 3);
+    crc.update_bits(eop_top3(channel), 3);
     let eop = ((channel as u16) << 6) | 0x20 | (crc.value() as u16 & 0x1F);
     words.push(Word::new(eop));
     words
@@ -85,4 +84,39 @@ pub fn words_to_samples(words: &[Word], cfg: &DeframeCfg, idle_frames: usize) ->
         emit(w, &mut out);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arg_width_to_params() {
+        // 32-bit args become two 16-bit words each, low half first.
+        assert_eq!(args_to_params16(&[0x1234_5678], true), vec![0x5678, 0x1234]);
+        assert_eq!(args_to_params16(&[0xBEEF, 0xCAFE], false), vec![0xBEEF, 0xCAFE]);
+        assert_eq!(args_to_params16(&[], true), Vec::<u16>::new());
+    }
+
+    #[test]
+    fn packet_word_sequence_shape() {
+        let words = encode_packet(2, 130, &[0xAABB], Some(0x0102), 1);
+        // SOP, TSH, TSL, HDR, 2 data bytes, EOP
+        assert_eq!(words.len(), 7);
+        assert_eq!(words[0].0, 0x91); // ch2, ts_en, seq1
+        assert_eq!(words[1].0, 0x201); // ch2 data: ts high byte
+        assert_eq!(words[2].0, 0x202); // ch2 data: ts low byte
+        assert_eq!(words[3].0, 0x282); // ch2 data: dbgid 130
+        assert_eq!(words[4].0, 0x2AA); // param high byte first
+        assert_eq!(words[5].0, 0x2BB);
+        assert_eq!(words[6].0 & 0x3E0, 0x0A0); // EOP: ch2 + bit5
+    }
+
+    #[test]
+    fn sample_expansion_size() {
+        let cfg = DeframeCfg::default();
+        let spb = cfg.samples_per_bit().round() as usize;
+        let samples = words_to_samples(&[nop()], &cfg, 3);
+        assert_eq!(samples.len(), 4 * 12 * spb); // (3 idle + 1) frames x 12 bits
+    }
 }

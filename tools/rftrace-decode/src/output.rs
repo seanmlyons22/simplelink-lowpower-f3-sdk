@@ -1,6 +1,7 @@
-//! Output sinks. All produce the SAME presentation as the ITM/UART `tilogger` path
-//! (ADR-011/014/017): stdout line + pcap `DLT_USER0=147` with the `||`-delimited payload
-//! consumed by `tilogger_dissector.lua`.
+//! Output sinks. All produce the same presentation as the ITM/UART `tilogger` path:
+//! a stdout line, and pcap `DLT_USER0=147` with the `||`-delimited payload consumed by
+//! `tilogger_dissector.lua`. Keeping the bytes identical is what lets the existing
+//! dissector and every tilogger output work unchanged on RF-tracer logs.
 
 use crate::types::{Health, LogRecord};
 use std::io::{self, Write};
@@ -99,5 +100,60 @@ impl<W: Write> Output for PcapSink<W> {
     }
     fn finish(&mut self) {
         let _ = self.w.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec() -> LogRecord {
+        LogRecord {
+            alias: "rftrc".into(),
+            channel: 2,
+            dbgid: 7,
+            seq: 1,
+            ts_ticks: 3,
+            ts_us: 1.5,
+            file: "t.c".into(),
+            line: 42,
+            level: "INFO",
+            text: "hello".into(),
+        }
+    }
+
+    #[test]
+    fn payload_is_tilogger_shaped() {
+        // The exact 8-column contract tilogger_dissector.lua splits on. Changing any
+        // column breaks Wireshark field parity with the ITM/UART path.
+        assert_eq!(
+            wireshark_payload(&rec()),
+            "rftrc||0.000001500||LOG_OPCODE_FORMATED_TEXT||DBGCH2||INFO||t.c||42||hello"
+        );
+    }
+
+    #[test]
+    fn stdout_line_matches_tilogger_default() {
+        assert_eq!(
+            stdout_line(&rec()),
+            "rftrc | 0.000001500 | DBGCH2 | INFO | t.c:42 | hello"
+        );
+    }
+
+    #[test]
+    fn pcap_stream_shape() {
+        let mut buf = Vec::new();
+        {
+            let mut sink = PcapSink::new(&mut buf).unwrap();
+            sink.write_record(&rec()).unwrap();
+        }
+        assert_eq!(&buf[0..4], &0xA1B2_C3D4u32.to_le_bytes()); // classic pcap magic
+        assert_eq!(u32::from_le_bytes(buf[20..24].try_into().unwrap()), 147); // DLT_USER0
+        let caplen = u32::from_le_bytes(buf[32..36].try_into().unwrap()) as usize;
+        let orig = u32::from_le_bytes(buf[36..40].try_into().unwrap()) as usize;
+        assert_eq!(caplen, orig);
+        assert_eq!(buf.len(), 24 + 16 + caplen); // exactly one record
+        let payload = std::str::from_utf8(&buf[40..40 + caplen]).unwrap();
+        assert_eq!(payload, wireshark_payload(&rec()));
     }
 }

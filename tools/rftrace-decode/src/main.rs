@@ -1,9 +1,9 @@
-//! `tracedecode` CLI — LA backend for the RF-core trace sink.
+//! `tracedecode` CLI - logic-analyzer backend for the RF-core trace sink.
 //!
 //! Usage:
 //!   tracedecode replay <file.sal> --channel 4 --dbgid A.h [--dbgid B.h] [--alias rftrc] (stdout | pcap --out f.pcap)
 //!   tracedecode decode --raw <file|-> --channel 4 --dbgid A.h stdout
-//!   tracedecode synth  --dbgid A.h --out synth.raw
+//!   tracedecode synth  --dbgid A.h --out synth.raw [--repeat N] [--idle-frames K]
 //!   tracedecode tail   <file.sal> --dbgid A.h [--last 50]
 //!   tracedecode retain <file.sal> --dbgid A.h --out ring [--files 4] [--filesize 1024]
 //!   tracedecode wireshark --extcap-interfaces | --extcap-dlts | --extcap-config
@@ -43,6 +43,9 @@ struct Cli {
     last: usize,
     ring_files: u32,
     ring_filesize_kb: u32,
+    // synth
+    repeat: u64,
+    idle_frames: usize,
 }
 
 fn parse_cli() -> Result<Cli, String> {
@@ -70,6 +73,8 @@ fn parse_cli() -> Result<Cli, String> {
         last: 50,
         ring_files: 4,
         ring_filesize_kb: 1024,
+        repeat: 1,
+        idle_frames: 8,
     };
     let args: Vec<String> = a.collect();
     let mut i = 0;
@@ -100,6 +105,10 @@ fn parse_cli() -> Result<Cli, String> {
                 let _ = next(&args, &mut i); // value optional in --extcap-version=x form
             }
             "--last" => cli.last = next(&args, &mut i)?.parse().map_err(|_| "bad --last")?,
+            "--repeat" => cli.repeat = next(&args, &mut i)?.parse().map_err(|_| "bad --repeat")?,
+            "--idle-frames" => {
+                cli.idle_frames = next(&args, &mut i)?.parse().map_err(|_| "bad --idle-frames")?
+            }
             "--files" => cli.ring_files = next(&args, &mut i)?.parse().map_err(|_| "bad --files")?,
             "--filesize" => {
                 cli.ring_filesize_kb = next(&args, &mut i)?.parse().map_err(|_| "bad --filesize")?
@@ -155,29 +164,50 @@ fn build_outputs(cli: &Cli) -> Result<Vec<Box<dyn Output>>, String> {
     Ok(outs)
 }
 
-/// One word -> (maybe) a record -> outputs. The per-word core shared by batch + streaming.
-#[allow(clippy::too_many_arguments)]
-fn feed_word(
-    w: Word,
-    asm: &mut PacketAssembler,
-    ts: &mut TsState,
-    db: &DbgIdDb,
-    alias: &str,
+/// The per-run decode state threaded through the word loop: packet assembly, timestamp
+/// reconstruction, health counters, and the metadata needed to resolve records.
+struct Run<'a> {
+    asm: PacketAssembler,
+    ts: TsState,
+    health: Health,
+    db: &'a DbgIdDb,
+    alias: &'a str,
     divide_time_by_2: bool,
-    health: &mut Health,
-    outs: &mut [Box<dyn Output>],
-) {
-    if let Some(pkt) = asm.push(classify(w), health) {
-        if !pkt.crc_ok {
-            return;
+}
+
+impl<'a> Run<'a> {
+    fn new(db: &'a DbgIdDb, alias: &'a str, divide_time_by_2: bool) -> Self {
+        Run {
+            asm: PacketAssembler::new(),
+            ts: TsState::new(),
+            health: Health::default(),
+            db,
+            alias,
+            divide_time_by_2,
         }
-        match resolve(&pkt, db, alias, ts, divide_time_by_2) {
-            Some(rec) => {
-                for o in outs.iter_mut() {
-                    o.on_record(&rec);
-                }
+    }
+
+    /// One word -> (maybe) a record -> outputs. The per-word core shared by batch + streaming.
+    fn feed(&mut self, w: Word, outs: &mut [Box<dyn Output>]) {
+        if let Some(pkt) = self.asm.push(classify(w), &mut self.health) {
+            if !pkt.crc_ok {
+                return;
             }
-            None => health.unknown_dbgid += 1,
+            match resolve(&pkt, self.db, self.alias, &mut self.ts, self.divide_time_by_2) {
+                Some(rec) => {
+                    for o in outs.iter_mut() {
+                        o.on_record(&rec);
+                    }
+                }
+                None => self.health.unknown_dbgid += 1,
+            }
+        }
+    }
+
+    fn finish(self, outs: &mut [Box<dyn Output>]) {
+        for o in outs.iter_mut() {
+            o.on_health(&self.health);
+            o.finish();
         }
     }
 }
@@ -191,25 +221,18 @@ fn run_words(
     alias: &str,
     outs: &mut [Box<dyn Output>],
 ) {
-    let mut asm = PacketAssembler::new();
-    let mut ts = TsState::new();
-    let mut health = Health {
-        framing_errors,
-        ..Health::default()
-    };
+    let mut run = Run::new(db, alias, cfg.divide_time_by_2);
+    run.health.framing_errors = framing_errors;
     for &w in words {
-        feed_word(w, &mut asm, &mut ts, db, alias, cfg.divide_time_by_2, &mut health, outs);
+        run.feed(w, outs);
     }
-    for o in outs.iter_mut() {
-        o.on_health(&health);
-        o.finish();
-    }
+    run.finish(outs);
 }
 
 /// Streaming decode: read samples in chunks and emit records live, with bounded memory, so a
-/// live `sigrok-cli … | tracedecode decode --raw -` can run **endlessly**. Never buffers the
+/// live `sigrok-cli ... | tracedecode decode --raw -` can run endlessly. Never buffers the
 /// whole capture: it keeps only the current chunk plus a one-frame carry that holds a frame
-/// straddling the chunk boundary (§11.1, ADR-005/007).
+/// straddling the chunk boundary.
 fn stream_decode(
     mut reader: impl std::io::Read,
     cfg: &DeframeCfg,
@@ -223,9 +246,7 @@ fn stream_decode(
     let bits_per_frame = 2 + cfg.data_bits as usize;
     let frame_span = (bits_per_frame as f64 * cfg.samples_per_bit()).ceil() as usize + 1;
 
-    let mut asm = PacketAssembler::new();
-    let mut ts = TsState::new();
-    let mut health = Health::default();
+    let mut run = Run::new(db, alias, cfg.divide_time_by_2);
 
     let mut buf = vec![0u8; 1 << 20]; // 1 MiB samples/read
     let mut carry: Vec<u8> = Vec::new(); // trailing levels from the previous chunk
@@ -266,13 +287,13 @@ fn stream_decode(
 
         let (words, fe, consumed) =
             deframe_edges_core(initial, &edges, window.len() as u64, cfg, sl);
-        health.framing_errors += fe;
+        run.health.framing_errors += fe;
         for w in words {
-            feed_word(w, &mut asm, &mut ts, db, alias, cfg.divide_time_by_2, &mut health, outs);
+            run.feed(w, outs);
         }
 
         // Carry the un-framed tail (holds a boundary-straddling frame). If that tail has no
-        // edges it is a static idle run with no possible frame — keep only one frame_span so
+        // edges it is a static idle run with no possible frame - keep only one frame_span so
         // memory stays bounded on an endless idle line.
         let cons = (consumed as usize).min(window.len());
         let mut new_carry = window.split_off(cons);
@@ -283,10 +304,7 @@ fn stream_decode(
         carry = new_carry;
     }
 
-    for o in outs.iter_mut() {
-        o.on_health(&health);
-        o.finish();
-    }
+    run.finish(outs);
     Ok(())
 }
 
@@ -315,7 +333,7 @@ fn load_db(cli: &Cli) -> Result<DbgIdDb, String> {
     Ok(db)
 }
 
-/// In-memory last-N ring, printed at end of stream (§15.5).
+/// In-memory last-N ring, printed at end of stream.
 struct TailSink {
     ring: VecDeque<String>,
     n: usize,
@@ -335,7 +353,7 @@ impl Output for TailSink {
     }
 }
 
-/// extcap protocol (§15.3). Returns an exit code when an extcap query was handled.
+/// extcap protocol handler for Wireshark's discovery queries and capture launch.
 fn extcap(cli: &Cli) -> Result<(), String> {
     if cli.extcap_interfaces {
         println!("extcap {{version=0.1.0}}{{help=https://www.ti.com}}");
@@ -363,7 +381,7 @@ fn extcap(cli: &Cli) -> Result<(), String> {
     Err("wireshark: expected --extcap-interfaces, --extcap-dlts, --extcap-config, or --capture --fifo <path>".into())
 }
 
-/// dumpcap ring-buffer retention (§15.4): pipe our pcap stream into dumpcap.
+/// dumpcap ring-buffer retention: pipe our pcap stream into dumpcap for a last-N disk ring.
 fn retain(cli: &Cli) -> Result<(), String> {
     let out = cli.out.clone().ok_or("retain needs --out <ring-file-base>")?;
     let mut child = std::process::Command::new("dumpcap")
@@ -389,6 +407,58 @@ fn retain(cli: &Cli) -> Result<(), String> {
     if !st.success() {
         return Err(format!("dumpcap exited with {st}"));
     }
+    Ok(())
+}
+
+/// Fabricate a raw capture from a dbgid database: one packet per def (up to 16, in
+/// stable (channel, dbgid) order), prefixed by `--idle-frames` NOP frames, the whole
+/// pattern written `--repeat` times. Streamed to disk so multi-GB benchmark captures
+/// never sit in RAM. Timestamps advance 3 ticks per packet and seqnums count per
+/// channel, so a decode of the output must report zero seq gaps and monotonic time.
+fn synth_capture(cli: &Cli) -> Result<(), String> {
+    use std::io::Write;
+
+    let cfg = build_cfg(cli, 500_000_000.0);
+    let db = load_db(cli)?;
+    let out = cli.out.clone().unwrap_or_else(|| "synth.raw".to_string());
+    let f = File::create(&out).map_err(|e| format!("creating {out}: {e}"))?;
+    let mut w = std::io::BufWriter::new(f);
+
+    // HashMap iteration order is random; sort so identical inputs give identical bytes.
+    let mut defs: Vec<_> = db.by_key.values().collect();
+    defs.sort_by_key(|d| (d.channel, d.dbgid));
+    defs.truncate(16);
+
+    let mut seq = [0u8; 4]; // per channel, wraps at 16 like the wire
+    let mut tick = 0u16; // shared 16-bit timestamp counter, wraps like the hardware
+    let mut total = 0u64;
+    for _ in 0..cli.repeat {
+        let mut words = Vec::new();
+        for def in &defs {
+            let nargs = def.arg_count.unsigned_abs() as usize;
+            let args: Vec<u32> = (0..nargs).map(|k| 0x1000 + k as u32).collect();
+            let params = synth::args_to_params16(&args, def.arg_count < 0);
+            let ch = def.channel as usize;
+            words.extend(synth::encode_packet(
+                def.channel,
+                def.dbgid,
+                &params,
+                Some(tick),
+                seq[ch],
+            ));
+            seq[ch] = (seq[ch] + 1) & 0xF;
+            tick = tick.wrapping_add(3);
+        }
+        let samples = synth::words_to_samples(&words, &cfg, cli.idle_frames);
+        let packed: Vec<u8> = samples.iter().map(|&l| l << cli.channel).collect();
+        w.write_all(&packed).map_err(|e| format!("writing synth: {e}"))?;
+        total += packed.len() as u64;
+    }
+    w.flush().map_err(|e| format!("writing synth: {e}"))?;
+    eprintln!(
+        "[info] wrote {total} samples to {out} ({} packets)",
+        cli.repeat * defs.len() as u64
+    );
     Ok(())
 }
 
@@ -426,31 +496,7 @@ fn main() -> ExitCode {
             stream_decode(reader, &cfg, &db, cli.channel, &cli.alias, &mut outs)
                 .map_err(|e| format!("decode: {e}"))
         })(),
-        "synth" => (|| {
-            let cfg = build_cfg(&cli, 500_000_000.0);
-            let db = load_db(&cli)?;
-            let out = cli.out.clone().unwrap_or_else(|| "synth.raw".to_string());
-            let mut words = Vec::new();
-            let mut seq = 0u8;
-            for def in db.by_key.values().take(16) {
-                let nargs = def.arg_count.unsigned_abs() as usize;
-                let args: Vec<u32> = (0..nargs).map(|k| 0x1000 + k as u32).collect();
-                let params = synth::args_to_params16(&args, def.arg_count < 0);
-                words.extend(synth::encode_packet(
-                    def.channel,
-                    def.dbgid,
-                    &params,
-                    Some(seq as u16 * 3),
-                    seq & 0xF,
-                ));
-                seq = seq.wrapping_add(1);
-            }
-            let samples = synth::words_to_samples(&words, &cfg, 8);
-            let packed: Vec<u8> = samples.iter().map(|&l| l << cli.channel).collect();
-            std::fs::write(&out, &packed).map_err(|e| format!("writing synth: {e}"))?;
-            eprintln!("[info] wrote {} samples to {out}", packed.len());
-            Ok(())
-        })(),
+        "synth" => synth_capture(&cli),
         other => Err(format!("unknown subcommand: {other}")),
     };
 

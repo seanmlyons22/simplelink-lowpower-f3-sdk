@@ -8,7 +8,7 @@
 # reads that pcap on stdin. The DLT_USER 147 dissector must be installed (see README).
 #
 # The decoder streams: it reads samples in chunks and emits records live with bounded memory,
-# so this pipe runs ENDLESSLY (no --samples/--time needed — omit them for continuous capture).
+# so this pipe runs ENDLESSLY (no --samples/--time needed - omit them for continuous capture).
 # Measured >780 MS/s worst-case, >1 GS/s idle, single core (> the 500 MS/s line rate).
 #
 # Usage:
@@ -49,7 +49,7 @@ tracedecode="${TRACEDECODE:-$here/../target/release/tracedecode}"
 wireshark_bin="${WIRESHARK:-wireshark}"
 
 # sigrok packs enabled channels into bytes; capture only the trace channel so it lands on
-# bit0 (decode reads bit `--channel`, so pass 0 downstream — the analog channel index only
+# bit0 (decode reads bit `--channel`, so pass 0 downstream - the analog channel index only
 # matters to sigrok's -C selector).
 exec sigrok-cli \
     --driver "$driver" \

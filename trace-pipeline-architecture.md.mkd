@@ -1,563 +1,566 @@
-# Trace Capture & Decode Pipeline — Architecture (ARD)
+# RF-Core Trace Capture and Decode Pipeline - Architecture
 
-**Status:** Draft
-**Date:** 2026-07-03
-**Scope:** Customer-scalable replacement for the internal FPGA+GUI trace tool for the **RF-core hardware tracer** log sink. Off-the-shelf logic-analyzer hardware → native decode → Wireshark. Reuses the SDK's existing log-metadata model and (where it fits) the existing `tilogger` host decode/dissector conventions.
+**Status:** As-built (shipped, tests green). No open decisions; the decoder-language
+question was settled by measurement (section 12).
+**Date:** 2026-07-04
+**Scope:** A customer-shippable replacement for the internal capture appliance that decodes
+the CC-series RF-core hardware tracer log sink (`source/ti/log/LogSinkTraceLPF3`). Off-the-shelf
+logic-analyzer hardware, native decode, Wireshark. Reuses the SDK log-metadata model and the
+existing `tilogger` decode and dissector conventions so RF-tracer logs look identical to ITM.
+
+This document is the self-contained ground truth for the pipeline: the wire format, the
+component layout, the interfaces, and the rationale. It does not point at any external spec;
+the facts a maintainer needs are stated here.
 
 ---
 
 ## 1. Context
 
-CC-series chips ship a `ti/log` logging framework (`source/ti/log`) with four interchangeable **sinks**. Three already have host tooling; one does not:
+CC-series chips ship a `ti/log` framework with four interchangeable sinks. Three already have
+host tooling; the trace sink did not - that gap is what this pipeline closes.
 
-| Sink | Transport | Rate | Host tool today |
+| Sink | Transport | Rate | Host tool |
 |---|---|---|---|
-| `LogSinkBuf` | on-chip RAM ring | — | ROV / debugger (no stream tool) |
-| `LogSinkITM` | ARM CoreSight ITM / SWO pin | 12 MHz typ. | `tilogger itm` (Python) |
-| `LogSinkUART` | UART2 peripheral, general-purpose serial | 3 Mbaud | `tilogger uart` (Python) |
-| **`LogSinkTraceLPF3`** | **RF-core LRFDTRC hardware tracer → DIO pin** | **≤24 MHz** | **none — internal FPGA + bespoke GUI** |
+| `LogSinkBuf` | on-chip RAM ring | - | debugger / ROV (no stream tool) |
+| `LogSinkITM` | Arm CoreSight ITM / SWO pin | 12 MHz typ. | `tilogger itm` (Python) |
+| `LogSinkUART` | UART2 peripheral | 3 Mbaud | `tilogger uart` (Python) |
+| `LogSinkTraceLPF3` | RF-core tracer, one DIO pin | up to 24 Mbaud | this pipeline (`tracedecode` + `tilogger rftrace`) |
 
-This ARD covers **only the trace sink** (`LogSinkTraceLPF3`). It is its own dedicated RF-trace path — *not* the general-purpose `LogSinkUART`. UART and ITM already stream to the host through `tilogger`; the trace sink is the gap.
+The trace sink is a dedicated tracer block inside the RF core, not the general-purpose UART2.
+`LogSinkTraceLPF3` writes log records straight into the tracer's registers; the tracer
+serializes them onto a user-selectable DIO pin as a UART-like line. There is no software
+buffer and no software timestamp - the tracer hardware stamps each record.
 
-**The trace source is a dedicated hardware module inside the RF core, emitting a UART line.** `LogSinkTraceLPF3` drives the **RF core's LRFDTRC (RF Tracer) peripheral** (base `0x40084000`), whose internal 24 MHz clock is divided by a prescaler (DIV1–DIV4) and serialized onto a user-selectable DIO pin. It is not the general-purpose UART2 peripheral (that's `LogSinkUART`) — it's a separate tracer block in the radio core — but the pin carries an **ordinary asynchronous UART line**. Today that line is decoded by an FPGA — the driver even busy-waits `HapiWaitUs(5)` on enable to "give enough time for FPGA tracer to lock on to signal." Replacing that FPGA+GUI with off-the-shelf hardware + a software deframer is the entire point of this project.
+**Two protocol layers, kept separate throughout the code:**
 
-**Two protocol layers** (keep them separate):
+- **Physical line** - a UART-like serial line but not a standard UART: idle high on the real
+  wire, active-high start bit, 10 data bits MSB-first, trailing zero. 12 bits per frame.
+  Recover words by start-edge detection plus oversampling.
+- **Logical packet** - a framed protocol above the word layer: a per-channel state machine
+  `SOP -> [timestamp] -> header(dbgid) -> data... -> EOP` with a 5-bit CRC trailer and a
+  channel-0 timestamp-MSB sync word. Each 10-bit word is `[9:8] channel-id . [7:0] payload`.
+  A `dbgid` (3..255, scoped to a channel) maps to a printf format string via the dbgid database.
 
-- **Physical line framing** — a UART-*like* serial line, but **not** a standard UART: idle **high**, **active-high start bit** (start = 1), 10 data bits **MSB-first**, trailing 0. 12 bits/frame. The whole ground-truth format is now pinned from the RTL (see §11, from `rf_tracer_spec.md`). Deframe by start-pulse detect + oversample, then lift the 10-bit word out of frame bits [11:2].
-- **Logical packet** — a real framed protocol above the word layer: a per-channel **SOP → [timestamp] → header(dbgid) → data* → EOP** state machine with a **CRC-5-USB** trailer and a channel-0 timestamp-MSB sync word. Each 10-bit word = `[9:8] chx_id · [7:0] payload byte`. This is fully specified (§11) and maps a **dbgid** (3..255, per channel) to a format string via the dbgid DB (§12).
+Section 3 states both layers in full so no other reference is needed.
 
-**Signal (physical):** single GPIO (`rfctrc_out`), idle high, 12-bit frames @ 500 ns (24 MHz ÷ 12 → 20 Mbit/s payload), active-high start, MSB-first, trailing zero. Idle stream = continuous **NOP words = `0x000`** (chx_id 0, payload 0), *not* `0x3FF` — that earlier value was the pre-spec guess and is superseded by §11. As captured by the LA the line is **inverted** (idle low from the probe's view); deframe as inverted async-serial, 10-bit, MSB — confirmed by the `.sal` analyzer config (§11.1, Open Q1 answered).
+## 2. Pipeline architecture
 
-**Frame geometry:** 12 bits/frame, 41.67 ns/bit, 500 ns/frame, 2M frames/s saturated. Real logs sparse; NOP idle dominates.
+```
+[CC chip: LogSinkTraceLPF3 -> RF-core tracer -> one DIO pin]
+   physical: 12-bit frame, idle-high, active-high start, MSB-first, NOP=0x000 idle fill
+   logical:  8-bit dbgid . arg-count . up to 4 params . 16-bit HW timestamp (0.5 us tick)
+        | single trace line
+        v
+   [ Sampler ]  one of:
+     - sigrok-cli --continuous -O binary   (true streaming, endless)
+     - Logic 2 Automation API              (batched .sal capture windows)
+     - a pre-recorded .sal or raw file     (offline / CI)
+        | raw samples (1 byte/sample) or a Saleae .sal container
+        v
+   [ tracedecode : native decoder ]
+        sample ingest -> deframe -> 10-bit words -> classify
+          -> per-channel packet state machine (x3) + CRC-5 + timestamp
+          -> resolve (channel,dbgid) against the dbgid database -> printf
+          -> LogRecord
+        | pcap, DLT_USER0=147, ||-delimited text payload (identical to tilogger)
+        +-- stdout (human line)
+        +-- Wireshark via extcap or a fifo, reusing tilogger_dissector.lua
+        +-- dumpcap ring buffer (last-N retention)
+        +-- in-memory tail (last-N, no Wireshark)
+        v
+   [ tilogger rftrace transport ]  (optional front-end)
+        spawns tracedecode, reads its pcap back, re-emits tilogger LogPackets
+        so every tilogger output works unchanged; --elf resolves dbgids from the ELF
+```
 
-## 2. Baseline — existing TI logger stack (reuse surface)
+The decoder is the only throughput-critical custom component. Sampler, viewer, and retention
+are off-the-shelf; metadata resolve and the dissector reuse the existing SDK / `tilogger` design.
 
-Everything above the physical line is already defined by `source/ti/log` (target) and `tools/log/tiutils` (host). The new decoder should reuse these facts as the single source of truth rather than reinvent them.
+## 3. Wire format (ground truth)
 
-### 2.1 On-target log model (`Log.h`)
+### 3.1 Physical layer
 
-- `Log_printf` / `Log_buf` are **preprocessor macros**. Each enabled call site (a) level-gates, (b) emits a **metadata string** into linker section `.log_data`, and (c) emits a **pointer/index** into section `.log_ptr*`.
-- Metadata strings are joined by ASCII **`0x1E`** (Record Separator), field order: `opcode · file · line · level · module · format · nargs`.
-- Opcodes are literal strings, matched on the host: `LOG_OPCODE_FORMATED_TEXT`, `LOG_OPCODE_BUFFER`, `LOG_OPCODE_EVENT`, `LOG_OPCODE_VERSION`.
-- Levels are a bitmask: `DEBUG=1<<0, VERBOSE=1<<2, INFO=1<<4, WARNING=1<<6, ERROR=1<<8`.
-- `.log_ptr*` is wildcard-collected by the linker into one **contiguous, fixed-stride, 4-byte-aligned** array (`type = COPY`, a **nonloadable** region — sample origins `LOG_DATA=0x90000000`, `LOG_PTR=0x94000008`). Consequence: the format string, file, and line **never occupy target flash/RAM at runtime** and **never cross the wire**. A statement is identified by its **index** into `.log_ptr`; only that index/pointer + args (+ maybe a timestamp) are transmitted. The host recovers everything else from the ELF.
-- Sinks are dispatched through function pointers in `Log_Module` (`printf`, `printf0..3`, `buf`); each ships `*_printfSingleton` (one instance, smallest code) and `*_printfDepInjection` (multi-instance) variants.
+- One DIO pin driven by the RF-core tracer. Bit clock is 24 MHz on most parts; some variants
+  run it at 48 MHz (use `--divide-time-by-2` so timestamps read as wall-clock).
+- **12-bit frame**, MSB drives the pin first:
+  - bit 11 (first): start = 1 (active-high, the opposite of a standard UART's active-low start)
+  - bits 10:1: the 10-bit data word, MSB first
+  - bit 0 (last): 0 (trailing/stop-like)
+- Bit clock / 12 gives the frame rate. At 24 MHz that is 2 MHz words = 500 ns/frame = 20 Mbit/s
+  of payload. The idle line is a continuous stream of NOP words (`0x000`), which is what lets
+  clock recovery lock even when no logs are flowing.
+- **As captured by the Saleae the line reads inverted** (idle low). So the deframer treats it
+  as inverted async-serial: 24 Mbaud, 10 data bits, MSB-first, 1 start, 1 stop, no parity. The
+  "idle-high / active-high start" of the real wire reconciles with this through the inverted probe.
+- At 500 MS/s the ratio is 500e6 / 24e6 = 20.83 samples/bit - non-integer. The deframer places
+  bit centers with a fractional accumulator and resyncs phase on every start edge, so only
+  intra-frame drift (12 bits) matters. Both clocks are crystal-derived, so intra-frame drift is
+  far below half a bit; no running period estimate is needed.
+- **Polarity is auto-detected, not assumed.** Because the tracer idles with NOP frames (1 start
+  bit, 11 zero bits) whenever it is on, the start-bit level is always the *minority* level over a
+  window. The deframer picks the minority level as the start level, which makes the "inverted"
+  flag only a hint and lets both real captures and synthetic captures decode with one default.
 
-### 2.2 Trace sink logical packet (`LogSinkTraceLPF3`)
+### 3.2 10-bit word layout
 
-- Writes directly to LRFDTRC registers — no software buffer. Per record: `CHxCMD` carries an **8-bit log ID** (`PKTHDR[15:8]`) + a **3-bit arg-count code** (`PARCNT[2:0]`, from `nArgLut = {0,2,4,3,4}`); `CHxPAR01`/`CHxPAR23` carry the params.
-- **Max 4 args.** 1–2 args pack as full 32-bit words; 3–4 args pack as 16-bit halves.
-- **Log-ID space = 256 per channel**, IDs 1–2 reserved, first usable = ID 3 (`LOG_PTR` origin `+4`, masked to 8 bits). The ID indexes the same `.log_ptr` table as every other sink.
-- **Channels multiplexed on the one pin:** CH1 = CPU logs, CH2/CH3 = internal radio (TOPSM). SysConfig modes CPU_ONLY / RADIO_ONLY / CPU_RADIO. A 3-bit channel field selects the register bank.
-- **Timestamps are generated by the tracer hardware**, not software: **0.5 µs resolution, 32 ms range before rollover**, toggled by the `TSEN` bit (on by default). No timestamp is marshalled in software.
-- `Log_buf` is **not supported** on this sink (no HW support). Config lost in standby → re-armed via a `PowerLPF3_AWAKE_STANDBY` notify callback.
-- Flow control: busy-poll `CHxCMD.PKTHDR` until the previous packet drains, inside a `HwiP_disable()` critical section.
+Every word is `w[9:8] = channel-id`, `w[7:0] = payload`. Classify by masks:
 
-### 2.3 Host pipeline (`tilogger`, for ITM/UART today)
-
-- **setuptools `entry_points` plugin architecture**: `tilogger.transport` (uart / itm / from-replayfile), `tilogger.output` (stdout / wireshark / to-replayfile), plus `tilogger.formatter` / `tilogger.subscriber`. Typer "chain" CLI wires a command line like `uart COM4 3000000 wireshark --start` into one `Logger`.
-- Stages: **Transport** (serial RX + a wire **Framer** + a **Packetiser** that resolves tokens via `TraceDB`) → emits the canonical `LogPacket` (`alias, module, opcode, level, filename, lineno, timestamp, timestamp_local, data, trace_db`) → **`Logger.log`** resolves the format string **host-side** (Python `%` substitution) and fans out to each **Output**.
-- **Token → metadata decode (`tracedb.py`):** parses the ELF **symbol table (`.symtab`)** — *not* DWARF (`dwarf.py` exists but is dead code, imported nowhere). Reads sections `.log_data` / `.log_ptr`; symbol conventions `LogSymbol_*`, `Ptr_LogSymbol_*`, `TimestampP_nativeFormat32_copy`. Result is cached (pickled, keyed by ELF MD5, `watchdog`-rebuilt on ELF change). The ELF can be stripped to just `.log_data` + `.log_ptr` via `objcopy` for sharing without proprietary code.
-- **UART framing** (`uart_framer.py`): self-synchronizing, **no sync word**. First 4 bytes = little-endian header = an ELF address, validated against `TraceDB`; length derived from opcode + nargs (not a wire length field); the next 4 bytes are an on-target device timestamp (native packed format, struct pulled from the ELF); **byte-shift resync** (`pop(0)`) on any header that doesn't resolve; overflow frame flagged by `header & 0xFFF80000 == 0x80000000`.
-- **ITM framing** (`itm_framer.py`): standard CoreSight ITM/DWT packet protocol; refuses to start until a 5-byte reset token `FB BB BB BB BB`; timestamps reconstructed host-side from cycle-count deltas.
-
-### 2.4 Existing Wireshark path (the reuse target for M3/M4)
-
-- **Mechanism:** a **Windows named pipe** (`\\.\pipe\tilogger-wireshark`) carrying a **hand-rolled classic pcap** stream (magic `0xA1B2C3D4`, snaplen 256). **Not** extcap, **not** pcapng, **not** a file. **Linux is explicitly unsupported** (`NotImplementedError("No support for Linux in this beta")`).
-- **Link type: `DLT_USER0` = 147**, configured into Wireshark via `-o uat:user_dlts:"User 0 (DLT=147)","tilogger",…`.
-- **One pcap packet = one decoded log record.**
-- **Payload is pre-decoded UTF-8 text**, `||`-delimited: `alias || ts_local(.9f) || opcode || module || level || file || line || formatted_string`. All real decode (token→format, printf substitution) happens **host-side** before Wireshark.
-- **Dissector is Lua** (`tilogger_dissector.lua`), manually copied into `Wireshark/plugins/x.y/`. It is a **trivial text splitter** — splits payload on `||` and assigns 8 string fields (`tilogger.alias`, `.ts_local` "Device time", `.opcode`, `.module`, `.level`, `.file`, `.line`, `.string`); registers on `wtap_encap` id 7 (Wireshark's internal id for DLT_USER0).
-
-## 3. Goals / Non-goals
-
-**Goals:**
-- Off-the-shelf hardware (Saleae-class), no custom silicon, no FPGA.
-- Sustained realtime decode at 24 Mbaud.
-- Headless streaming; last-N retention; no giant capture files.
-- Wireshark as viewer (filter/color/columns free).
-- **Cross-platform, incl. Linux** — the existing `tilogger` Wireshark output is Windows-only; this path should not inherit that limit.
-- **Reuse the SDK metadata model and `tilogger` conventions** where they fit: the `.log_data`/`.log_ptr` decode, opcode/level enums, `DLT_USER0`, the `||`-text payload + existing Lua dissector.
-- Customer-shippable packaging.
-
-**Non-goals:**
-- Custom GUI (Wireshark covers it).
-- Replacing the ITM/UART `tilogger` paths — this only adds the trace-sink path they lack.
-- Analog capture.
-- Multiple physical trace lines (single pin, v1). Note: the LRFDTRC still multiplexes multiple logical *channels* onto that one pin.
-
-## 4. Constraints
-
-| Constraint | Value | Driver |
+| Word | Detect on 10-bit `w` | Fields |
 |---|---|---|
-| Oversample factor | ≥8x (target ~20x) | async start-edge + mid-bit recovery |
-| Sample rate | 500 MS/s (fallback 250) | Logic Pro ≤4ch USB3 ceiling |
-| Pipe throughput | ≤500 MB/s (byte/sample) | sigrok `-O binary` unitsize=1 |
-| Wireshark live rate | ~10k–100k pkt/s | UI/dissector limit → packetize at log level, not frame |
-| Physical line | inverted async-serial, 10-bit, MSB, 24 Mbaud, NOP=0x000 | confirmed via `.sal` analyzer config (§11.1); RTL-corroborated |
-| HW timestamp range | 0.5 µs res, **32 ms rollover** | tracer timestamp field; must unwrap host-side |
-| Log-ID space | 256 IDs / channel | 8-bit `PKTHDR`; large apps may exceed |
-| Existing WS output | Windows-only, Python | named-pipe + Python framer won't sustain 24 Mbaud or run on Linux |
-| sigrok Pro driver | experimental | sustained-stream reliability unproven |
-| License | GPLv3 (sigrok/libsigrok) | subprocess vs link boundary |
+| NOP / idle | `w == 0x000` | none - dropped |
+| Overflow | top bits 0, `w & 0x00E != 0` | `w[3:1]` per-channel overflow (bit3=ch3, bit2=ch2, bit1=ch1) |
+| TS-MSB (ch0) | top bits 0, `w & 0x020 != 0`, `w[7:6]==0` | `w[4]`=ts_en, `w[0]`=timestamp counter MSB |
+| SOP | top bits 0, `w[7:6] != 0`, `w & 0x020 == 0` | `w[7:6]`=channel 1..3, `w[4]`=ts_en, `w[3:0]`=seqnum |
+| EOP | top bits 0, `w[7:6] != 0`, `w & 0x020 != 0` | `w[7:6]`=channel, `w[4:0]`=CRC-5 |
+| DATA | `w[9:8] != 0` | `w[9:8]`=channel 1..3, `w[7:0]`=payload byte |
 
-## 5. Architecture
+Note the channel sits in `w[7:6]` for SOP/EOP (their top bits are zero) but in `w[9:8]` for
+DATA. Route each word to the owning channel's state machine accordingly.
+
+### 3.3 Per-channel packet state machine
+
+Three independent state machines (channels 1..3); their words interleave on the wire. Per packet:
 
 ```
-[CC chip: LogSinkTraceLPF3 → LRFDTRC RF tracer → DIO pin]
-   physical framing: 12b frame, idle-high, active-high start, MSB, NOP=0x000 idle (replaces FPGA)
-   logical packet:   8b log ID · arg-count · ≤4 params · HW timestamp (0.5us)
-        │ single trace line
-        ▼
-[Logic Pro 8/16  |  DSLogic U3Pro16] ──USB3──► [M1 Sampler: sigrok-cli --continuous -O binary]
-        │ raw packed samples  (I1)
-        ▼
-┌──────────────────────────────────────────────────────┐
-│ [M2 Trace Decoder]  (native, Rust)                    │
-│   M2.1 Sample Ingest                                  │
-│   M2.2 Clock/Baud Recovery ◄─ start-pulse edges       │
-│   M2.3 Deframer (start/invert/MSB/stop) ← LRFDTRC     │
-│   M2.4 Sync Filter (drop NOP 0x000 words)             │
-│   M2.5 Protocol Decode: LRFDTRC packet → log ID,      │
-│        args, HW timestamp, channel                    │
-│   M2.5b Metadata resolve: ID → .log_ptr → .log_data   │
-│         (reuse tracedb model) → format substitution   │
-│   M2.6 Record Emitter (HW timestamp, not sample idx)  │
-└──────────────────────────────────────────────────────┘
-        │ pcap/pcapng, DLT_USER0=147, ||-text payload  (I3)
-        ├────────► [M3 extcap/pipe shim] ─► [M4 Wireshark + existing Lua dissector]
-        ├────────► [M5 Retention: dumpcap -b files:N]   (I4)
-        └────────► [M6 Headless tail: last-N logs]       (I5)
+SOP(channel, ts_en, seq)
+  -> if ts_en: DATA (timestamp delta high byte), DATA (low byte)
+  -> DATA (dbgid, 3..255)
+  -> DATA x par_cnt: byte pairs, high byte first, each pair = one 16-bit param word
+  -> EOP(channel, crc5)      // par_cnt = number of 16-bit words collected, up to 4
 ```
 
-The decoder is the only custom hot-path component. Sampler, transport, viewer, retention are off-the-shelf, and the metadata-resolve + dissector reuse the existing SDK/`tilogger` design.
+- dbgid 0..2 are reserved (0 debug, 1 timestamp, 2 sim-end): handle or skip, never dispatch as logs.
+- Param width comes from the dbgid (section 4). A 32-bit arg consumes two 16-bit words, low half
+  first: `arg = params[i] | (params[i+1] << 16)`. A 16-bit arg is one word.
+- seqnum wraps at 16 and is used to detect dropped packets per channel.
 
-## 6. Modules
+### 3.4 CRC-5
 
-### M1 — Sampler (acquisition front-end)
-- **Role:** drive LA, stream raw digital samples continuously.
-- **Impl:** `sigrok-cli` subprocess (v1). libsigrok C client = later option (see ADR-003).
-- **Config:** device driver, samplerate, channel, `--continuous`, `-O binary`.
-- **Out:** I1. **Owns:** USB/driver handling, sample-rate config. Stateless re: protocol.
+- 5-bit CRC, poly 0x05, init 0x1F, **MSB-first**. Accumulate `word[7:0]` for SOP, timestamp,
+  header, and data words, then the top 3 bits (`word[7:5]`) of EOP. The transmitted CRC is in
+  `EOP[4:0]`. A good packet's received CRC equals the accumulated value.
+- The MSB-first convention was confirmed against a real capture: 28 of 28 real packets validate.
+  The textbook reflected CRC-5/USB does *not* match the wire (it validated 1 of 28); it is kept
+  only as a self-test anchor (`check("123456789") == 0x19`), never used to validate wire packets.
+- A CRC failure increments a health counter and drops the packet; it never aborts decoding.
 
-### M2 — Trace Decoder (core)
-- **Role:** raw samples → decoded log records. Only throughput-critical module.
-- **Impl:** Rust (aligns with active RCL/Rust-on-TI work; memory-safe hot loop). C viable.
-- **In:** I1. **Out:** I3 (pcap), I5 (tail text).
-- Submodules:
-  - **M2.1 Sample Ingest** — read packed samples from stdin, mask channel bit, feed edge detector. Backpressure via blocking read.
-  - **M2.2 Clock/Baud Recovery** — measure real bit period from frame start-pulse edges (one per 500 ns, dense during NOP idle); low-pass; correct sampler↔device drift.
-  - **M2.3 Deframer** — detect start edge (polarity-parameterized), fractional bit-center accumulator (~20.83 samp/bit), sample bits, assemble MSB-first, verify stop, count framing errors. Reconstructs the LRFDTRC line, replacing the FPGA.
-  - **M2.4 Sync Filter** — drop NOP words (chx_id 0, payload 0 = `0x000`) and consume ch0 timestamp-MSB / overflow words as state, not output. Only real packets reach M2.5. Kills idle flood pre-pcap.
-  - **M2.5 Protocol Decode** — run the per-channel packet state machine over the 10-bit word stream: **SOP → [TSH,TSL] → HDR(dbgid) → DATA·par_cnt → EOP**, verify **CRC-5-USB**, extract `(channel 1..3, dbgid 3..255, seqnum, timestamp delta, params[])`. Word = `[9:8] chx_id · [7:0] byte`. Fully specified in §11 — a known, fixed format.
-  - **M2.5b Metadata Resolve** — look up `(channel, dbgid)` in the **dbgid DB** (`DBG_DEF` lines produced by `elf2dbgid.py` from the ELF, §12) → format string + argCount (sign = param width) + file + line. Then printf-substitute params. **Do not parse the ELF in the decoder** — consume the pre-extracted dbgid file (`elf2dbgid` already owns ELF parsing).
-  - **M2.6 Record Emitter** — serialize to a pcap record (I3) or tail line (I5). **Timestamp = the tracer's embedded HW timestamp** (unwrapped across the 32 ms rollover, optionally correlated to host wall clock), *not* `sample_index / samplerate` — the sample index is only a fallback/sanity check.
+### 3.5 Timestamp reconstruction
 
-### M3 — extcap / pipe shim
-- **Role:** present the decoder as a Wireshark capture interface.
-- **Impl:** extcap (production, cross-platform, discoverable) is preferred over the existing Windows-only named-pipe approach. A fifo (`wireshark -k -i -`) mirrors the current `tilogger` mechanism for a quick prototype.
-- **In:** extcap control args. **Out:** pcap/pcapng on fifo (I3).
+- A 16-bit counter at 2 MHz (bit clock / 12), so 0.5 us per tick and a 32.768 ms range before
+  the 16-bit counter rolls over. Each timestamped packet carries a 16-bit snapshot.
+- Reconstruct the full tick count by keeping the running upper bits and merging the 16-bit
+  snapshot. Rollover rule: if the merged value is more than 2000 ticks *behind* the last value,
+  the counter wrapped - add 0x10000. (2000 ticks of slack tolerates out-of-order jitter without
+  false rollovers.)
+- Convert ticks to microseconds by dividing by 2 (0.5 us/tick); divide by 2 again for 48 MHz
+  parts (`--divide-time-by-2`, e.g. CC2745, whose ticks are 0.25 us). Keep raw ticks for the
+  pcap record timestamp.
 
-### M4 — Wireshark dissector
-- **Role:** parse the record → named fields; filter/color/columns.
-- **Impl:** **reuse the existing `tilogger_dissector.lua`** — it splits a `||`-delimited text payload into `alias / ts_local / opcode / module / level / file / line / string`. Since the decoder does full decode (M2.5b), it emits that same text and the trivial dissector works unchanged. A binary payload + custom binary dissector is the alternative (ADR-014).
+## 4. Metadata: the dbgid database
 
-### M5 — Retention (last-N / circular)
-- **Role:** bounded on-disk history, headless.
-- **Impl:** `dumpcap -b files:N -b filesize:X` ring on I3. No custom buffer code.
+The wire carries only an 8-bit dbgid per channel, not the format string. The decoder resolves
+`(channel, dbgid)` to a format string, arg widths, file, and line using a text database. It
+never parses an ELF itself - keeping ELF/DWARF parsing out of the hot path and out of the
+shipped binary. That parsing is done once, upstream, by the SDK `elf2dbgid` tool (or, in the
+Python front-end, by tilogger's own ELF reader; see section 6.2).
 
-### M6 — Headless tail
-- **Role:** print last-N decoded logs, no Wireshark.
-- **Impl:** M2 `--tail N` text mode, or ring consumer on pcap.
+A database entry is one `DBG_DEF` line with 8 comma-separated fields (some quoted, and quoted
+fields may themselves contain commas, so the parser splits only on top-level commas):
 
-## 7. Interface specs
-
-### I1 — Sampler → Decoder
-| Field | Spec |
-|---|---|
-| Direction | M1 → M2 |
-| Medium | pipe (stdout → stdin) |
-| Format | sigrok binary, unitsize=1: 1 byte/sample, bit0 = D0 |
-| Rate | ≤500 MB/s @ 500 MS/s |
-| Backpressure | pipe blocking; decoder must sustain or sampler stalls → sample loss. Monitor. |
-| Errors | short read / EOF = sampler died → decoder exits nonzero |
-
-Note: byte/sample is 8x wasteful. If pipe-bound, switch to libsigrok packed datafeed (ADR-003).
-
-### I3 — Decoder → Wireshark / Retention
-| Field | Spec |
-|---|---|
-| Direction | M2 → M3/M4, M5, M6 |
-| Container | pcap (matches existing `tilogger`) or pcapng; both carry the same payload/DLT and the Lua dissector is container-agnostic |
-| Link type | **`DLT_USER0` = 147** (same as existing `tilogger`) |
-| Record | one packet per **log message** (= one LRFDTRC packet); confirmed by existing host tool |
-| Payload | **pre-decoded `||`-delimited UTF-8 text**: `alias · ts_local · opcode · module · level · file · line · formatted_string` (existing dissector format). Binary payload is the ADR-014 alternative. |
-| Timestamp | tracer HW timestamp (0.5 µs), unwrapped past 32 ms rollover; pcap `ts_sec/ts_usec` from it |
-| Control (extcap) | `--extcap-interfaces`, `--extcap-dlts`, `--extcap-config`, `--capture`, `--fifo`, `--extcap-interface` |
-
-### I4 — Retention config
-| Field | Spec |
-|---|---|
-| Ring | `-b files:N` (file count) + `-b filesize:X` (KB) or `-b duration:T` |
-| Result | last N rotated pcap files on disk |
-
-### I5 — Headless tail
-| Field | Spec |
-|---|---|
-| Format | human-readable line per decoded log, stderr-safe |
-| Retention | in-mem ring of last N records; dump on SIGUSR1 or continuous stream |
-
-### Decoder CLI (config surface)
 ```
-tracedecode <SUBCOMMAND> [OPTS]
-
-# Physical / deframe (all subcommands)
-  --samplerate <Hz>        # 500000000 (LA sample rate; from .sal meta if replay)
-  --baud <Hz>              # 24000000 (async-serial bit rate)
-  --data-bits 10           # 10 data bits (+1 start +1 stop framing)
-  --bit-order msb          # msb|lsb           (confirmed: msb)
-  --invert / --no-invert   # line inversion    (confirmed: invert ON by default)
-  --channel <n>            # LA channel carrying rfctrc_out (default 4; 5 = cluster/slave)
-  --dbgid <path>...        # one or more DBG_DEF files (elf2dbgid output); *_mst.h / *_slv.h / *.h
-  --divide-time-by-2       # Agama / 48 MHz clk_rfctrc variants
-
-# Subcommands (composable, tilogger-style)
-  decode   <input>         # raw samples stdin|file → records
-  replay   <file.sal|.bin> # Saleae .sal or raw sample file → records (offline/CI)
-  synth    --dbgid <f> -o  # fabricate a sample stream from a dbgid DB (self-test)
-  stdout   [--format FMT]  # human-readable, matches reference decode
-  wireshark [--extcap|--pipe NAME]   # DLT_USER0=147, ||-text payload
-  retain   --files N --filesize KB   # dumpcap ring
-  tail     --n N           # headless last-N
+DBG_DEF(NAME, dbgid, DBGCH<ch>, argCount, "format", "file", line)
 ```
 
-## 8. Decision log (ADR)
+| Field | Meaning |
+|---|---|
+| 0 | literal `DBG_DEF` (else the line is skipped) |
+| 1 | symbolic name (ignored) |
+| 2 | dbgid, 3..255 (0..2 reserved) |
+| 3 | `DBGCH1`/`DBGCH2`/`DBGCH3` -> channel 1..3 |
+| 4 | argCount: > 0 means that many 16-bit args; < 0 means that many 32-bit args; 0 means none |
+| 5 | printf format string, C `%` specifiers |
+| 6 | source file |
+| 7 | source line |
 
-### ADR-001 — Tap raw samples, bypass Logic 2 SDK
-**Status:** Accepted
-**Context:** Logic 2 holds captures in RAM, no disk streaming, no live sample access; Automation API = orchestration only; HLA runs inside the app. All three PoC pain points are structural to Logic 2.
-**Decision:** Take raw samples off the hardware via sigrok; never route through Logic 2 at runtime.
-**Consequences:** (+) true streaming, headless, no memory cap. (−) lose Saleae app conveniences; depend on sigrok driver support.
+The database is keyed on `(channel, dbgid)`. Naming convention (for parts that split logical
+streams): `*_mst.h` is master-only, `*_slv.h` slave-only, `*.h` both. The current single-pin
+decoder merges everything into one database; a master/slave split would only be needed if two
+trace pins were probed at once.
 
-### ADR-002 — Native decoder, not libsigrokdecode
-**Status:** Accepted
-**Context:** 2M frames/s saturated. libsigrokdecode is single-thread Python, built for kHz–low-MHz. The existing `tilogger` framer/`tracedb` is also Python — fine for 3–12 MHz UART/ITM, but not for a 24 Mbaud continuous LA feed. Decode algorithm itself is trivial (~62.5 MB/s scan, <1 core native).
-**Decision:** Custom native decoder (M2). sigrok used only as sampler front-end. Reuse `tracedb`'s *logic* (ELF `.symtab` parse, `0x1E` fields, opcode/level enums) as the spec, ported to native or called out-of-band for non-hot-path metadata build.
-**Consequences:** (+) meets throughput. (−) own the deframe/decode code; keep the Rust metadata resolve in sync with `tracedb`.
-**Alternatives:** stock `uart` PD + Python custom PD (rejected: throughput; also defaults LSB-first, idle-high — wrong twice here).
+## 5. Native decoder (`tools/rftrace-decode`, `tracedecode`)
 
-### ADR-003 — Sampler = sigrok-cli subprocess (v1)
-**Status:** Proposed
-**Context:** Two taps into hardware: `sigrok-cli` subprocess (stdout binary) vs libsigrok linked C client. sigrok is GPLv3. Subprocess = arm's-length; linking libsigrok pulls GPL into a shipped binary. Subprocess also costs byte/sample stdout overhead (I1).
-**Decision:** subprocess for v1. Revisit libsigrok client if (a) pipe becomes bottleneck or (b) need packed feed / tighter control. Keep decoder input abstracted so either backs it.
-**Consequences:** (+) clean license boundary, fast to build. (−) 8x pipe overhead; less control over device.
+A single Rust crate: one library plus a thin CLI binary. The hot path is allocation-light and
+streaming - it never buffers a whole capture. `.sal` replay works edge-to-edge, so an 11.5
+billion-sample capture is processed without ever expanding it to per-sample levels.
 
-### ADR-004 — Hardware: Logic Pro primary, DSLogic fallback
-**Status:** Proposed
-**Context:** 24 Mbaud needs ≥8x → ≥192 MS/s. Logic Pro 8/16: 500 MS/s on ≤4ch over USB3 (single line qualifies). sigrok `saleae-logic-pro` driver = experimental, sustained-500-MS/s-stream unproven. DSLogic U3Pro16 has mature sigrok lineage + streaming mode.
-**Decision:** target Logic Pro (ubiquity). Validate sustained no-drop stream before commit. If it drops, fall back to DSLogic U3Pro16.
-**Consequences:** driver risk gated by a validation spike. Both remain off-the-shelf.
+### 5.1 Modules
 
-### ADR-005 — 500 MS/s, fractional bit-center recovery
-**Status:** Accepted
-**Context:** 500 MS/s / 24 Mbaud = 20.83 samp/bit — non-integer.
-**Decision:** fractional bit-center accumulator, resync phase on each start edge. Fallback 250 MS/s (10.4x) if driver can't sustain 500.
-**Consequences:** robust to non-integer ratio + drift. Slight decoder complexity.
+| File | Responsibility |
+|---|---|
+| `types.rs` | Core data model: `Word`, `WordKind`, `DecodedPacket`, `DbgDef`, `DbgIdDb`, `LogRecord`, `Health`, `DeframeCfg`. |
+| `sample.rs` | Ingest: raw 1-byte-per-sample reader, and the Saleae `.sal` container reader (transition-list form; see section 8.2). |
+| `deframe.rs` | Physical deframe: sample levels or an edge list -> 10-bit words. Clock recovery and framing. Shares `encode_frame`/`decode_frame` with the synth encoder. |
+| `packet.rs` | Word classification and the three per-channel packet state machines; CRC check; yields `DecodedPacket` on each EOP. |
+| `crc5.rs` | The incremental MSB-first CRC-5 used by both the assembler and the synth encoder, plus the reflected CRC-5/USB self-test anchor. |
+| `timestamp.rs` | Running device-time reconstruction (rollover unwrap) and tick-to-microsecond conversion. |
+| `dbgid.rs` | `DBG_DEF` line parser and multi-file database loader. |
+| `record.rs` | `DecodedPacket` + database entry -> `LogRecord`, including the C printf engine. |
+| `output.rs` | The `Output` trait and its sinks: stdout line and pcap (`DLT_USER0=147`, `||` payload). |
+| `synth.rs` | The reverse path: records -> tracer words -> sample levels. The basis of the hardware-free self-tests. |
+| `main.rs` | CLI: argument parsing, output wiring, batch (`run_words`) and streaming (`stream_decode`) drivers, and the `replay`/`decode`/`synth`/`tail`/`retain`/`wireshark` subcommands. |
 
-### ADR-006 — Filter NOP words at decoder, pre-pcap
-**Status:** Accepted
-**Context:** idle spews **NOP words (`0x000`)** at 2M frames/s (RTL `PS_IDLE`); this is the file-size + packet-rate root cause. NOP is a known constant and the tracer idle fill.
-**Decision:** M2.4 drops NOP words and consumes ch0-timestamp-MSB / overflow control words as state before emit. Only complete, CRC-valid packets reach pcap.
-**Consequences:** capture size collapses to real-log volume. CRC/framing errors counted (health metric), not emitted.
+### 5.2 Core types
 
-### ADR-007 — Clock recovery from frame start-pulses
-**Status:** Accepted
-**Context:** sampler free-runs vs device 24 MHz clock; fixed ratio offset + drift; phase walks over long runs at fractional samp/bit. The FPGA reference reports a lock ratio (`whole + frac·0.125`) it recovers by oversampling — we do the same in software.
-**Decision:** M2.2 measures real frame period from the periodic active-high start-pulses (one per 500 ns, continuous during NOP idle), low-passes, corrects bit-center placement.
-**Consequences:** stable phase over long captures. Depends on sync presence — safe, sync is the idle fill.
+```
+Word(u16)                         // 10-bit word, w[9:8]=channel-id, w[7:0]=payload
+WordKind = Nop | Overflow(u8) | TsMsb{ts_en,ts_msb}
+         | Sop{ch,ts_en,seq} | Eop{ch,crc5} | Data{ch,byte}
+DecodedPacket { channel, dbgid, seq, ts_delta: Option<u16>, params: Vec<u16>, crc_ok }
+DbgDef       { dbgid, channel, arg_count: i32, fmt, file, line }
+DbgIdDb      { by_key: HashMap<(u8,u8), DbgDef> }
+LogRecord    { alias, channel, dbgid, seq, ts_ticks, ts_us, file, line, level, text }
+Health       { framing_errors, crc_errors, overflow_words, unknown_dbgid, dropped_seq }
+trait Output { on_record(&LogRecord); on_health(&Health); finish(); }
+```
 
-### ADR-008 — Wireshark transport = extcap (was: named pipe)
-**Status:** Proposed
-**Context:** The existing `tilogger` uses a **Windows named pipe** feeding a hand-rolled classic-pcap stream — Windows-only and not a discoverable interface. Production wants cross-platform + clean packaging.
-**Decision:** fifo for prototype (mirrors current `tilogger`), **extcap** for production (cross-platform, appears as a capture interface).
-**Consequences:** extcap = customer-facing, Linux-capable, discoverable. Small shim to write; diverges from the current Python named-pipe implementation.
+### 5.3 Streaming vs batch
 
-### ADR-009 — Packetize at log-record level
-**Status:** Accepted (confirmed by existing tool)
-**Context:** Wireshark live comfort ~10k–100k pkt/s. 2M frames/s → one-packet-per-frame chokes it. The existing `tilogger` already emits **one pcap packet per decoded log message**.
-**Decision:** one pcap record per decoded **log message** (= one LRFDTRC packet). Frames aggregate in M2.5 to message boundaries.
-**Consequences:** packet rate tracks real log volume (sparse).
+- **Streaming (`decode`)** reads samples in 1 MiB chunks and keeps only a one-frame carry that
+  holds a frame straddling a chunk boundary, so a live `sigrok-cli | tracedecode decode --raw -`
+  runs endlessly in bounded memory (memory is O(chunk), not O(capture)). On an endless idle line
+  the carry is capped to one frame span so a static run cannot grow memory without bound.
+- **Batch (`replay`)** decodes a finite `.sal` or raw file in one pass. `.sal` input is stored
+  as a transition list, so batch mode is still memory-bounded on huge captures.
 
-### ADR-010 — Retention via dumpcap ring buffer
-**Status:** Accepted
-**Decision:** `dumpcap -b files:N` ring on I3; M6 tail for no-Wireshark case. No custom persistence code.
-**Consequences:** last-N solved by stock tooling. Two consumers (Wireshark, ring) tee off the same pcap stream.
+`Health` counters (framing, CRC, overflow, unknown dbgid, dropped sequence) are accumulated and
+printed to stderr; they never interrupt the hot loop.
 
-### ADR-011 — Link type DLT_USER0 (=147) + reuse existing dissector
-**Status:** Proposed
-**Context:** The SDK already defines the Wireshark contract: **`DLT_USER0` = 147**, one packet per log, and a **Lua dissector that splits a `||`-delimited text payload** into `alias / ts_local / opcode / module / level / file / line / string`. The real decode is host-side; the dissector is display-only.
-**Decision:** emit `DLT_USER0=147` with the same `||`-text payload, and **reuse `tilogger_dissector.lua` unchanged**. Decode authority stays in M2.
-**Consequences:** zero net-new dissector work; instant field/column/filter parity with the existing tool. Ties the emitter to the `||` text schema.
-**Alternatives:** binary payload + custom binary dissector (ADR-014).
+## 6. Python front-end (`tools/log/tiutils/streams/rftrace`, `tilogger rftrace`)
 
-### ADR-012 — Decoder language: Rust
-**Status:** Proposed
-**Context:** hot loop, memory safety, existing Rust-on-TI momentum (rcl, embedded-hal). C is the alt.
-**Decision:** Rust for M2.
-**Consequences:** (+) safe hot path, team alignment. (−) if a C shop owns maintenance, revisit.
+A `tilogger` stream plugin. It is a drop-in alternative to the `itm`/`uart` transports: pick a
+source and one or more tilogger outputs, and RF-tracer logs flow through the identical
+presentation path.
 
-### ADR-013 — Metadata via `elf2dbgid` dbgid files, single source of truth
-**Status:** Accepted
-**Context:** Open Q "encoding spec source." The on-wire HDR carries a dbgid; `elf2dbgid.py` extracts `DBG_DEF(name, dbgid, DBGCH<n>, argCount, "fmt", "file", line)` lines from the ELF `.log_data`/`.log_ptr` (`0x1E`-split) — the same metadata model, pre-resolved to a flat text DB the decoder can load directly.
-**Decision:** the decoder consumes **dbgid files** emitted by the existing **`elf2dbgid.py`** (which owns all ELF parsing). The decoder never touches the ELF. dbgid file is the single source of truth for `(channel, dbgid) → format/argcount/file/line`.
-**Consequences:** decode stays correct across firmware rebuilds; no ELF/DWARF parsing in the hot binary; no spec drift. Adds a build step (`elf2dbgid extract app.out -o app_dbgid.h`) before decode.
+### 6.1 Transport (`rftrace_transport.py`)
 
-### ADR-014 — Ship pre-decoded text payload (reuse trivial dissector)
-**Status:** Proposed
-**Context:** Two ways to feed Wireshark: (a) decode fully in M2 and emit the `||` text the existing Lua dissector expects, or (b) emit a compact binary record and write a rich binary dissector.
-**Decision:** (a) for v1 — full host-side decode + `||` text — matching `tilogger`.
-**Consequences:** (+) reuse existing dissector, immediate parity. (−) larger packets than binary; decode cost on the hot host path. Revisit (b) if payload size or decode latency bites.
+- Subclasses tilogger's `TransportABC` so the logger CLI picks it up as an input stream. Falls
+  back to a plain object when tilogger is not importable, so the stdlib-only pcap adapter and its
+  self-check run standalone.
+- Spawns `tracedecode` with `pcap --out -`, reads the pcap `DLT_USER0` stream back, splits the
+  `||` payload, and re-emits tilogger `LogPacket`s using the replay-file opcode so tilogger does
+  not try to re-format text the decoder already formatted. This is exactly the `from-replayfile`
+  pattern: the decoder owns decode, tilogger owns presentation.
+- Sources (exactly one, enforced at the CLI): `--sal` (batch replay), `--raw` (file or stdin
+  decode), `--sigrok` (live two-process pipe), `--logic2` (drive the Logic 2 Automation API).
+- The `--logic2` path is batched, not streaming: the Logic Pro plus Automation API cannot stream
+  mid-capture, so each window is captured to a temporary `.sal` and replayed through the same
+  path. `--duration` or `--trigger` bounds a window; `--loop`/`--count` produce rolling windows.
+  It polls for the Saleae device for up to 15 s after connecting, because the automation port
+  starts listening a moment before the USB device enumerates; without the poll a fresh headless
+  launch would see an empty device list and tear the capture down at startup.
 
-### ADR-015 — Records keyed by (channel, dbgid), 8-bit ID
-**Status:** Accepted
-**Context:** Unlike the UART sink (32-bit metadata pointer on the wire), the tracer HDR word carries only an **8-bit dbgid** (3..255; 0–2 reserved for debug/timestamp/sim-end) scoped to a **channel** (1..3). `elf2dbgid` derives `dbgid = (ptr&0xFFFF)>>2` (+1 for ch1) and `channel = (ptr>>24)&0xF` (4→1).
-**Decision:** M2.5b keys the DB on `(channel, dbgid)`. Load per-channel from `*_mst.h`/`*_slv.h`/`*.h` naming (master/slave/both), matching the reference parser.
-**Consequences:** compact wire records. Caveat: 256 dbgids/channel is a hard ceiling — large images may exhaust it (Open Q8).
+### 6.2 ELF bridge (`elf_dbgid.py`)
 
-### ADR-016 — Timestamp = embedded HW tracer timestamp
-**Status:** Accepted
-**Context:** The tracer emits a hardware timestamp (0.5 µs resolution, **32 ms rollover**) in-stream. Deriving time from `sample_index / samplerate` would ignore it and drift vs the device's own clock.
-**Decision:** M2.6 uses the embedded HW timestamp as record time, unwrapping the 32 ms rollover and (optionally) correlating to host wall-clock on first packet, as `tilogger` does (`timestamp` vs `timestamp_local`). Sample index is a fallback only.
-**Consequences:** device-accurate timestamps; matches existing tool semantics. Requires rollover-unwrap state in the decoder.
+`--elf <app.out>` resolves every CPU-side log straight from the application binary, with no manual
+`elf2dbgid` step. It reuses tilogger's own `TraceDB` (pyelftools) to read the log sections and
+emits the same `DBG_DEF` text the decoder loads as a `--dbgid` file. The wire dbgid is recovered
+from the 32-bit log pointer: channel is `(pointer >> 24) & 0xF` (channel-1 pointers were relocated
+so that field reads as 4, mapped back to 1, and their dbgid is `((pointer & 0xFFFF) >> 2) + 1`;
+channels 2/3 are unmoved with dbgid `(pointer & 0xFFFF) >> 2`). Extra `--dbgid` files layer modem
+and LRF tables (pbe/rfe/mce) on top, since those are not in the application ELF.
 
-### ADR-017 — Standalone native decoder vs `tilogger.transport` plugin
-**Status:** Proposed
-**Context:** The LA+deframer could instead register as a new `tilogger.transport` ("rf-trace") producing `LogPacket`s, inheriting `tracedb` + every existing output for free. But the existing outputs are Python and the Wireshark output is Windows-only — neither is credible at 24 Mbaud continuous.
-**Decision:** standalone native decoder for the hot path (throughput + Linux). It is purely a **new backend**: its output is **byte-identical to what the ITM/UART `tilogger` path emits** (`DLT_USER0=147`, the `||` payload, `tilogger_dissector.lua`, and the `tilogger` stdout line), so RF-tracer logs are indistinguishable from ITM in Wireshark. Only sample-ingest→deframe→packet→dbgid is new.
-**Consequences:** best throughput and portability; users see one uniform log view across sinks. Small duplication of the emit logic (kept spec-aligned).
+## 7. Glue and viewer
 
-## 9. Open questions / validate
+- **Wireshark dissector** - the existing `tilogger_dissector.lua` is reused unchanged. It splits a
+  `||`-delimited text payload into eight fields (alias, device time, opcode, module, level, file,
+  line, string). Because the decoder already produces that exact text, the trivial dissector works
+  as-is and RF-tracer logs are indistinguishable from ITM in the UI.
+- **extcap wrapper** (`extcap/rftrace-decode`) presents `tracedecode wireshark` as a discoverable,
+  cross-platform capture interface. Its config exposes the `.sal` file, dbgid file(s), channel, and
+  the `--divide-time-by-2` flag.
+- **Shell launchers** - `scripts/sigrok-to-wireshark.sh` (standalone `sigrok-cli | tracedecode |
+  wireshark` pipe, no Python) and `scripts/tilogger-rftrace.sh` (builds the binary, sets
+  `$TRACEDECODE`, runs the integrated `tilogger rftrace` path).
+- **Measurement tools** - `scripts/bench_decode.sh` (the dense/sparse throughput benchmark,
+  section 10) and `scripts/pydecode.py` (the byte-identical Python port behind the section 12
+  language decision).
+- The same work made tilogger's Wireshark output run on Linux, not just Windows: the win32
+  named-pipe path is guarded and a fifo path added, so `wireshark --start` auto-launches on both.
 
-1. **Pin polarity — ANSWERED.** The `tx_burst_example.sal` Async-Serial analyzer that produced the golden decode uses **inverted, 10-bit, MSB-first, 24 Mbaud, 1 start/stop, no parity** on channel 4. Default `--invert` on. (Reconciles with RTL idle-high via the inverted probe.)
-2. **Frame prescaler / clk_rfctrc.** RTL default prescaler → 500 ns/frame (2 MHz words) at 24 MHz; some variants run clk_rfctrc at 48 MHz (`--divide-time-by-2`). Confirm which, so timestamps and M1 oversampling are sized right.
-3. **Sustained 500 MS/s stream** through the sigrok Pro driver, no dropped samples — spike before committing hardware (ADR-004).
-4. **Message framing — ANSWERED.** One LRFDTRC packet (`CHxCMD` trigger) = one log message. Packetize per packet (ADR-009).
-5. **Encoding spec source — ANSWERED.** `elf2dbgid.py` → `DBG_DEF` dbgid files (ADR-013). Decoder loads them; never parses the ELF.
-6. **Channel demux.** CH1 (CPU/app logs) and CH2/CH3 (radio: PBE/MCE/etc.) share one pin, tagged by chx_id. Route to a `channel` field/column; support `*_mst.h`/`*_slv.h` split. All channels decoded in v1.
-7. **HW timestamp rollover.** 32 ms range — confirm unwrap strategy and host-clock correlation (ADR-016).
-8. **Log-ID exhaustion.** 256 IDs/channel — does a realistic image exceed it, and how does the sink behave if so?
-9. **Average vs saturated rate.** Capture 60 s worst-case trace, measure bytes/s — sizes the pipe + confirms Wireshark live headroom.
+## 8. Inputs and outputs
 
-## 10. Risks
+### 8.1 Raw samples
+
+1 byte per sample, the trace line at bit index `--channel`; from `sigrok-cli -O binary` on stdin
+(live) or a file (replay).
+
+### 8.2 Saleae `.sal` reader
+
+A `.sal` is a ZIP holding `meta.json` plus one `digital-<N>.bin` per captured channel. The trace
+pin is typically digital channel 4 (channel 5 is the cluster/slave stream). Each `digital-<N>.bin`
+is Saleae's transition-list format, not raw samples, so the trace channel is a few tens of MB even
+for a multi-second capture and never has to be expanded to 500 MS/s.
+
+The `digital-<N>.bin` layout was reverse-engineered and verified against a real capture (all six
+channels parse to exactly their byte length, with sample coverage matching `meta.json`):
+
+```
+header (0x33 bytes):
+  "<SALEAE>" magic (8 bytes)
+  u32 version = 1
+  u32 = 100, u32 = 1, u8 = 0
+  u64 capture start (unix ms), f64 fractional ms, u16 = 0
+  u64 block count
+then, per block:
+  u64 begin_sample, u64 end_sample, u64 num_samples (== end - begin)
+  u64 sample_rate, u64 = 1, u64 payload_len
+  payload_len bytes of run lengths, each a big-endian varint:
+    first byte:  bit6 = continue, bits[5:0] = high bits of the value
+    later bytes: bit7 = continue, bits[6:0] appended below
+    run = value + 1 samples; runs alternate level and sum to num_samples
+  jump table: u32 n, u32 pad, then n entries of 20 bytes
+    (u64 sample_offset, u64 run_index, u32 level); entry 0 carries the block start level
+```
+
+`meta.json` also carries the sample rate and the analyzer settings (bit rate, bits/frame, MSB,
+inverted, stop, parity); the reader takes the sample rate from it and otherwise uses CLI defaults.
+
+### 8.3 Synthetic generator
+
+The reverse of the decode path: a list of `(channel, dbgid, args, timestamp)` becomes packets
+(SOP, timestamp, header, data, EOP with a real CRC), then 12-bit frames, then oversampled sample
+levels. It round-trips through the decoder to test the state machine, CRC, framing, and printf
+without any hardware, and it is what the large-scale performance captures (section 11) are built
+from. The `synth` subcommand emits one packet per dbgid def (up to 16, stable order), with
+per-channel seqnums and a monotonically advancing shared timestamp, so a decode of its output
+must report zero seq gaps and monotonic time; `--idle-frames K` prepends K NOP frames per
+pattern and `--repeat N` tiles the pattern N times, streamed to disk, which is how the multi-GB
+dense (K small) and sparse (K large) benchmark captures are built.
+
+### 8.4 Output sinks
+
+- **stdout** - one human line per record, matching tilogger's default `alias | time | module |
+  level | file:line | text`.
+- **pcap / Wireshark** - classic pcap, magic `0xA1B2C3D4`, snaplen 256, linktype `DLT_USER0 = 147`,
+  one packet per record, flushed per record so live viewers see each log immediately. Payload is
+  UTF-8, `||`-delimited, byte-identical to tilogger: `alias || device_time(.9f) || opcode ||
+  module || level || file || line || text`. For trace records: opcode is `LOG_OPCODE_FORMATED_TEXT`,
+  module is `DBGCH<channel>`, level defaults to `INFO` (dbgids carry no level).
+- **extcap** - the same pcap written to Wireshark's fifo.
+- **retain** - the pcap piped into `dumpcap -b files:N -b filesize:X` for a last-N ring on disk.
+- **tail** - an in-memory ring of the last N records, printed on finish; no Wireshark.
+
+## 9. CLI surface
+
+### 9.1 `tracedecode`
+
+```
+tracedecode <subcommand> [options] [outputs]
+
+subcommands (one input):
+  replay <file.sal>        decode a Saleae capture (batch)
+  decode --raw <file|->     decode raw samples, streaming, endless
+  synth  --dbgid <f> --out  fabricate a raw capture from a dbgid database (self-test);
+                            --repeat <N> tiles the pattern, --idle-frames <K> pads NOP frames
+  tail   <file.sal>         decode and keep the last N records
+  retain <file.sal>         decode into a dumpcap ring
+  wireshark ...             extcap protocol (queries or --capture --fifo)
+
+physical / deframe options:
+  --channel <n>            LA channel/bit index of the trace pin (default 4)
+  --samplerate <Hz>        sample rate (default 500e6; taken from .sal meta on replay)
+  --baud <Hz>              tracer bit rate (default 24e6)
+  --invert / --no-invert   line inversion hint (polarity is auto-detected regardless)
+  --divide-time-by-2       48 MHz tracer parts (0.25 us ticks), read time as wall-clock
+
+metadata / labelling:
+  --dbgid <path>           a DBG_DEF file; repeatable
+  --alias <name>           device alias in the log (default rftrc)
+
+outputs (one or more): stdout | pcap --out <file|-> | wireshark
+retain: --files <N> --filesize <KB>
+tail:   --last <N>
+extcap: --extcap-interfaces | --extcap-dlts | --extcap-config | --capture --fifo <path>
+```
+
+### 9.2 `tilogger rftrace`
+
+Sources (exactly one): `--sal`, `--raw`, `--sigrok "<args>"`, `--logic2`.
+Metadata (at least one): `--elf <app.out>`, `--dbgid <file>` (repeatable).
+Shared: `--channel`, `--samplerate`, `--baud`, `--divide-time-by-2`, `--alias`, `--tracedecode`.
+`--logic2` knobs: `--duration`, `--trigger {rising|falling|pulse-high|pulse-low}`,
+`--trigger-channel`, `--after`, `--buffer-mb`, `--loop`, `--count`, `--threshold`,
+`--logic2-port`, `--logic2-address`, `--logic2-device`.
+Outputs are tilogger's own (`stdout`, `wireshark`, `to-replayfile`, ...), chained tilogger-style.
+
+## 10. Testing
+
+Most of the weight sits at module level on synthetic data, then integration, then the CLI
+surface, then gated externals. Run everything with `cargo test` (Rust) and
+`python -m pytest tests/` from `tools/log/tiutils/streams/rftrace` (Python, tiutils venv).
+
+**Rust unit tests (in each `src/` module, ~50 tests):** word/SOP/EOP layout helpers; CRC-5
+(wire form vs bitwise reference, USB anchor, the two conventions must disagree); deframe
+(frame codec round-trip both bit orders, idle-only, empty/static input, polarity auto-detect
+on both line conventions, corrupt stop bit counts a framing error, truncated final frame left
+for the streaming carry); packet state machines (classify mask table, stray DATA/EOP ignored,
+corrupt byte fails CRC, per-channel seq-gap counting, seq wrap without loss, interleaved
+channels, SOP mid-packet restart, overflow words); timestamp (seed, rollover, jitter slack,
+hold); dbgid parser (embedded commas, reserved-id rejection, C escapes, later files override,
+missing file errors); printf (specifiers, flags/width/precision, degenerate inputs, UTF-8
+format strings pass through intact); record resolve (known/unknown dbgid, 16/32-bit arg
+reconstruction, timestamp hold); `.sal` reader (varint runs, block-boundary edge, bad
+magic/version/truncation, per-sample expansion); output (payload and stdout line pinned
+byte-for-byte, pcap header shape).
+
+**Rust integration (`tests/integration.rs`):** synth round-trips through the real deframer;
+golden `.sal` end-to-end (gated on the oracle files; skips cleanly): the exact app+pbe record
+sequence, monotonic timestamps, zero CRC errors; subprocess pcap contract (DLT_USER0=147 +
+the eight dissector columns); streaming across 1 MiB chunk boundaries with zero loss.
+
+**Rust CLI (`tests/cli.rs`, via the built binary):** every subcommand and flag - synth
+(`--repeat`, `--idle-frames`, `--channel`); decode (`--raw` file and stdin, `--alias`,
+`--channel`, `--divide-time-by-2` halves timestamps, `--samplerate`/`--baud` must match the
+capture, `--invert`/`--no-invert`, `stdout` and `pcap --out` file/`-`); replay (synthetic
+`.sal` built by a test-local ZIP writer, sample rate honored from meta.json); `tail --last`;
+`retain --files --filesize` through real dumpcap (skips if absent); the four extcap queries
+and `--capture --fifo`; every error path exits nonzero. Plus the Python-port equivalence pin:
+`pydecode.py` (pure and `--numpy`) must be byte-identical to the Rust decoder on a
+multi-channel synth capture; the same check against the golden `.sal` runs under
+`RFTRACE_PY_GOLDEN=1` (about 35 s, so not in the default run).
+
+**Python (`streams/rftrace/tests/`, pytest):** the pcap adapter (record parse, `||`-in-text,
+header-time fallback, truncation); tracedecode resolution order (flag, env, PATH); command
+construction for `--sal`/`--raw`/`--sigrok`; every `tilogger rftrace` CLI option mapped
+through a recorded transport, the exactly-one-source guard, the `--logic2` duration/trigger
+guards; Logic 2 capture config (timed, trigger, defaults) against the real automation
+package; device polling (enumeration race, Logic Pro preference, simulation skip, deadline);
+the full `--logic2` capture loop with a faked Manager (`--count`, single window, device
+config, address/port); the ELF bridge (pointer-to-dbgid encoding, arg-count field, DBG_DEF
+line emission, and extraction from the real reference ELF when present).
+
+**HIL (gated, never in CI):** `RFTRACE_HIL=1 pytest tests/ -k hil` captures one live window
+from a Saleae via Logic 2 and decodes it end to end (needs hardware, Logic 2 with automation,
+`TRACEDECODE`, and `RFTRACE_DBGID`).
+
+**Benchmark harness (`scripts/bench_decode.sh`):** generates a dense or sparse capture with
+the synth encoder, streams it through a decode, asserts the exact record count plus all-zero
+health counters, and reports MS/s and peak RSS. `DECODE` selects the decoder under test
+(`SYNTH` defaults to `DECODE`), so the same harness measured the Python port:
+
+```
+DECODE=tracedecode SIZE_GB=5 scripts/bench_decode.sh dense
+DECODE="python3 scripts/pydecode.py --numpy" SYNTH=tracedecode SIZE_GB=5 scripts/bench_decode.sh sparse
+```
+
+Defaults are small (0.2 GB) so it doubles as a CI-friendly stress test; point `TMPDIR` at a
+real disk for 5 GB runs.
+
+## 11. Performance (measured)
+
+Single core, 5 GB synthetic captures from the benchmark harness (section 10), streaming
+decode, correctness asserted on every run (exact record count, all health counters zero):
+
+| Input | Throughput | vs 500 MS/s line | Peak RSS |
+|---|---|---|---|
+| sparse (99% NOP idle + bursts, realistic) | ~1000 MS/s | 2.0x | ~4.4 MB |
+| dense (back-to-back packets, 3 channels) | ~610 MS/s | 1.2x | ~4.5 MB |
+
+Real traffic is mostly idle NOPs, so it sits near the top row. Memory is O(chunk): a 5 GB
+input decodes in under 5 MB RSS. `.sal` replay stays batch but edge-compressed - the
+11.5 billion-sample golden capture decodes in about 1.2 s because it is never expanded per
+sample.
+
+## 12. Decision record: decoder language (Rust stays; measured 2026-07-04)
+
+The decode core is Rust with a Python front-end for orchestration (tilogger integration, ELF
+bridge, Logic 2 capture). Whether the whole inner decode could move to Python - collapsing the
+project to one language - was settled by measurement, not preference.
+
+**Method.** A full Python port of the hot path (`scripts/pydecode.py`: sample ingest, deframe,
+packet reassembly, CRC-5, timestamp, resolve, printf) was written in two variants: pure stdlib,
+and NumPy-vectorized deframe (vectorized edge extraction and batched bit-center sampling, with
+an exact-scalar fallback on framing errors so output stays identical). Correctness first: both
+variants are byte-identical to the Rust decoder on multi-channel synthetic captures (pinned in
+`tests/cli.rs` on every test run) and on the golden 11.5 G-sample `tx_burst_example.sal`
+(pure and NumPy both produce the exact 23-record output and the same health counters). Then
+both were benchmarked with the section 10 harness on the 5 GB dense and sparse captures, every
+run asserting exact record count and zero health counters. Single core, same machine:
+
+| Decoder | Dense 5 GB | Sparse 5 GB | Peak RSS | Golden .sal replay |
+|---|---|---|---|---|
+| Rust (`tracedecode`) | 608 MS/s (1.2x bar) | 1002 MS/s (2.0x) | ~4.5 MB | 1.2 s |
+| Python + NumPy deframe | 194 MS/s (0.39x) | 369 MS/s (0.74x) | ~48 MB | 33 s |
+| Pure Python | 55 MS/s (0.11x) | 86 MS/s (0.17x) | ~20 MB | 89 s |
+
+**Verdict: keep Rust for the inner loop.** The bar is a live 500 MS/s stream that must decode
+faster than it arrives. Pure Python misses it by roughly 6-9x; even the NumPy-vectorized
+deframe misses it by 1.4x on the *best* case (sparse) and 2.6x on dense, i.e. a live capture
+would fall behind on exactly the traffic a benchmark cannot promise away. The remaining Python
+costs sit in the per-frame greedy accept loop and per-packet state machine, which do not
+vectorize without giving up the exact framing semantics. The split stays: Rust owns
+samples-to-records, Python owns orchestration.
+
+`scripts/pydecode.py` is kept so this decision remains reproducible (and as an executable
+cross-check of the wire format); it is pinned byte-identical to the Rust decoder in CI. If the
+bar ever drops (slower line, batch-only decode) or PyPy/NumPy change the arithmetic, rerun:
+
+```
+DECODE="python3 scripts/pydecode.py [--numpy]" SYNTH=tracedecode SIZE_GB=5 scripts/bench_decode.sh {dense|sparse}
+```
+
+## 13. Decision log
+
+Short records of why the architecture is shaped the way it is.
+
+- **D1 - Off-the-shelf hardware, no FPGA.** Replace the internal capture appliance with a
+  Saleae-class logic analyzer and a software deframer. Customer-scalable, no custom silicon.
+- **D2 - Native decoder, not a logic-analyzer decode plugin.** A saturated line is 2 M frames/s;
+  general-purpose decode plugins are single-thread Python built for kHz-to-low-MHz work. The
+  decode itself is a light linear scan, so a custom native decoder easily sustains it.
+- **D3 - Sampler is a subprocess.** Take samples via `sigrok-cli`'s stdout (or Logic 2 Automation
+  for batched windows), keeping an arm's-length boundary from GPL-licensed capture libraries and
+  a clean input abstraction. Cost is the byte-per-sample pipe overhead, acceptable at these rates.
+- **D4 - Drop NOP idle at the decoder, before pcap.** The idle line spews NOP words at the frame
+  rate; dropping them (and consuming timestamp-MSB and overflow words as state) collapses capture
+  size to real log volume. Only complete, CRC-valid packets become pcap records.
+- **D5 - Clock recovery from start edges; auto-detect polarity.** The periodic active-high start
+  pulses (one per frame, continuous during idle) give a phase reference; the minority-level rule
+  removes the need to hard-code inversion. Robust over long captures and across probe conventions.
+- **D6 - Packetize at the log-record level.** One pcap packet per decoded log, not per frame, so
+  the packet rate tracks real log volume and Wireshark stays responsive.
+- **D7 - Retention via `dumpcap` ring.** No custom persistence; stock tooling gives last-N on disk.
+- **D8 - `DLT_USER0=147` and reuse the existing Lua dissector.** The SDK already defines this
+  Wireshark contract (link type, one packet per log, a `||`-text payload). Emitting the same text
+  gives instant field/column/filter parity and zero new dissector work, at the cost of tying the
+  emitter to the `||` text schema.
+- **D9 - Metadata via dbgid files, single source of truth.** The decoder consumes `DBG_DEF` files
+  (from `elf2dbgid`, or from the Python ELF bridge) and never parses an ELF. Decode stays correct
+  across firmware rebuilds with no ELF/DWARF parsing in the hot binary.
+- **D10 - Ship pre-decoded text, not binary.** Full host-side decode plus `||` text reuses the
+  trivial dissector and matches tilogger exactly. Larger packets than a binary record, but the
+  decode cost is off the device and the payoff is one uniform log view across all sinks.
+- **D11 - HW timestamp as record time.** Use the tracer's embedded timestamp (rollover-unwrapped),
+  not `sample_index / samplerate`, so times track the device clock. Sample index is a fallback only.
+- **D12 - Standalone backend, adapted into tilogger.** The decoder is a standalone native backend
+  whose output is byte-identical to the ITM/UART path; the `tilogger rftrace` transport is a thin
+  adapter on top, not a rewrite. Best throughput and portability, one uniform log view.
+- **D13 - Extcap for the production Wireshark path.** A discoverable, cross-platform capture
+  interface, replacing the Windows-only named pipe of the original tilogger Wireshark output; a
+  fifo path remains for quick prototyping.
+- **D14 - Decoder stays Rust; measured, not argued.** A byte-identical Python port (pure and
+  NumPy) misses the 500 MS/s live bar on 5 GB dense and sparse benchmarks (best case 369 MS/s
+  vs Rust's 1002 MS/s). Numbers and method in section 12; the port is kept as a reproducible
+  cross-check.
+
+## 14. Risks
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| Wrong inversion/bit-order on a new capture | garbage deframe | defaults confirmed (invert+MSB); `--no-invert`/`--bit-order` if a future probe differs; NOP=0x000 + CRC-5 pass is the self-check |
-| CRC-5 impl mismatch vs RTL | false frame-error drops | golden-vector test the CRC-5-USB (init 0x1F) against `tx_burst_example` (§17) |
-| Existing WS output Windows-only + Python | no Linux, no 24 Mbaud | native decoder + extcap (ADR-008, ADR-017) |
-| sigrok Pro driver drops samples @500 MS/s | no realtime capture | validate early; DSLogic fallback |
-| I1 pipe bound at 500 MB/s | sample loss/stall | libsigrok packed client (ADR-003) |
-| Wireshark chokes on burst | dropped display | log-level packetize (ADR-009); ring buffer absorbs |
-| HW timestamp 32 ms rollover mishandled | wrong ordering / times | unwrap + host correlation (ADR-016) |
-| Log-ID space (256/channel) exhausted | ambiguous/undecodable IDs | measure ID usage; document ceiling (Open Q8) |
-| Metadata decode drifts vs firmware | wrong decode | rebuild dbgid via `elf2dbgid` per firmware build (ADR-013) |
-| Clock drift over long runs | phase walk, framing errors | sync-edge recovery (ADR-007) |
-
----
-
-# Part B — Implementation Specification (for one-shot generation)
-
-> Authoritative, self-contained build spec. Ground truth is `rf_tracer_spec.md` (RTL-corroborated). Reference artifacts (in `~/Downloads`, `~/Pictures`) are the conformance oracle:
-> `elf2dbgid.py`, `rcl_generic_tx_burst_lp_em_cc2745r10_q1_nortos_llvm.out` (ELF), its dbgid `..._dbgid.h` + `_dbgid_pbe_generic.h`, `tx_burst_example.sal` (Saleae capture), `tx_burst_example_decoded.txt` (golden decode).
->
-> **Deliverable / scope:** the **logic-analyzer backend** (sample ingest → deframe → packet decode → dbgid resolve) **+ pipe to Wireshark and stdout**. RF-tracer logs must appear in Wireshark **identically to ITM logs** — same `||` payload, same `tilogger_dissector.lua`, same columns. Only the *backend* is new; the presentation layer is shared with the existing ITM/UART path. The golden `.txt` is a **correctness oracle** (it happens to be the old FPGA-GUI format) — used to verify decoded content, **not** a format to reproduce. Retention/tail/sampler-orchestration are secondary.
-
-## 11. Wire format (RTL ground truth)
-
-### 11.1 Physical layer
-- Single GPIO `rfctrc_out`. **Idle high.** Clock `clk_rfctrc` = 24 MHz (some variants 48 MHz → `--divide-time-by-2`).
-- **12-bit frame**, MSB drives the pin first:
-  - bit 11 (first): **start = 1** (active-high, *not* UART active-low)
-  - bits 10:1: **10-bit data word, MSB first**
-  - bit 0 (last): **0** (trailing/stop-like)
-- Default prescaler → **500 ns/frame** = 2 MHz word rate = 20 Mbit/s payload. `frame_duration = (ser_prescal+1)*12` clk cycles.
-- Deframe: recover frame period from start-pulse edges (M2.2), place bit centers (fractional accumulator, ~20.83 samp/bit @ 500 MS/s), read the 12 bits, lift `word10 = frame_bits[10:1]`.
-- **Confirmed deframe params** (from the `tx_burst_example.sal` Async-Serial analyzer that produced the golden decode): it is a **standard inverted async-serial UART** — 24 Mbaud, **10 data bits, MSB-first, 1 start, 1 stop, no parity, signal inverted**. So M2.3 is a textbook inverted-UART 10-bit word extractor (start=falling edge after inversion); the RTL "idle-high/active-high start" reconciles with this via the inverted probe. Default `--invert` on; verify NOP decodes to `0x000` and CRC-5 passes.
-
-### 11.2 10-bit word layout
-Every word: `word[9:8] = chx_id`, `word[7:0] = payload`. Classify by masks (from `PacketParser.cpp`):
-
-| Word | Detect (on 10-bit `w`) | Fields |
-|---|---|---|
-| **NOP / idle** | `chx_id==0 && payload==0` (`w==0x000`) | none — drop |
-| **Overflow NOP** | `chx_id==0 && (w & 0x00E)!=0` | `w[3:1]` = per-channel overflow (bit3=ch3, 2=ch2, 1=ch1) |
-| **TS-MSB (ch0)** | `chx_id==0 && (w & 0x020)!=0` (bit5=1) | `w[4]`=ts_en, `w[0]`=timestamp-counter MSB (seqnum[0]) |
-| **SOP** | `(w & 0x3C0)!=0 && (w & 0x320)==0x000` | `w[7:6]`=channel(1..3), `w[4]`=ts_en, `w[3:0]`=seqnum |
-| **EOP** | `(w & 0x320)==0x020` | `w[7:6]`=channel, `w[4:0]`=CRC-5 |
-| **DATA/TS** | `chx_id!=0` | `chx_id`=channel(1..3), `payload`=byte |
-
-Note the channel is in `w[7:6]` for SOP/EOP (which carry `chx_id==0` in the top bits) but in `w[9:8]` for DATA words. Route each word to the owning channel's state machine accordingly.
-
-### 11.3 Per-channel packet state machine
-Maintain 3 independent SMs (channels 1..3); words interleave on the wire. Sequence per packet:
-
-```
-SOP(ch, ts_en, seq)
-  → if ts_en: DATA→PS_TSH (ts_delta high byte), DATA→PS_TSL (low byte)
-  → DATA→PS_HDR  (payload = dbgid, 3..255)
-  → DATA× par_cnt: alternating PS_DATAH/PS_DATAL, each pair = one 16-bit param, high byte first
-  → EOP(ch, crc5)   // terminates; par_cnt = number of 16-bit words collected (≤4)
-```
-- dbgid 0–2 reserved (0=debug, 1=timestamp, 2=sim-end) — handle/skip, don't dispatch as logs.
-- Params: collect the 16-bit words `par[0..par_cnt)`. **Width comes from the dbgid** (§12): 32-bit args (negative argCount) consume two words, low half first → `arg = par[i] | (par[i+1]<<16)`; 16-bit args (positive argCount) are one word each. Validate `par_cnt` matches the dbgid's expected count.
-- seqnum wraps at 16; use to detect dropped packets per channel.
-
-### 11.4 CRC-5
-- **CRC-5-USB**, init `0x1F`. Accumulate over payload bytes **from SOP inclusive** through all TS/HDR/DATA words (`next_crc5_d8` on `word[7:0]`), then the 3 MSBs of EOP (`next_crc5_d3` on `word[7:5]`); the transmitted 5-bit CRC sits in `EOP[4:0]`. Re-running the CRC over the received CRC field yields residue `0x00` on a good packet.
-- Implement as the 256-entry LUT `crc = lut[data ^ (crc<<3)] & 0x1F` (matches `pCrc5Lut`). **Verify the impl against the golden vectors (§17), not by hand.** CRC-fail → count as health metric, drop packet, do not emit.
-
-### 11.5 Timestamp reconstruction
-- 16-bit counter at 24 MHz ÷ 12 = **2 MHz** (0.5 µs/tick). Per packet, TSH/TSL carry a 16-bit snapshot **delta**.
-- ch0 TS-MSB word carries `ts_counter[15]`; use it to keep the running MSB synced across rollover.
-- Merge delta with `lastTimestamp` upper bits; **rollover: add `0x10000` if the new value is >2000 behind** `lastTimestamp` (matches `PacketParser.cpp`). Then `micros = value / 2` (÷2 again if `--divide-time-by-2`). Format `HH:MM:SS.uuuuuu`. Also keep raw ticks for the pcap timestamp.
-
-## 12. dbgid database (`elf2dbgid` output)
-
-Build step (owned by TI's tool, not us): `elf2dbgid extract <app.out> -o <app>_dbgid.h`. Decoder loads one or more such files.
-
-**`DBG_DEF` line** — 8 fields, exact separators `(`, `, `, …, `, "`, `", "`, `", `, `)`:
-```
-DBG_DEF(DBGID_<file>_<line>, <dbgid>, DBGCH<ch>, <argCount>, "<fmt>", "<file>", <line>)
-```
-| Field | Meaning |
-|---|---|
-| 0 | literal `DBG_DEF` (else skip line) |
-| 1 | symbolic name (ignore) |
-| 2 | `dbgid` 3..255 (0–2 reserved) |
-| 3 | `DBGCH1`/`DBGCH2`/`DBGCH3` → channel 1..3 |
-| 4 | `argCount`: **>0 ⇒ that many 16-bit args; <0 ⇒ `|n|` 32-bit args; 0 ⇒ none** |
-| 5 | printf format string (C `%` specifiers) |
-| 6 | source file (basename after last `/`) |
-| 7 | source line number |
-
-- **File-name routing** (matches reference parser): `*_mst.h` → master parser only, `*_slv.h` → slave only, `*.h` → both. Master/slave = the two logical streams (bit 15 of the FPGA 16-bit word; for LA capture, a single die = one stream unless two pins are probed).
-- Key the DB on `(channel, dbgid)`. Example rows (from `_dbgid_pbe_generic.h`): `DBG_DEF(DBGID_PBE_RAM_BANK0_ASM_1367, 128, DBGCH2, 0, "…CRC error", "pbe_ram_bank0.asm", 1367)`.
-- **printf formatting:** substitute reconstructed args (widths per field 4) into the format string, C-style. Missing/extra args → emit raw + mark malformed, don't panic.
-
-## 13. Decoder architecture (Rust)
-
-Single Cargo workspace, one lib + thin bins. Hot path is allocation-light; use iterators/streaming, no full-capture buffering.
-
-```
-tracedecode/
-  Cargo.toml
-  src/
-    lib.rs
-    sample.rs     // ingest: raw u8/sample stream (stdin/file) + Saleae .sal reader (§16)
-    deframe.rs    // samples → Word stream: clock recovery (M2.2) + framing (M2.3)
-    word.rs       // Word, WordKind classify (§11.2)
-    crc5.rs       // CRC-5-USB LUT + update; golden-tested
-    packet.rs     // 3× per-channel SM (§11.3) → DecodedPacket, CRC check
-    timestamp.rs  // TsState reconstruct (§11.5)
-    dbgid.rs      // DBG_DEF parser → DbgIdDb keyed (channel,dbgid) (§12)
-    record.rs     // DecodedPacket + DbgDef → LogRecord (printf substitution)
-    output/
-      mod.rs      // Output trait
-      stdout.rs   // human text, matches reference decode (§15.1)
-      pcap.rs     // DLT_USER0=147, ||-text payload (§15.2)
-      extcap.rs   // extcap protocol + fifo (§15.3)
-      retain.rs   // dumpcap ring spawn (§15.4)
-      tail.rs     // in-mem last-N ring (§15.5)
-    synth.rs      // reverse path: DbgIdDb + records → wire → samples (self-test, §16.3)
-  bins/ (or [[bin]]): tracedecode (main CLI, §7 surface)
-```
-
-**Core types:**
-```rust
-struct Word { chx_id: u8, payload: u8, raw10: u16 }
-enum WordKind { Nop, Overflow(u8), TsMsb{ ts_en: bool, ts_msb: u8 },
-                Sop{ ch: u8, ts_en: bool, seq: u8 }, Eop{ ch: u8, crc5: u8 },
-                Data{ ch: u8, byte: u8 } }
-
-struct DecodedPacket { channel: u8, dbgid: u8, seq: u8,
-                       ts_delta: Option<u16>, params: Vec<u16>, crc_ok: bool }
-
-struct DbgDef { dbgid: u8, channel: u8, arg_count: i32,
-                fmt: String, file: String, line: u32 }
-struct DbgIdDb { by_key: HashMap<(u8,u8), DbgDef> }   // (channel, dbgid)
-
-struct LogRecord { channel: u8, dbgid: u8, seq: u8,
-                   ts_ticks: u64, ts_us: f64, args: Vec<u32>,
-                   text: String, def: DbgDef }  // text = fmt % args
-
-trait Output { fn on_record(&mut self, r: &LogRecord); fn on_health(&mut self, h: Health); }
-```
-
-**Pipeline (streaming iterators):**
-```
-samples: impl Iterator<Item=u8>
-  → deframe(cfg) : Iterator<Word>
-  → classify     : Iterator<WordKind>
-  → PacketAssembler (3 SMs + CRC + TsState) : Iterator<DecodedPacket>   // NOPs/overflow/ts-msb consumed as state
-  → resolve(&db) : Iterator<LogRecord>
-  → for each Output: on_record
-```
-Backpressure: blocking read on stdin; if any Output is a pipe, a bounded channel + drop-oldest with a health counter (never stall the deframer).
-
-## 14. CLI
-
-See §7 "Decoder CLI." Subcommands compose left-to-right (tilogger-style): one input (`decode`/`replay`/`synth`) + one or more outputs (`stdout`/`wireshark`/`retain`/`tail`). `--dbgid` repeatable. Global deframe flags apply to input.
-
-## 15. Output formats
-
-### 15.1 stdout (human)
-Match the **existing `tilogger` stdout**, not the golden `.txt`: default `{I} | {T} | {M} | {L} | {F} | {D}` (identifier, timestamp, module, level, file:line, data). `--format` overrides with the same `{I}{T}{M}{L}{F}{D}` specifiers. Presentation is identical to ITM/UART logs.
-
-### 15.2 Wireshark (pcap + reuse existing dissector) — identical to ITM
-- Same path the ITM/UART sinks already use, so RF-tracer logs are indistinguishable from ITM in the UI.
-- Classic pcap stream (or pcapng): global header magic `0xA1B2C3D4`, snaplen 256, **linktype `DLT_USER0 = 147`**. One packet per `LogRecord`. Packet ts from `ts_ticks` (µs).
-- Payload = UTF-8, **`||`-delimited**, byte-identical to what `tilogger` emits so `tilogger_dissector.lua` works **unchanged**:
-  `alias || ts_local(.9f) || opcode || module || level || file || line || text`
-  Field mapping for trace records: `alias`=source (e.g. `rftrc`/`--alias`); `opcode`=`LOG_OPCODE_FORMATED_TEXT`; `module`=`DBGCH<n>` (channel); `level`=from dbgid if present else `INFO`; `file`,`line`,`text` from dbgid + args.
-- Transport: **extcap** (cross-platform) preferred; `--pipe` named-pipe/fifo fallback mirrors current `tilogger`.
-
-### 15.3 extcap
-Implement `--extcap-interfaces`, `--extcap-dlts` (DLT 147), `--extcap-config`, `--capture --fifo <path> --extcap-interface <if>`. On `--capture`, write the pcap stream (15.2) to the fifo.
-
-### 15.4 retain / 15.5 tail
-`retain` spawns `dumpcap -b files:N -b filesize:X` on the pcap stream. `tail` keeps an in-mem ring of last-N `LogRecord`, prints on demand / continuously; no Wireshark.
-
-## 16. Input
-
-### 16.1 Raw samples
-`unitsize=1`, 1 byte/sample; the `rfctrc_out` line is `--channel` (bit index). stdin (live, from `sigrok-cli … -O binary`) or a file (`replay`).
-
-### 16.2 Saleae `.sal` reader (confirmed against `tx_burst_example.sal`)
-`.sal` = ZIP archive containing `meta.json` + one `digital-<N>.bin` per captured channel.
-- **Trace pin = digital channel 4** (`digital-4.bin`; meta row "MST:TRC"). Channel 5 = "Cluster: TRC" (the slave/cluster stream). `--channel` selects; default 4.
-- `digital-<N>.bin` is Saleae's **transition-list** format (initial level + list of edge timestamps), *not* raw samples — hence ch4 is ~98 MB (dense edges) while idle channels are ~0.5 MB. The reader converts transitions → a bit/sample timeline for the deframer (no need to expand to 500 MS/s raw; step edge-to-edge).
-- `meta.json` carries `sampleRate.digital` (500000000) and the **Async-Serial analyzer settings** (bitRate 24e6, 10 bits/frame, MSB, inverted, 1 stop, no parity) — the reader may auto-config the deframer from these, else use CLI defaults.
-- Parse the exact `digital-*.bin` header layout against this file at build time (Saleae digital `.bin`: magic/version, initial state, u64 transition count, then f64/u64 timestamps).
-
-### 16.3 Synth generator (self-test)
-Reverse pipeline: `DbgIdDb` + a scripted list of `(channel, dbgid, args, ts)` → packets → CRC-5 → 10-bit words (SOP/TS/HDR/DATA/EOP) → 12-bit frames → oversampled samples at `--samplerate`. Round-trips through the decoder to prove the SM + CRC + framing without hardware.
-
-## 17. Verification (golden vectors)
-
-**Acceptance gate:** decode `tx_burst_example.sal` (channel 4) with the provided dbgid files; the resulting **records must match the golden `tx_burst_example_decoded.txt` in content** — same ordered sequence of `(file:line, formatted-text)` and monotonic timestamps. The golden `.txt` is parsed into expected records `[(file, line, text), …]` (4-line blocks: alias / abs-time / duration / `file:line >> text`); compare against decoder output regardless of display format. (Radio-channel lines needing an `rfe`/`mce` dbgid not provided may be skipped — assert on the app + pbe subset.)
-
-Layered tests:
-1. **CRC-5 unit** — vectors lifted from decoded packets in the reference; residue-0 check.
-2. **Word classify** — table-driven masks (§11.2) incl. NOP/overflow/TS-MSB/SOP/EOP edge cases.
-3. **Packet SM** — synth (§16.3) round-trip: records → wire → decode → identical records.
-4. **dbgid parse** — parse both provided `.h` files; assert row counts + a few known `(channel,dbgid)→fmt`.
-5. **End-to-end (gate)** — `.sal` → records, content-match vs parsed golden `.txt` (above).
-6. **Output format** — a decoded record renders to the exact `tilogger` `||` pcap payload + `tilogger` stdout line (identical-to-ITM check), *not* the golden-`.txt` layout.
-7. **Timestamp** — monotonic + correct rollover across a synth stream spanning the 32 ms (16-bit tick) boundary.
-
-## 18. Build, deps, one-shot checklist
-
-- **Deps (minimal):** `zip`/`flate2` (.sal), `clap` (CLI). Avoid heavy frames; hand-roll pcap (it's a `struct.pack`-level format). No ELF/DWARF crate (dbgid files instead).
-- **Platforms:** Linux-first; extcap keeps it cross-platform. No Windows-only APIs.
-- **One-shot success criteria:** (a) builds clean; (b) all §17 tests pass; (c) `replay tx_burst_example.sal --channel 4 --dbgid <app> --dbgid <pbe>` produces records whose `(file:line, text)` sequence content-matches the golden `.txt`; (d) `… wireshark --extcap` shows those logs in Wireshark via the existing `tilogger_dissector.lua`, indistinguishable from ITM; (e) `stdout` line matches the `tilogger` format.
-- **Deferred / stub-OK:** live sigrok orchestration (`decode` reads stdin — pipe from `sigrok-cli` manually); pcapng (classic pcap suffices for the dissector); 48 MHz-variant auto-detect (`--divide-time-by-2` flag).
+| Wrong inversion / bit order on a new capture | garbage deframe | polarity auto-detected; NOP=0x000 and CRC-5 pass are the self-check; `--no-invert`/`--baud` overrides exist |
+| Sustained 500 MS/s capture drops samples | no realtime capture | validate the sampler driver early; batched Logic 2 windows as a fallback |
+| Pipe bound at 500 MB/s (byte per sample) | sample loss / stall | switch to a packed sample feed if the pipe becomes the bottleneck |
+| Wireshark chokes on a burst | dropped display | packetize at log level; the ring buffer absorbs |
+| dbgid space (256 per channel) exhausted | ambiguous IDs | measure usage on real images; document the ceiling |
+| Metadata drifts vs firmware | wrong decode | rebuild the dbgid table per firmware build (or use `--elf`) |
+| Clock drift over long runs | framing errors | phase resync on every start edge |

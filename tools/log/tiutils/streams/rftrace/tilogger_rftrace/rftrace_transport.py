@@ -35,7 +35,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 Swaps in for the `itm`/`uart` transports: instead of a serial port it runs the
 native `tracedecode` backend (the Rust logic-analyzer decoder) and adapts its
 output into `LogPacket`s, so every existing tilogger output (`stdout`,
-`wireshark`, `to-replayfile`, …) works unchanged.
+`wireshark`, `to-replayfile`, ...) works unchanged.
 
     python -m tilogger rftrace --sal capture.sal --dbgid app_dbgid.h \
         --dbgid pbe_dbgid.h --channel 4 --divide-time-by-2 wireshark --start
@@ -64,7 +64,7 @@ import time
 logger = logging.getLogger("RFTrace Transport")
 
 # Rust `tracedecode` emits level "INFO" (dbgids carry no level); map onto tilogger's
-# LogLevel names so stdout/wireshark render identically to ITM ("Log_INFO", …).
+# LogLevel names so stdout/wireshark render identically to ITM ("Log_INFO", ...).
 _LEVEL_NAMES = {
     "DEBUG": "Log_DEBUG",
     "VERBOSE": "Log_VERBOSE",
@@ -309,7 +309,7 @@ class RFTrace_Transport(_TransportBase):
             return self._l2_device
         # Logic 2's automation port starts listening a beat before the USB device
         # is enumerated, so right after a fresh (headless) launch get_devices() is
-        # briefly empty. Poll instead of bailing — otherwise this transport thread
+        # briefly empty. Poll instead of bailing - otherwise this transport thread
         # SystemExits silently and the whole capture tears down at startup.
         deadline = time.time() + 15
         while True:
@@ -328,7 +328,7 @@ class RFTrace_Transport(_TransportBase):
 
     def _run_logic2(self, emit):
         """Loop: capture a window via the Logic 2 Automation API, save it to a temp
-        .sal, and decode it through the same replay path — repeat per --loop/--count."""
+        .sal, and decode it through the same replay path - repeat per --loop/--count."""
         import tempfile
         try:
             from saleae import automation

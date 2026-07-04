@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "Logic-analyzer backend for the CC-series RF-core (LRFDTRC) trace sink: samples -> deframe -> packet -> dbgid -> Wireshark/stdout, output identical to the ITM/UART tilogger path."
 
-# Skeleton is intentionally std-only (zero deps) so it compiles and tests offline.
-# Fable may add: clap (CLI), zip + serde_json (.sal), thiserror/anyhow (errors).
+# Deliberately std-only (zero dependencies) so it builds and tests offline; the .sal
+# reader shells out to `unzip` and meta.json is scanned without serde.
 [dependencies]
 
 [lib]

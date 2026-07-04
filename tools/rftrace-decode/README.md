@@ -1,152 +1,176 @@
 # rftrace-decode
 
-Logic-analyzer backend for the CC-series **RF-core (LRFDTRC) trace sink**
-(`source/ti/log/LogSinkTraceLPF3`). Takes LA samples of the `rfctrc_out` pin →
-deframes → decodes the tracer packet protocol → resolves dbgids → emits logs to
-**Wireshark and stdout, identically to the ITM/UART `tilogger` path**.
+Logic-analyzer backend for the CC-series RF-core (LRFDTRC) trace sink
+(`source/ti/log/LogSinkTraceLPF3`). Takes LA samples of the trace pin, deframes
+the 12-bit tracer line, decodes the packet protocol, resolves dbgids, and emits
+logs to Wireshark and stdout identically to the ITM/UART `tilogger` path.
 
-Full spec: **`../../trace-pipeline-architecture.md.mkd`, Part B (§11–§18)**.
-Wire ground truth: `rf_tracer_spec.md`. Metadata: `elf2dbgid.py` `DBG_DEF` files.
+The self-contained pipeline description (wire format, module map, decision log)
+is `trace-pipeline-architecture.md.mkd` at the repo root. Metadata comes from
+`elf2dbgid` `DBG_DEF` files; the decoder never parses an ELF.
 
 ## Pipeline
 
 ```
-samples(u8) → deframe → Word(10b) → classify → WordKind
-            → PacketAssembler (3× per-channel SM + CRC-5 + timestamp) → DecodedPacket
-            → resolve(&DbgIdDb)  → LogRecord → Output (stdout / pcap DLT_USER0=147, || payload)
+samples(u8) -> deframe -> Word(10b) -> classify -> WordKind
+            -> PacketAssembler (3x per-channel SM + CRC-5 + timestamp) -> DecodedPacket
+            -> resolve(DbgIdDb) -> LogRecord -> Output (stdout / pcap DLT_USER0=147, || payload)
 ```
 
 ## Status
 
-**Complete, std-only, `cargo test` fully green** (13 pass, 0 ignored), including the
-golden end-to-end gate: `tx_burst_example.sal` decodes to the exact app+pbe record
-sequence of `tx_burst_example_decoded.txt` (23/23, 0 framing errors, 0 CRC errors).
+Complete, std-only (zero dependencies), `cargo test` fully green: ~50 module unit
+tests, integration tests including the golden end-to-end gate (`tx_burst_example.sal`
+decodes to the exact app+pbe record sequence of the oracle, zero framing and CRC
+errors), and a CLI suite covering every subcommand and flag of the built binary.
 
 ## Performance (live capture)
 
-`decode` **streams** — reads samples in 1 MiB chunks with a one-frame carry, emits records
-live, and runs **endlessly** with bounded memory. It never buffers the whole capture, so a
-live `sigrok-cli … | tracedecode decode --raw -` keeps up with a 500 MS/s pipe forever.
+`decode` streams: it reads samples in 1 MiB chunks with a one-frame carry, emits
+records live, and runs endlessly in bounded memory, so a live
+`sigrok-cli ... | tracedecode decode --raw -` keeps up with a 500 MS/s pipe.
 
-Measured single-core (300 MB raw, `/usr/bin/time -v`):
+Measured single-core on 5 GB synthetic captures (`scripts/bench_decode.sh`, exact
+record count and zero health counters asserted on every run):
 
-| Input                         | Throughput  | vs 500 MS/s line | Peak RSS |
-|-------------------------------|-------------|------------------|----------|
-| idle / static line (scan)     | ~1070 MS/s  | 2.1×             | 5.2 MB   |
-| dense packets (worst case)    | ~790 MS/s   | 1.6×             | 5.4 MB   |
+| Input                                | Throughput | vs 500 MS/s line | Peak RSS |
+|--------------------------------------|------------|------------------|----------|
+| sparse (99% NOP idle, realistic)     | ~1000 MS/s | 2.0x             | 4.4 MB   |
+| dense (back-to-back, 3 channels)     | ~610 MS/s  | 1.2x             | 4.5 MB   |
 
-Real traffic is mostly idle NOPs, so it sits near the top row. Memory is O(chunk), not
-O(capture): a 300 MB input decodes in ~5 MB RSS. `stream_decode_crosses_chunk_boundaries`
-tests that frames straddling a chunk boundary are neither dropped nor duplicated.
-`.sal` replay stays batch (finite, edge-compressed — 11.5 G samples in ~1.2 s).
+Memory is O(chunk), not O(capture). `.sal` replay stays batch but edge-compressed:
+the 11.5 G-sample golden capture decodes in about 1.2 s.
+
+The decoder core stays in Rust by measurement, not preference: a byte-identical
+Python port (`scripts/pydecode.py`, pure and NumPy variants) tops out at 369 MS/s
+on the easiest profile - under the 500 MS/s live bar. Numbers and method are in
+the architecture doc's decision record; the port is pinned byte-identical to this
+decoder by `tests/cli.rs` so the decision stays reproducible.
 
 Empirically resolved against the golden capture:
-- **CRC-5**: the MSB-first convention (`crc5::Crc5`, poly 0x05, init 0x1F) is correct —
-  28/28 real packets validate. The reflected USB form does not match the wire.
-- **`.sal` `digital-N.bin`**: not a flat f64 transition array. Real layout: 0x33-byte
-  header (magic, version, capture start time, block count), then per-block
-  `[begin, end, nsamples, rate, 1, payload_len]` u64s + varint-encoded run lengths
-  (first byte: 6 data bits + bit6 continue; later bytes: 7 bits + bit7 continue;
-  run = value+1 samples) + a jump table whose entry 0 carries the block start level.
-  See `sample::decode_saleae_runs`.
-- **Polarity**: on the real wire the start bit is HIGH (Saleae "inverted" UART sense).
-  `deframe` auto-detects start-bit polarity (minority level), so both the synth
-  convention and the real capture decode with the same defaults.
-- **CC2745 timestamps** are 0.25 µs ticks → pass `--divide-time-by-2` to match wall time.
+
+- CRC-5 is the MSB-first convention (poly 0x05, init 0x1F): 28/28 real packets
+  validate. The textbook reflected CRC-5/USB does not match the wire.
+- `.sal` `digital-N.bin` is a block/varint run-length format, not raw samples;
+  see `sample::decode_saleae_runs` for the reverse-engineered layout.
+- On the real wire the start bit is high (Saleae "inverted" UART sense). The
+  deframer auto-detects start-bit polarity (minority level), so real captures and
+  synthetic ones decode with the same defaults.
+- CC2745 tracer ticks are 0.25 us: pass `--divide-time-by-2` to read wall-clock.
 
 ## Run
 
 ```
-cargo test
-cargo run -- replay tx_burst_example.sal --channel 4 --divide-time-by-2 \
+cargo test                              # unit + integration + CLI suites
+cargo run -- replay capture.sal --channel 4 --divide-time-by-2 \
     --dbgid app_dbgid.h --dbgid pbe_dbgid.h stdout
-cargo run -- replay ... pcap --out trace.pcap        # DLT_USER0=147, tilogger payload
-cargo run -- tail   tx_burst_example.sal --last 20 --dbgid app_dbgid.h
-cargo run -- retain tx_burst_example.sal --dbgid app_dbgid.h --out ring   # dumpcap ring
-cargo run -- wireshark --extcap-interfaces            # extcap; --capture --fifo <path>
-cargo run -- synth  --dbgid app_dbgid.h --out synth.raw
+cargo run -- replay ... pcap --out trace.pcap   # DLT_USER0=147, tilogger payload
+cargo run -- tail   capture.sal --last 20 --dbgid app_dbgid.h
+cargo run -- retain capture.sal --dbgid app_dbgid.h --out ring  # dumpcap ring
+cargo run -- wireshark --extcap-interfaces      # extcap; --capture --fifo <path>
+cargo run -- synth  --dbgid app_dbgid.h --out synth.raw [--repeat N] [--idle-frames K]
 cargo run -- decode --raw synth.raw --channel 4 --dbgid app_dbgid.h stdout
+```
+
+Gated extras:
+
+```
+RFTRACE_PY_GOLDEN=1 cargo test pydecode_matches_rust_on_golden_sal   # ~35 s
+SIZE_GB=5 DECODE=target/release/tracedecode scripts/bench_decode.sh dense
+SIZE_GB=5 DECODE=target/release/tracedecode scripts/bench_decode.sh sparse
 ```
 
 ## Wireshark setup
 
-The decoder emits the **same pcap the ITM/UART `tilogger` path emits** — DLT_USER0 (147)
-with the `||`-delimited payload — so it reuses `tools/log/tiutils/streams/wireshark/`
-`tilogger_dissector.lua` unchanged. Two one-time steps:
+The decoder emits the same pcap the ITM/UART `tilogger` path emits - DLT_USER0
+(147) with the `||`-delimited payload - so it reuses
+`tools/log/tiutils/streams/wireshark/tilogger_dissector.lua` unchanged. Two
+one-time steps:
 
-1. **Dissector + DLT_USER mapping.** Copy `tilogger_dissector.lua` into your Wireshark
-   plugins dir (Help > About > Folders > "Personal Lua Plugins"), and map DLT 147 to it:
-   Edit > Preferences > Protocols > DLT_USER > Edit… > add `DLT=147`, payload `tilogger`.
-   (tilogger's own launcher passes this as `-o uat:user_dlts:...`; the extcap path can't, so
-   set it once in preferences.)
-2. Put the binary on `PATH`: `cargo install --path .` (→ `~/.cargo/bin/tracedecode`).
-   Or just build it — `cargo build --release` → `target/release/tracedecode` — and set
+1. Dissector + DLT_USER mapping. Copy `tilogger_dissector.lua` into your
+   Wireshark plugins dir (Help > About > Folders > "Personal Lua Plugins") and
+   map DLT 147 to it: Edit > Preferences > Protocols > DLT_USER > Edit, add
+   DLT=147, payload `tilogger`. (tilogger's own launcher passes this as
+   `-o uat:user_dlts:...`; the extcap path cannot, so set it once in preferences.)
+2. Put the binary on PATH: `cargo install --path .` (installs
+   `~/.cargo/bin/tracedecode`). Or build with `cargo build --release` and set
    `$TRACEDECODE` / pass `--tracedecode <path>`.
 
-### Launch from Wireshark (extcap — replay a `.sal`)
+### Launch from Wireshark (extcap - replay a .sal)
 
 ```
 ln -s "$PWD/extcap/rftrace-decode" ~/.config/wireshark/extcap/rftrace-decode
 ```
 
-`extcap/rftrace-decode` is a thin wrapper over `tracedecode wireshark`. Restart Wireshark;
-"RF-core trace (LRFDTRC) decoder" appears as an interface. Its gear icon exposes the `.sal`
-file, dbgid file(s), channel, and the `--divide-time-by-2` flag; start capture to stream the
-decoded logs in. (Set `TRACEDECODE=/path/to/tracedecode` if the binary isn't on `PATH`.)
+`extcap/rftrace-decode` is a thin wrapper over `tracedecode wireshark`. Restart
+Wireshark; "RF-core trace (LRFDTRC) decoder" appears as an interface. Its gear
+icon exposes the `.sal` file, dbgid file(s), channel, and `--divide-time-by-2`;
+start capture to stream the decoded logs in. (Set `TRACEDECODE=/path/to/binary`
+if it is not on PATH.)
 
-### Live from sigrok (logic analyzer → decoder → Wireshark)
+### Live from sigrok (logic analyzer -> decoder -> Wireshark)
 
 ```
 scripts/sigrok-to-wireshark.sh --dbgid app_dbgid.h --dbgid pbe_dbgid.h \
     --driver saleae-logic-pro-16 --channel 4 --samplerate 500M --divide-time-by-2
 ```
 
-One pipe: `sigrok-cli -O binary | tracedecode decode --raw - … pcap --out - | wireshark -k -i -`.
-Runs **endlessly** (omit `--samples`/`--time`); the decoder streams with bounded memory.
+One pipe: `sigrok-cli -O binary | tracedecode decode --raw - ... pcap --out - |
+wireshark -k -i -`. Runs endlessly (omit `--samples`/`--time`); the decoder
+streams with bounded memory.
 
 ## Launcher scripts
 
 | Script | End-to-end flow |
 |--------|-----------------|
-| `scripts/tilogger-rftrace.sh <rftrace args…> <output>` | Builds the binary if needed, sets `$TRACEDECODE`, runs `tilogger rftrace …` (the integrated path). |
-| `scripts/sigrok-to-wireshark.sh --dbgid … [opts]` | Standalone `sigrok-cli \| tracedecode \| wireshark` pipe (no Python). |
+| `scripts/tilogger-rftrace.sh <rftrace args...> <output>` | Builds the binary if needed, sets `$TRACEDECODE`, runs `tilogger rftrace ...` (the integrated path). |
+| `scripts/sigrok-to-wireshark.sh --dbgid ... [opts]` | Standalone `sigrok-cli | tracedecode | wireshark` pipe (no Python). |
+| `scripts/bench_decode.sh {dense|sparse}` | Throughput/RSS benchmark with correctness asserted (see architecture doc). |
+| `scripts/pydecode.py` | Byte-identical Python port of the decode path; keeps the language decision reproducible. |
 | `extcap/rftrace-decode` | Wireshark-launched extcap wrapper (symlink into Wireshark's extcap dir). |
 
 ## Integration with `tilogger` (primary UX)
 
-This decoder is wired into the existing `tilogger` tool as a first-class **transport**,
-so it swaps in for `itm`/`uart` with the same command shape and reuses every tilogger
-output (`stdout`, `wireshark`, `to-replayfile`) unchanged:
+This decoder is wired into the existing `tilogger` tool as a first-class
+transport, so it swaps in for `itm`/`uart` with the same command shape and reuses
+every tilogger output (`stdout`, `wireshark`, `to-replayfile`) unchanged:
 
 ```
 tilogger rftrace --sal cap.sal --elf app.out \
-    --channel 4 --divide-time-by-2 stdout                            # metadata from the ELF
+    --channel 4 --divide-time-by-2 stdout                       # metadata from the ELF
 tilogger rftrace --sal cap.sal --elf app.out --dbgid pbe_dbgid.h \
-    --divide-time-by-2 wireshark --start                            # + modem/LRF headers
+    --divide-time-by-2 wireshark --start                        # + modem/LRF headers
 tilogger rftrace --sigrok "--driver saleae-logic-pro-16 --config samplerate=500M \
-    -C D4" --elf app.out --channel 0 --divide-time-by-2 stdout       # endless live
+    -C D4" --elf app.out --channel 0 --divide-time-by-2 stdout  # endless live
+tilogger rftrace --logic2 --duration 2 --loop --elf app.out \
+    --channel 7 --divide-time-by-2 wireshark --start            # Logic 2 automation
 ```
 
-The transport (`tools/log/tiutils/streams/rftrace/`) runs this `tracedecode` binary with
-`pcap --out -` and adapts its `||` records into tilogger `LogPacket`s (the `from-replayfile`
-pattern), so formatting/presentation stay shared with ITM/UART. **`--elf <app.out>` resolves
-all CPU-side logs straight from the binary** — the transport reads the ELF's dbgid table via
-tilogger's own ELF parser (`elf_dbgid.py`, verified byte-identical to `elf2dbgid`), so no
-manual elf2dbgid step is needed; extra `--dbgid` headers add modem/LRF (pbe/rfe/mce). The Rust
-decoder itself still only reads DBG_DEF `--dbgid` files (ADR-013 — never parses ELF); the
-transport bridges the ELF to it. Install the binary with `cargo install --path .` so it's on
-`PATH`; otherwise point at it via `--tracedecode` or `$TRACEDECODE`. See
-`tools/log/tiutils/README.md` → "RF-core Trace (rftrace) Transport".
+The transport (`tools/log/tiutils/streams/rftrace/`) runs this `tracedecode`
+binary with `pcap --out -` and adapts its `||` records into tilogger `LogPacket`s
+(the from-replayfile pattern), so formatting and presentation stay shared with
+ITM/UART. `--elf <app.out>` resolves all CPU-side logs straight from the binary -
+the transport reads the ELF's dbgid table via tilogger's own ELF parser
+(`elf_dbgid.py`, verified against `elf2dbgid` output); extra `--dbgid` headers add
+modem/LRF tables (pbe/rfe/mce). The decoder itself still only reads `DBG_DEF`
+files and never parses an ELF; the transport bridges the ELF to it.
 
-The same change made tilogger's **Wireshark output work on Linux** (`streams/wireshark`): the
-win32 named-pipe path was guarded and a FIFO path added, so `wireshark --start` auto-launches
-and configures Wireshark on Linux and Windows alike.
+Its test suite (`streams/rftrace/tests/`, pytest) covers every CLI option, the
+pcap adapter, and the whole `--logic2` capture loop against a faked Logic 2
+automation client - no hardware in CI. One hardware-in-the-loop check exists and
+is gated: `RFTRACE_HIL=1 pytest tests/ -k hil` (needs a Saleae attached, Logic 2
+running with automation enabled, `TRACEDECODE`, and `RFTRACE_DBGID`).
+
+The same change made tilogger's Wireshark output work on Linux
+(`streams/wireshark`): the win32 named-pipe path was guarded and a FIFO path
+added, so `wireshark --start` auto-launches and configures Wireshark on Linux and
+Windows alike.
 
 ## Standalone use (no tilogger)
 
-The `replay`/`decode`/`tail`/`retain`/`wireshark` subcommands, the `extcap/` wrapper, and
-`scripts/sigrok-to-wireshark.sh` above run the decoder directly without the Python tool —
-same pcap DLT_USER0 stream, same `tilogger_dissector.lua`. Per architecture ADR-017 the
-decode core is a standalone native backend; the tilogger transport is a thin adapter on top,
-not a rewrite. The `cli_emits_tilogger_pcap_over_stdout` test asserts the binary's pcap
-contract (DLT 147 + the 8 dissector columns).
+The `replay`/`decode`/`tail`/`retain`/`wireshark` subcommands, the `extcap/`
+wrapper, and `scripts/sigrok-to-wireshark.sh` run the decoder directly without
+the Python tool - same pcap DLT_USER0 stream, same `tilogger_dissector.lua`. The
+decode core is a standalone native backend; the tilogger transport is a thin
+adapter on top, not a rewrite. `cli_emits_tilogger_pcap_over_stdout` asserts the
+binary's pcap contract (DLT 147 + the 8 dissector columns).
