@@ -96,6 +96,10 @@ impl<W: Write> Output for PcapSink<W> {
     fn on_record(&mut self, r: &LogRecord) {
         let _ = self.write_record(r);
         // Flush each record so live consumers (Wireshark fifo, tilogger transport) see it now.
+        // This costs ~4x on a bulk `pcap --out <file>` export (a 5 GB capture writes at roughly
+        // 150 MS/s vs ~600 MS/s to stdout) because every record forces a syscall. That trade is
+        // right for the live path, which is the design target. If bulk file export ever matters,
+        // skip the flush when the sink is a regular file (only flush pipes/fifos).
         let _ = self.w.flush();
     }
     fn finish(&mut self) {
