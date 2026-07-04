@@ -219,9 +219,11 @@ Arguments:
   BAUDRATE  TPIU baudrate  [required]
 
 Options:
-  --elf PATH    Symbol file path (elf/out file)  [default: ]
-  --alias TEXT  Alias for this device in the log
-  --help        Show this message and exit.
+  --elf PATH       Symbol file path (elf/out file)  [default: ]
+  --alias TEXT     Alias for this device in the log
+  --pcsample PATH  Write a speedscope profile of DWT PC samples to this file
+                   on exit and open the interactive viewer in the browser
+  --help           Show this message and exit.
 ```
 
 #### Examples
@@ -242,6 +244,24 @@ Options:
   > Data Port".
 * `tilogger` will not begin recording until it has seen a reset frame, which is
   only generated on startup.
+
+#### DWT hardware events and PC-sample profiling
+
+DWT hardware trace packets are decoded and shown next to the `Log_*` records
+on the same clock: PC samples (module `DWT`, symbolized to `function
+(file:line)` via the `--elf` files), exception entry/exit/return, watchpoint
+matches, event counter wraps, and ITM overflow warnings (module `ITM`). They
+appear on stdout, in Wireshark (no dissector change) and in replay files.
+
+To profile with the periodic PC sampler, enable it on the device
+(`ITM_enablePCSampling`) and pass `--pcsample out.speedscope.json`; on exit
+(Ctrl+C) an interactive flame view opens in the default browser using a
+bundled, fully offline copy of [speedscope](https://github.com/jlfwong/speedscope).
+The device emits program-counter samples rather than call stacks, so the
+view is a flat per-function histogram.
+
+Design, wire-format facts, and the measured performance decision record are
+in `streams/itm/ARCHITECTURE.md`.
 
 #### Viewing RAW ITM Streams
 
