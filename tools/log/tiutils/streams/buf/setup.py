@@ -45,5 +45,7 @@ setuptools.setup(
     install_requires=["typer==0.15.1", "colorama==0.4.6"],
     # The live-probe path needs pyOCD; dump replay and the tests do not:
     #   pip install -e streams/buf[probe]
-    extras_require={"probe": ["pyocd>=0.36"]},
+    # 'probe' is the default CMSIS-DAP path (pyOCD). 'xds110' is the opt-in
+    # native-XDS110 backend (--backend xds110), which only needs pyusb.
+    extras_require={"probe": ["pyocd>=0.36"], "xds110": ["pyusb>=1.2"]},
 )

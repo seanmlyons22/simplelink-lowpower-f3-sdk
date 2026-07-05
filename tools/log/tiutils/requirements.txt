@@ -12,4 +12,4 @@ streams/from_replayfile/
 streams/rftrace/[logic2]
 # LogSinkBuf RAM-ring transport. The [probe] extra pulls pyOCD for the live
 # SWD path; drop it if you only decode RAM dumps (--dump).
-streams/buf/[probe]
+streams/buf/[probe,xds110]

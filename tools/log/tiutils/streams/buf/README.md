@@ -18,8 +18,11 @@ reported as `drops=N`.
 # dump replay only (no probe library needed):
 pip install -e streams/buf
 
-# live probe support (pulls pyOCD):
+# live probe support, CMSIS-DAP via pyOCD (the default backend):
 pip install -e streams/buf[probe]
+
+# optional native-XDS110 backend (--backend xds110, higher throughput):
+pip install -e streams/buf[xds110]
 ```
 
 After install, `tilogger --help` lists the `buf` subcommand.
@@ -56,8 +59,11 @@ python -m tilogger_buf_transport ram.bin --elf app.out
 | option | default | meaning |
 |---|---|---|
 | `--instance NAME` | `CONFIG_ti_log_LogSinkBuf_0` | sink instance; the struct symbol read is `LogSinkBuf_<NAME>_config` (the default is the SysConfig singleton) |
-| `--probe UID` | first probe found | pyOCD probe unique id |
+| `--backend NAME` | `pyocd` | live read backend: `pyocd` (CMSIS-DAP, robust default) or `xds110` (native XDS110 protocol, higher throughput, opt-in; needs `streams/buf[xds110]`) |
+| `--probe UID` | first probe found | pyOCD probe unique id (also selects an XDS110 by serial) |
 | `--target TYPE` | `cortex_m` | pyOCD target type. CC23xx/CC27xx have no guaranteed pyOCD device pack; the generic `cortex_m` target reads RAM fine, which is all this transport does |
+| `--frequency HZ` | `4000000` | SWD clock (pyOCD backend); `0` uses the probe default. 4 MHz is the XDS110 sweet spot (higher plateaus) |
+| `--limit-packets N` | `1` | max outstanding CMSIS-DAP packets (pyOCD backend). `1` is required for a stable XDS110; `0` uses the pyOCD default |
 | `--dump FILE` | | decode a saved RAM dump instead of attaching a probe |
 | `--base ADDR` | `0x20000000` | load address of the dump (SRAM base on CC23xx/CC27xx) |
 | `--poll SEC` | `0.01` | poll interval. Falling behind is not an error; laps are counted as drops |
@@ -100,11 +106,31 @@ with a wide margin. The poll loop keeps the probe side minimal: one 28-byte
 struct read plus block reads of only the fresh byte span per poll (two reads
 when the span wraps), all via `read_memory_block32`, never halting.
 
-**Decision rule**: if measured pyOCD read throughput clears your target's log
-fill rate with margin, pyOCD stays. If pyOCD is too slow, evaluate `probe-rs`
-(Rust core, markedly faster SWD memory reads) behind the same one-method
-`MemoryReader` interface in `memory.py` and record the measured comparison --
-it is a drop-in swap, no transport changes.
+### Backends (measured on an XDS110 + CC2745)
+
+The `MemoryReader` interface in `memory.py` has one method, so backends are
+drop-in. Two live backends ship:
+
+- **`pyocd` (default)** -- CMSIS-DAP. Robust and always the right first choice.
+  The XDS110 firmware reports a 64-byte DAP packet and services one command at
+  a time, so reads are USB-round-trip bound: ~0.073 MB/s at the pyOCD default
+  clock, ~0.13 MB/s in CMSIS-DAP v2 mode at 4 MHz+ (higher clocks and larger
+  block sizes do not help -- it is latency, not bandwidth). That is ~6-10k
+  records/s end to end, which clears any nominal log rate with wide margin.
+- **`xds110` (opt-in, `--backend xds110`)** -- the native XDS110 protocol
+  (`xds110_reader.py`), the same one CCS/DSLite and OpenOCD's `xds110` driver
+  use. It batches DAP transfers ~1000 words per USB round trip (vs ~14), so it
+  is SWD-clock bound rather than latency bound: projected ~0.3 MB/s at 4 MHz and
+  ~1 MB/s at 12-14 MHz. Use it only if the pyOCD ceiling is actually in your way.
+
+Note on the native backend: the XDS110's native SWD connect can be flaky to
+(re)establish -- an intermittent "target failed to see SWD header" that a probe
+re-plug clears -- whereas the CMSIS-DAP (pyOCD) path is unaffected. That is why
+`pyocd` is the default and `xds110` is opt-in.
+
+**Decision rule**: if the measured `pyocd` read throughput clears your target's
+log fill rate with margin, keep it. Only reach for `--backend xds110` when it
+does not.
 
 ## Tests
 

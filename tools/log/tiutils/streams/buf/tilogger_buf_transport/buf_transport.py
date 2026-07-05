@@ -360,6 +360,11 @@ def transport_factory_cli(app: typer.Typer):
             1, help="Max outstanding CMSIS-DAP packets; 1 is required for stable XDS110, 0 uses the pyOCD default"
         ),
         prefer_v1: bool = typer.Option(False, help="Use CMSIS-DAP v1 (HID) instead of v2 (bulk)"),
+        backend: str = typer.Option(
+            "pyocd",
+            help="Live read backend: 'pyocd' (CMSIS-DAP, robust default) or 'xds110' "
+            "(native XDS110 protocol, higher throughput; opt-in)",
+        ),
         alias: Optional[str] = typer.Option(None, help="Alias for this device in the log"),
     ):
         """Add LogSinkBuf transport as input to log.
@@ -387,6 +392,13 @@ def transport_factory_cli(app: typer.Typer):
         if dump is not None:
             reader: MemoryReader = DumpReader(dump, int(base, 0))
             one_shot = True
+        elif backend == "xds110":
+            # Native XDS110 protocol: batches DAP transfers ~1000 words/round trip
+            # (vs CMSIS-DAP's ~14), so it clears the pyOCD read ceiling. Opt-in.
+            from .xds110_reader import Xds110Reader
+
+            reader = Xds110Reader(serial=probe)
+            one_shot = False
         else:
             reader = PyocdReader(
                 probe=probe, target=target, frequency=frequency,
