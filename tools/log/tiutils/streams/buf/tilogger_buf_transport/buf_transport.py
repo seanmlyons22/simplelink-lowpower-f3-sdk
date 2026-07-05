@@ -355,6 +355,11 @@ def transport_factory_cli(app: typer.Typer):
         ),
         base: str = typer.Option("0x20000000", help="Load address of --dump"),
         poll: float = typer.Option(0.01, help="Poll interval in seconds"),
+        frequency: Optional[int] = typer.Option(None, help="SWD clock in Hz (default: probe default)"),
+        limit_packets: int = typer.Option(
+            1, help="Max outstanding CMSIS-DAP packets; 1 is required for stable XDS110, 0 uses the pyOCD default"
+        ),
+        prefer_v1: bool = typer.Option(False, help="Use CMSIS-DAP v1 (HID) instead of v2 (bulk)"),
         alias: Optional[str] = typer.Option(None, help="Alias for this device in the log"),
     ):
         """Add LogSinkBuf transport as input to log.
@@ -383,6 +388,9 @@ def transport_factory_cli(app: typer.Typer):
             reader: MemoryReader = DumpReader(dump, int(base, 0))
             one_shot = True
         else:
-            reader = PyocdReader(probe=probe, target=target)
+            reader = PyocdReader(
+                probe=probe, target=target, frequency=frequency,
+                limit_packets=limit_packets, prefer_v1=prefer_v1,
+            )
             one_shot = False
         return Buf_Transport(reader, db, alias or "buf", instance=instance, poll=poll, one_shot=one_shot)
