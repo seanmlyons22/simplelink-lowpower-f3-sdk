@@ -170,12 +170,13 @@ static void LogSinkBuf_cobsFinish(LogSinkBuf_Cobs *c)
 void LogSinkBuf_printf(LogSinkBuf_Handle inst, uint32_t header, uint32_t index, uint32_t numArgs, va_list argptr)
 {
     uintptr_t       key;
-    uint32_t        now, delta, off, frameLen, i;
+    uint32_t        now, delta, off, frameLen, i, argLen;
     uint32_t        deltaLen;
     uint8_t         idbuf[2];
     uint8_t         deltabuf[5];
-    uint8_t         argbuf[LogSinkBuf_MAX_ARGS * 5];
+    uint8_t         argbuf[5]; /* one arg's worst-case ULEB, reused per arg */
     uint32_t        argsLen = 0;
+    va_list         argCount;
     LogSinkBuf_Cobs cobs;
 
     (void)header;
@@ -185,13 +186,20 @@ void LogSinkBuf_printf(LogSinkBuf_Handle inst, uint32_t header, uint32_t index, 
         numArgs = LogSinkBuf_MAX_ARGS;
     }
 
-    /* Read the timestamp and encode the arguments outside the critical section;
-     * only the delta bookkeeping and the reservation must be atomic. */
+    /* Read the timestamp outside the critical section; only the delta bookkeeping
+     * and the reservation below must be atomic. */
     now = TimestampP_getNative32();
+
+    /* Measure the encoded argument length without storing it, so the reservation
+     * can be exact. va_copy lets the encode pass below re-walk the same args, so
+     * they go straight into the ring through a 5-byte per-arg scratch instead of a
+     * LogSinkBuf_MAX_ARGS * 5 stack buffer. */
+    va_copy(argCount, argptr);
     for (i = 0; i < numArgs; i++)
     {
-        argsLen += LogSinkBuf_uleb((uint32_t)va_arg(argptr, uintptr_t), &argbuf[argsLen]);
+        argsLen += LogSinkBuf_ulebLen((uint32_t)va_arg(argCount, uintptr_t));
     }
+    va_end(argCount);
 
     key = HwiP_disable();
 
@@ -240,7 +248,11 @@ void LogSinkBuf_printf(LogSinkBuf_Handle inst, uint32_t header, uint32_t index, 
     LogSinkBuf_cobsInit(&cobs, inst, off);
     LogSinkBuf_cobsFeed(&cobs, idbuf, 2);
     LogSinkBuf_cobsFeed(&cobs, deltabuf, deltaLen);
-    LogSinkBuf_cobsFeed(&cobs, argbuf, argsLen);
+    for (i = 0; i < numArgs; i++)
+    {
+        argLen = LogSinkBuf_uleb((uint32_t)va_arg(argptr, uintptr_t), argbuf);
+        LogSinkBuf_cobsFeed(&cobs, argbuf, argLen);
+    }
     LogSinkBuf_cobsFinish(&cobs);
 }
 
