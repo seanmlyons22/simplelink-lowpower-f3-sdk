@@ -71,7 +71,10 @@ class PyocdReader(MemoryReader):
 
     retryable = True
 
-    def __init__(self, probe=None, target: str = "cortex_m", frequency=None,
+    # 4 MHz SWD: measured ~1.5x the pyOCD default read throughput on the XDS110
+    # and plateaus there (the link is USB-round-trip bound, not clock bound), so
+    # higher clocks buy nothing. Override with frequency=None to use the probe default.
+    def __init__(self, probe=None, target: str = "cortex_m", frequency=4_000_000,
                  limit_packets: int = 1, prefer_v1: bool = False):
         self._probe = probe
         self._target_type = target

@@ -355,7 +355,7 @@ def transport_factory_cli(app: typer.Typer):
         ),
         base: str = typer.Option("0x20000000", help="Load address of --dump"),
         poll: float = typer.Option(0.01, help="Poll interval in seconds"),
-        frequency: Optional[int] = typer.Option(None, help="SWD clock in Hz (default: probe default)"),
+        frequency: Optional[int] = typer.Option(4_000_000, help="SWD clock in Hz; 0 uses the probe default"),
         limit_packets: int = typer.Option(
             1, help="Max outstanding CMSIS-DAP packets; 1 is required for stable XDS110, 0 uses the pyOCD default"
         ),
