@@ -58,9 +58,10 @@ let config_instance = [
         ]
     },
     {
-        name: "numEntries",
-        displayName: "Number of Entries",
-        default: 100
+        name: "bufSize",
+        displayName: "Buffer Size (bytes)",
+        description: "Size in bytes of the RAM ring buffer that holds packed log records.",
+        default: 1024
     },
     {
         name: "printfDelegate",
@@ -170,10 +171,6 @@ linking against a known LogSinkBuf_Instance symbol name.
             "/ti/log/templates/LogSinkBuf.Config.c.xdt",
         "/ti/log/templates/ti_log_config.h.xdt":
             "/ti/log/templates/LogSinkBuf.Config.h.xdt",
-        "/ti/utils/rov/syscfg_c.rov.xs.xdt":
-            "/ti/log/LogSinkBuf.rov.js",
-        "/ti/log/templates/rov.js.xdt":
-            "/ti/log/LogSinkBuf.rov.js.xdt",
         "/ti/utils/build/GenLibs.cmd.xdt":
             { modName: "/ti/log/LogSinkBuf", getLibs: getLibs }
     }

@@ -45,5 +45,5 @@
 
 % for (let i = 0; i < LogSinkBuf.$instances.length; i++) {
 %     let inst = LogSinkBuf.$instances[i];
-Log_SINK_BUF_DEFINE(`inst.$name`, `inst.bufType`, `inst.numEntries`);
+Log_SINK_BUF_DEFINE(`inst.$name`, `inst.bufType`, `inst.bufSize`);
 % }

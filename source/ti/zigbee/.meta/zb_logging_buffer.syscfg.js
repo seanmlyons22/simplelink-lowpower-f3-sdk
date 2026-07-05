@@ -23,7 +23,7 @@ RCL.loggingEnabled = true;
 const LogSinkBuf        = scripting.addModule("/ti/log/LogSinkBuf", {}, false);
 const LogSinkBuf1       = LogSinkBuf.addInstance({}, false);
 LogSinkBuf1.$name       = "CONFIG_ti_log_LogSinkBuf_0";
-LogSinkBuf1.numEntries  = 250;
+LogSinkBuf1.bufSize     = 2048;
 
 RCL.LogModule.logger                = LogSinkBuf1;
 ZIGBEE.LogModuleZigbeeLLMAC.logger  = LogSinkBuf1;
