@@ -50,7 +50,7 @@ from typing import DefaultDict, Dict, List
 from collections import defaultdict
 
 from tilogger.interface import LogOutputABC, LogPacket, LoggerCliCtx, TransportABC, LogFormatterABC, LogSubscriberABC
-from tilogger.tracedb import Opcode, TraceDB, ElfString, LOG_ID_SIZE
+from tilogger.tracedb import Opcode, TraceDB, ElfString, LOG_ID_SIZE, format_c
 from tilogger.helpers import build_value
 
 # Upper value of opcodes used/reserved by Log.h
@@ -163,8 +163,9 @@ class Logger:
                 data = data[4:]
 
             try:
-                # Convert the list of values into a tuple so it is a valid argument to the % command
-                packet._str_data = elf_str.string % tuple(values)
+                # format_c applies C signedness (%d/%i as int32) the promoted
+                # 32-bit args don't carry, so a negative %d prints as e.g. -38.
+                packet._str_data = format_c(elf_str.string, values)
             except TypeError as exc:
                 logger.error(
                     "Log.h elf string formatting failed: %s\nFormat string: %s, args: %s", exc, elf_str.string, values

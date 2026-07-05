@@ -89,7 +89,8 @@ def test_record_roundtrip_args_and_timestamps():
     assert res.records[1].text == "x=42"
     assert res.records[2].text == "a=1 b=2"
     assert res.records[3].text == "x=0"
-    assert res.records[4].text == "x=4294967295"
+    # 0xFFFFFFFF through a %d format is -1, matching C's signed conversion.
+    assert res.records[4].text == "x=-1"
     assert res.records[5].text == "1 2 3 4 5 6 7 8"
 
     # timestamps reconstruct to the absolute values that were logged

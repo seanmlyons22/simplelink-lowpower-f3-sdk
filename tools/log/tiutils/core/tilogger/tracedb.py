@@ -38,6 +38,7 @@ import json
 import enum
 import struct
 import io
+import re
 
 from pathlib import Path
 from typing import Dict, Optional, List
@@ -66,6 +67,26 @@ LOG_ID_SIZE = LOG_ID_BITS // 8
 # Bumped when the pickled database layout changes so stale caches rebuild even
 # though the .out file (and thus its hash) is unchanged.
 PICKLE_VERSION = "v2"
+
+
+# Matches one printf conversion, skipping any flags/width/precision/length
+# between '%' and the conversion character. Group 1 is the conversion char.
+_C_CONV = re.compile(r"%[-+ #0]*[0-9*]*(?:\.[0-9*]*)?(?:hh|ll|[hljztL])?([diouxXeEfFgGaAcsp%])")
+
+
+def format_c(fmt, args):
+    """Apply a C printf format string to the target's promoted 32-bit args.
+
+    Each arg arrives as a raw 32-bit word, so a negative %d value comes across as
+    its unsigned two's complement (e.g. -38 -> 0xFFFFFFDA). Python's % would print
+    that as 4294967258, so reinterpret %d/%i args as int32 to match C and print -38.
+    """
+    specs = [m.group(1) for m in _C_CONV.finditer(fmt) if m.group(1) != "%"]
+    out = list(args)
+    for i, spec in enumerate(specs):
+        if i < len(out) and spec in ("d", "i") and 0x80000000 <= out[i] <= 0xFFFFFFFF:
+            out[i] -= 0x100000000
+    return fmt % tuple(out)
 
 
 def build_log_index(slots):

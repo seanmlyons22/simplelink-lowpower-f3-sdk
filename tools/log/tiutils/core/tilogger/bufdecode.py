@@ -55,7 +55,7 @@ and Python agree on the wire format.
 
 from collections import namedtuple
 
-from tilogger.tracedb import LOG_ID_MASK, Opcode
+from tilogger.tracedb import LOG_ID_MASK, Opcode, format_c
 
 # Buffer type constants, matching LogSinkBuf.h.
 TYPE_LINEAR = 1
@@ -174,7 +174,7 @@ def _format_record(payload, elf):
     while pos < len(payload):
         value, pos = uleb_decode(payload, pos)
         args.append(value)
-    text = (elf.string % tuple(args)) if elf.nargs else elf.string
+    text = format_c(elf.string, args) if elf.nargs else elf.string
     return delta, args, text
 
 
