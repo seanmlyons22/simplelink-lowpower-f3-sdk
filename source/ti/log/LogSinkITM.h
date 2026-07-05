@@ -92,7 +92,7 @@
 extern "C" {
 #endif
 
-#define Log_TI_LOG_SINK_ITM_VERSION 0.1.0
+#define Log_TI_LOG_SINK_ITM_VERSION 0.2.0
 
 /*
  * ======== LogSinkITM_StimulusPorts ========

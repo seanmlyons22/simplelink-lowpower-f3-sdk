@@ -36,7 +36,7 @@ from enum import Enum
 
 from typing import Optional
 
-from tilogger.tracedb import ElfString, Opcode, TraceDB
+from tilogger.tracedb import ElfString, Opcode, TraceDB, LOG_ID_SIZE
 from tilogger.helpers import build_value
 
 logger = logging.getLogger("UART Framer")
@@ -44,6 +44,22 @@ logger = logging.getLogger("UART Framer")
 # logging.basicConfig(level=logging.DEBUG)
 
 UART_RESET_TOKEN = bytes([0xBB, 0xBB, 0xBB, 0xBB])
+
+# Every record starts with a one-byte frame header: a fixed sync pattern in the
+# high nibble and a record code in the low nibble (see LogSinkUART.c). This lets
+# the framer resynchronize to the byte stream without a wide address value.
+UART_FRAME_SYNC = 0xA0
+UART_SYNC_MASK = 0xF0
+UART_CODE_MASK = 0x0F
+UART_CODE_OVERFLOW = 0x0E
+UART_CODE_BUFFER = 0x0F
+UART_MAX_ARGS = 8
+
+_FRAME_HEADER_SIZE = 1
+_TIMESTAMP_SIZE = 4
+_SIZE_FIELD_SIZE = 4
+# Frame header byte plus the 16-bit log id.
+_ID_HEADER_SIZE = _FRAME_HEADER_SIZE + LOG_ID_SIZE
 
 
 class UARTOpcode(Enum):
@@ -180,79 +196,77 @@ class UARTFramer:
         frame.parse(self._trace_db.timestamp_fmt_32)
         self._output_queue.put(frame)
 
-        # While there is a full packet to parse...
+        # While there is a full record to parse...
         while True:
-            # Nothing meaningful to parse if there are less than 4 bytes
-            if len(buf) < 4:
+            # Need at least a frame header and a log id to make any decision.
+            if len(buf) < _ID_HEADER_SIZE:
                 logger.debug("Not enough data to parse.")
                 return buf
 
-            # Make the assumption that the first 4 bytes is a header or overflow header
-            header = build_value(buf[0:4])
-            packet_length = 0
-
-            # Default to creating a dataframe
-            frame = UARTDataFrame(0)
-
-            if header in self._trace_db.traceDB:
-
-                # Check what type of log statement this header is and find the expected number of arguments
-                elf_string = self._trace_db.traceDB[header]
-
-                # If it is a Log_printf statement then read the number of arguments from the elf string
-                if elf_string.opcode == Opcode.FORMATTED_TEXT:
-                    packet_length = 8 + elf_string.nargs * 4
-
-                # If it is a Log_buf statement then read the size from the third argument.
-                # First make sure there is enough data to do so.
-                elif elf_string.opcode == Opcode.BUFFER:
-                    if len(buf) < 12:
-                        return buf
-                    else:
-                        packet_length = 12 + build_value(buf[8:12])
-
-                # There is not enough data to construct a packet.
-                if len(buf) < packet_length:
-                    return buf
-
-            elif (header & 0xFFF80000 == 0x80000000) and (0x90000000 | (header & 0x3FFFF)) in self._trace_db.traceDB:
-                frame = UARTErrorFrame(0)
-
-            else:
-                # Try to process buffer until a valid frame is found
+            # A record starts with the sync pattern; anything else is stream
+            # noise, so advance one byte and try again.
+            if (buf[0] & UART_SYNC_MASK) != UART_FRAME_SYNC:
                 buf.pop(0)
+                continue
+
+            code = buf[0] & UART_CODE_MASK
+
+            if code <= UART_MAX_ARGS:
+                # printf: header + id + timestamp + one word per argument
+                record_length = _ID_HEADER_SIZE + _TIMESTAMP_SIZE + code * 4
+                is_buffer = False
+            elif code == UART_CODE_OVERFLOW:
+                record_length = _ID_HEADER_SIZE
+                is_buffer = False
+            elif code == UART_CODE_BUFFER:
+                # The payload size follows the timestamp; wait for it if needed.
+                if len(buf) < _ID_HEADER_SIZE + _TIMESTAMP_SIZE + _SIZE_FIELD_SIZE:
+                    return buf
+                size_offset = _ID_HEADER_SIZE + _TIMESTAMP_SIZE
+                payload_size = build_value(buf[size_offset : size_offset + _SIZE_FIELD_SIZE])
+                record_length = _ID_HEADER_SIZE + _TIMESTAMP_SIZE + _SIZE_FIELD_SIZE + payload_size
+                is_buffer = True
+            else:
+                # Reserved code: a false sync, advance one byte.
+                buf.pop(0)
+                continue
+
+            if len(buf) < record_length:
                 return buf
 
-            if frame is not None:
-                # Parse packet based on packet type
-                try:
-                    if frame.opcode == UARTOpcode.DATA:
+            # Validate the log id against the database. An unknown id means we
+            # locked onto a byte that only looked like a frame header, so resync.
+            log_id = build_value(buf[_FRAME_HEADER_SIZE : _FRAME_HEADER_SIZE + LOG_ID_SIZE])
+            if log_id not in self._trace_db.logIndexDB:
+                buf.pop(0)
+                continue
 
-                        # If it's a buffer frame, trim the "nargs" field from the data,
-                        # otherwise it gets parsed as part of the data
-                        if self._trace_db.traceDB[header].opcode == Opcode.BUFFER:
-                            del buf[8:12]
-                            # Update the packet length
-                            packet_length -= 4
+            try:
+                if code == UART_CODE_OVERFLOW:
+                    frame = UARTErrorFrame(0)
+                    frame.data = buf[_FRAME_HEADER_SIZE:record_length]
+                    frame.size = len(frame.data)
+                    self._output_queue.put(frame)
+                else:
+                    frame = UARTDataFrame(0)
+                    if is_buffer:
+                        # Drop the frame header and the size field, leaving
+                        # [id timestamp payload] for the packetiser to finish.
+                        payload_start = _ID_HEADER_SIZE + _TIMESTAMP_SIZE + _SIZE_FIELD_SIZE
+                        frame.data = buf[_FRAME_HEADER_SIZE : _ID_HEADER_SIZE + _TIMESTAMP_SIZE] + buf[
+                            payload_start:record_length
+                        ]
+                    else:
+                        # Drop the frame header, leaving [id timestamp args].
+                        frame.data = buf[_FRAME_HEADER_SIZE:record_length]
+                    frame.size = len(frame.data)
+                    logger.debug("Parsed data frame (size %d): %s", frame.size, frame)
+                    self._output_queue.put(frame)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.error("Invalid UART Packet")
+                logger.debug(exc)
 
-                        # Parse buffer
-                        buf = frame.parse(buf, packet_length)
-
-                        # Log packet that was just parsed
-                        logger.debug("Parsed data frame (size %d, %d left in buf): %s", packet_length, len(buf), frame)
-
-                        # queue packet for output
-                        self._output_queue.put(frame)
-
-                    if frame.opcode == UARTOpcode.ERROR:
-                        # Parse buffer
-                        buf = frame.parse(buf)
-
-                        self._output_queue.put(frame)
-
-                except Exception as exc:  # pylint: disable=broad-except
-                    logger.error("Invalid UART Packet")
-                    logger.debug(exc)
+            buf = buf[record_length:]
 
         # Return unparsed data
         return buf

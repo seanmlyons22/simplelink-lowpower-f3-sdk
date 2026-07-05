@@ -50,7 +50,7 @@ from typing import DefaultDict, Dict, List
 from collections import defaultdict
 
 from tilogger.interface import LogOutputABC, LogPacket, LoggerCliCtx, TransportABC, LogFormatterABC, LogSubscriberABC
-from tilogger.tracedb import Opcode, TraceDB, ElfString
+from tilogger.tracedb import Opcode, TraceDB, ElfString, LOG_ID_SIZE
 from tilogger.helpers import build_value
 
 # Upper value of opcodes used/reserved by Log.h
@@ -139,20 +139,20 @@ class Logger:
                 transport.stop()
 
     def format_dobby_packet(self, packet: LogPacket) -> None:
-        if len(packet.data) < 4:
-            logger.error("Packet with less than 4 bytes of data! \n%s", packet)
+        if len(packet.data) < LOG_ID_SIZE:
+            logger.error("Packet with fewer than %d bytes of data! \n%s", LOG_ID_SIZE, packet)
             return
 
-        address: int = build_value(packet.data[:4])
+        log_id: int = build_value(packet.data[:LOG_ID_SIZE])
 
-        if address not in packet.trace_db.traceDB:
-            logger.error("Packet header points to %d but this address does not map to the .out file!", address)
+        if log_id not in packet.trace_db.logIndexDB:
+            logger.error("Packet log id 0x%x does not map to the .out file!", log_id)
             return
 
-        elf_str: ElfString = packet.trace_db.traceDB[address]
+        elf_str: ElfString = packet.trace_db.logIndexDB[log_id]
 
-        # We have used the first 32-bit word already, so strip it off
-        data = packet.data[4:]
+        # The leading id has been used to resolve the log site, so strip it off
+        data = packet.data[LOG_ID_SIZE:]
 
         if elf_str.opcode == Opcode.FORMATTED_TEXT:
             values = []

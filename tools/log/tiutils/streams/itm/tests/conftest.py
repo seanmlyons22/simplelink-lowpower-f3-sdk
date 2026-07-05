@@ -10,7 +10,7 @@ import pytest
 
 from tilogger.dwarf import RangeDict
 from tilogger.interface import LogPacket
-from tilogger.tracedb import ElfString
+from tilogger.tracedb import ElfString, LOG_ID_MASK
 
 from tilogger_itm_transport.itm_framer import ITMFramer, ITMFrame
 from tilogger_itm_transport.itm_to_log import ITMPacketiser
@@ -23,13 +23,15 @@ logging.disable(logging.CRITICAL)
 class FakeTraceDB:
     """Duck-typed stand-in for tilogger.tracedb.TraceDB.
 
-    The packetiser only reads .traceDB (dict addr -> ElfString); building the
-    dict here keeps the Log_* tests offline and fast instead of committing a
-    multi-megabyte .out.
+    The packetiser reads .logIndexDB (16-bit log id -> ElfString); building it
+    here keeps the Log_* tests offline and fast instead of committing a
+    multi-megabyte .out. add_fmt/add_buf take a .log_ptr slot address and the
+    id is its low bits, mirroring the real DB.
     """
 
     def __init__(self):
         self.traceDB = {}
+        self.logIndexDB = {}
         self.elves: List = []
         self.timestamp_fmt_32 = b""
         self.timestamp_fmt_64 = b""
@@ -50,7 +52,9 @@ class FakeTraceDB:
         line: str = "42",
     ) -> int:
         value = "\x1e".join(["LOG_OPCODE_FORMATED_TEXT", file, line, level, module, fmt, str(nargs)])
-        self.traceDB[addr] = ElfString(value, self)
+        elf_string = ElfString(value, self)
+        self.traceDB[addr] = elf_string
+        self.logIndexDB[addr & LOG_ID_MASK] = elf_string
         return addr
 
     def add_buf(
@@ -63,7 +67,9 @@ class FakeTraceDB:
         line: str = "43",
     ) -> int:
         value = "\x1e".join(["LOG_OPCODE_BUFFER", file, line, level, module, text, "0"])
-        self.traceDB[addr] = ElfString(value, self)
+        elf_string = ElfString(value, self)
+        self.traceDB[addr] = elf_string
+        self.logIndexDB[addr & LOG_ID_MASK] = elf_string
         return addr
 
 

@@ -45,15 +45,15 @@ def test_dense_records_reassemble(db):
     assert count.module == "LogMod_App"
     assert count.level == LogLevel.Log_INFO
     assert (count.filename, count.lineno) == ("app.c", "42")
-    assert count.data == struct.pack("<III", 0x9000_0100, 7, 9)
+    assert count.data == struct.pack("<HII", 0x0100, 7, 9)
     assert count._str_data == "Count 7 of 9"
 
     assert boot.level == LogLevel.Log_WARNING
     assert boot.lineno == "77"
-    assert boot.data == struct.pack("<I", 0x9000_0200)
+    assert boot.data == struct.pack("<H", 0x0200)
     assert boot._str_data == "Boot complete"
 
-    assert buf.data == struct.pack("<I", 0x9000_0300) + bytes(range(7))
+    assert buf.data == struct.pack("<H", 0x0300) + bytes(range(7))
     assert buf._str_data == "buffer: 0x0 0x1 0x2 0x3 0x4 0x5 0x6"
 
 
@@ -64,10 +64,11 @@ def test_timestamp_math(db):
 
     clock, baud, prescaler = 48e6, 12e6, 16  # prescaler set by the boot info frame
     rtc = 3000 / (clock / prescaler)
-    # First record header is the frame right after the LTS: one 5-byte frame.
-    expect_first = rtc + 5 / baud
-    # Second header follows two 5-byte trace frames plus itself.
-    expect_second = rtc + 4 * 5 / baud
+    # First record header is the frame right after the LTS: one 3-byte id frame.
+    expect_first = rtc + 3 / baud
+    # Second header follows the first id frame, its two 5-byte trace frames, and
+    # then its own 3-byte id frame.
+    expect_second = rtc + (3 + 5 + 5 + 3) / baud
 
     assert packets[0].timestamp_local == pytest.approx(expect_first, abs=1e-12)
     assert packets[1].timestamp_local == pytest.approx(expect_second, abs=1e-12)
@@ -98,15 +99,15 @@ def test_unknown_header_address_is_discarded(db):
 # ---------------------------------------------------------------------------
 
 STDOUT_PIN = [
-    "ITM0 | 0.001000417 | LogMod_App | Log_INFO | app.c:42 | Count 7 of 9",
-    "ITM0 | 0.001001667 | LogMod_App | Log_WARNING | app.c:77 | Boot complete",
+    "ITM0 | 0.001000250 | LogMod_App | Log_INFO | app.c:42 | Count 7 of 9",
+    "ITM0 | 0.001001333 | LogMod_App | Log_WARNING | app.c:77 | Boot complete",
 ]
 
 WIRESHARK_PIN = [
     b"\x00\x00\x00\x00\xe8\x03\x00\x00P\x00\x00\x00P\x00\x00\x00"
-    b"ITM0||0.001000417||FORMATTED_TEXT||LogMod_App||Log_INFO||app.c||42||Count 7 of 9",
+    b"ITM0||0.001000250||FORMATTED_TEXT||LogMod_App||Log_INFO||app.c||42||Count 7 of 9",
     b"\x00\x00\x00\x00\xe9\x03\x00\x00T\x00\x00\x00T\x00\x00\x00"
-    b"ITM0||0.001001667||FORMATTED_TEXT||LogMod_App||Log_WARNING||app.c||77||Boot complete",
+    b"ITM0||0.001001333||FORMATTED_TEXT||LogMod_App||Log_WARNING||app.c||77||Boot complete",
 ]
 
 
@@ -247,7 +248,7 @@ def test_dwt_packets_share_log_clock(db):
     clock, baud, prescaler = 48e6, 12e6, 16
     rtc = 3000 / (clock / prescaler)
     assert pc.timestamp_local == pytest.approx(rtc + 5 / baud, abs=1e-12)
-    assert log.timestamp_local == pytest.approx(rtc + 10 / baud, abs=1e-12)
+    assert log.timestamp_local == pytest.approx(rtc + (5 + 3) / baud, abs=1e-12)
     assert pc.timestamp_local < log.timestamp_local
 
 

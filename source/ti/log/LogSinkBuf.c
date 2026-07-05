@@ -107,7 +107,12 @@ void LogSinkBuf_printf(LogSinkBuf_Handle inst, uint32_t header, uint32_t index, 
     rec->serial = serial;
     rec->type   = LogSinkBuf_PRINTF;
 
-    rec->data[0] = header;
+    /*
+     * Store the low 16 bits of the .log_ptr slot as the log id. The reader
+     * recovers the full slot, and thus the format string, from the .out file,
+     * so the wide metadata pointer does not need to be kept in the record.
+     */
+    rec->data[0] = (uint16_t)index;
 
     uint32_t i;
     for (i = 0; i < argsToCopy; i++)
@@ -329,7 +334,8 @@ void LogSinkBuf_bufDepInjection(const Log_Module *handle, uint32_t header, uint3
         if (i == 0)
         {
             rec->type    = LogSinkBuf_BUFFER_START;
-            rec->data[0] = header;
+            /* Low 16 bits of the .log_ptr slot name the log site (see LogSinkBuf_printf) */
+            rec->data[0] = (uint16_t)index;
             rec->data[1] = size;
         }
         else

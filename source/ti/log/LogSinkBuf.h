@@ -44,7 +44,7 @@
 extern "C" {
 #endif
 
-#define Log_TI_LOG_SINK_BUF_VERSION 0.2.0
+#define Log_TI_LOG_SINK_BUF_VERSION 0.3.0
 
 #define LogSinkBuf_Type_LINEAR      (1)
 #define LogSinkBuf_Type_CIRCULAR    (2)

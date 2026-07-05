@@ -496,17 +496,17 @@ class ITMPacketiser:
     def append_packet(self, itm_frame: ITMSourceSWFrame, time_offset) -> Optional[ItmLogPacketData]:
         port = itm_frame.port
         if port is _PORT_HEADER:
-            header = int.from_bytes(itm_frame.data, "little")
+            log_id = int.from_bytes(itm_frame.data, "little")
 
-            trace_db = self._trace_db.traceDB
-            if header not in trace_db:
-                # This address does not exist in the trace database
-                logger.warning("FRAMING: corruption: no trace database information at 0x%x", header)
+            log_index = self._trace_db.logIndexDB
+            if log_id not in log_index:
+                # This log id does not exist in the trace database
+                logger.warning("FRAMING: corruption: no trace database information for log id 0x%x", log_id)
                 self._current_packet = None
                 return None
 
             self._current_packet = ItmLogPacketData(
-                trace_db[header],
+                log_index[log_id],
                 itm_frame,
                 alias=self.alias,
                 timestamp_local=self._rtc_s + time_offset,
@@ -514,7 +514,7 @@ class ITMPacketiser:
             )
             if self._debug:
                 logger.debug(
-                    "FRAMING: New Frame with len %d header 0x%x", self._current_packet.remaining_length, header
+                    "FRAMING: New Frame with len %d log id 0x%x", self._current_packet.remaining_length, log_id
                 )
 
             if self._current_packet.remaining_length == 0:

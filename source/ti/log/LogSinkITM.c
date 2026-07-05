@@ -97,8 +97,12 @@ void LogSinkITM_printf(const Log_Module *handle, uint32_t header, uint32_t heade
     /* disable interrupts */
     key = HwiP_disable();
 
-    /* Send header */
-    ITM_send32Polling(LogSinkITM_STIM_HEADER, headerPtr);
+    /*
+     * The log site is named by its .log_ptr slot. The host recovers the full
+     * slot from the .out file, so only the low 16 bits are needed to identify
+     * it. Send a halfword to keep the header transfer short.
+     */
+    ITM_send16Polling(LogSinkITM_STIM_HEADER, (uint16_t)headerPtr);
 
     uint32_t i;
     for (i = 0; i < numArgs; ++i)
@@ -181,8 +185,8 @@ void LogSinkITM_bufSingleton(const Log_Module *handle, uint32_t header, uint32_t
     /* disable interrupts */
     key = HwiP_disable();
 
-    /* Send header */
-    ITM_send32Polling(LogSinkITM_STIM_HEADER, headerPtr);
+    /* Low 16 bits of the .log_ptr slot are enough to name the log site (see printf) */
+    ITM_send16Polling(LogSinkITM_STIM_HEADER, (uint16_t)headerPtr);
     /* We always send the size of the expected buffer */
     ITM_send32Polling(LogSinkITM_STIM_TRACE, size);
     /* Send out the actual data */

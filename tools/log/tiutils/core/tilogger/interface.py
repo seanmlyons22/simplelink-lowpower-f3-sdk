@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Optional, NoReturn, List, TYPE_CHECKING
 from abc import ABC, abstractmethod, abstractproperty
 
-from tilogger.tracedb import ElfString, Opcode, TraceDB
+from tilogger.tracedb import ElfString, Opcode, TraceDB, LOG_ID_SIZE
 from tilogger.helpers import build_value
 
 if TYPE_CHECKING:
@@ -179,9 +179,9 @@ class LogPacket:
         """
         This is not normally used, but builds a human-readable packet representation for debugging or verbose mode.
         """
-        elf_ptr = build_value(self.data[:4])
-        data_str = " ".join(["0x%x" % byte for byte in self.data[4:]])
-        return f"""LogPacket(module={self.module}, opcode={self.opcode}, level={self.level}, ts={self.timestamp:0.4f}, ptr=0x{elf_ptr:08X}, data={data_str}, formatted={self._str_data}"""
+        log_id = build_value(self.data[:LOG_ID_SIZE])
+        data_str = " ".join(["0x%x" % byte for byte in self.data[LOG_ID_SIZE:]])
+        return f"""LogPacket(module={self.module}, opcode={self.opcode}, level={self.level}, ts={self.timestamp:0.4f}, id=0x{log_id:04X}, data={data_str}, formatted={self._str_data}"""
 
 
 class TransportABC(ABC):

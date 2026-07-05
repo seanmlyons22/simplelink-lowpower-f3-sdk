@@ -8,8 +8,8 @@ check and not a tautology:
   and DWT Packet Protocol"; identical encodings in ARMv8-M ARM (ARM DDI 0553)
   for the packets the TI sinks emit.
 - TI Log_* framing on top of ITM stimulus ports: source/ti/log/LogSinkITM.c
-  (STIM_HEADER carries the .log_data record address, STIM_TRACE carries
-  argument words / buffer length + payload).
+  (STIM_HEADER carries the 16-bit log id, the low bits of the .log_ptr slot
+  address, and STIM_TRACE carries argument words / buffer length + payload).
 
 Header encodings (from DDI 0403 D4.2):
   SW source  : (port << 3) | size_code                 bit2 = 0
@@ -167,20 +167,20 @@ def trace_data(comparator: int, write: bool, value: int, size: int = 4) -> bytes
 
 
 def log_record(addr: int, args: Iterable[int] = ()) -> bytes:
-    """Log_printf record: header word then one STIM_TRACE word per argument."""
-    out = bytearray(sw(STIM_HEADER, struct.pack("<I", addr)))
+    """Log_printf record: 16-bit id halfword then one STIM_TRACE word per argument."""
+    out = bytearray(sw(STIM_HEADER, struct.pack("<H", addr & 0xFFFF)))
     for arg in args:
         out += sw(STIM_TRACE, struct.pack("<I", arg & 0xFFFFFFFF))
     return bytes(out)
 
 
 def log_buf(addr: int, payload: bytes) -> bytes:
-    """Log_buf record: header word, length word, then the buffer bytes.
+    """Log_buf record: 16-bit id halfword, length word, then the buffer bytes.
 
     Mirrors LogSinkITM_bufSingleton + ITM_sendBufferAtomic: 4-byte stimulus
     writes while possible, then 2- and 1-byte writes for the tail.
     """
-    out = bytearray(sw(STIM_HEADER, struct.pack("<I", addr)))
+    out = bytearray(sw(STIM_HEADER, struct.pack("<H", addr & 0xFFFF)))
     out += sw(STIM_TRACE, struct.pack("<I", len(payload)))
     view = memoryview(bytes(payload))
     while len(view) >= 4:
