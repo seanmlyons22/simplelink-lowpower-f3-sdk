@@ -172,6 +172,7 @@ class TraceDB:
         self.timestamp_fmt_64 = b""
         self.stringpointers = {}
         self._function_ranges = None
+        self._symbols = None
 
         self.changed_event = threading.Event()
         self.change_handler = ElfWatcherHandler(self.elves, self.changed_event)
@@ -303,6 +304,35 @@ class TraceDB:
                     infos.append(elf.get_dwarf_info())
             self._function_ranges = get_all_functions_range(infos)
         return self._function_ranges
+
+    def _symbol_table(self):
+        """{name -> (st_value, st_size)} over all loaded ELFs, built lazily.
+
+        Not pickled: transports that poll device memory (e.g. the buf sink)
+        need a handful of named addresses, so one linear .symtab scan on
+        first use is plenty.
+        """
+        if self._symbols is None:
+            self._symbols = {}
+            for elfpath in self.elves:
+                elf = ELFFile(io.BytesIO(elfpath.read_bytes()))
+                symtab = elf.get_section_by_name(".symtab")
+                if symtab is None:
+                    continue
+                for sym in symtab.iter_symbols():
+                    if sym.name:
+                        self._symbols.setdefault(sym.name, (sym.entry.st_value, sym.entry.st_size))
+        return self._symbols
+
+    def symbol_address(self, name: str) -> Optional[int]:
+        """Return the st_value (load address) of a named symbol, or None."""
+        entry = self._symbol_table().get(name)
+        return entry[0] if entry else None
+
+    def symbol_size(self, name: str) -> Optional[int]:
+        """Return the st_size of a named symbol, or None."""
+        entry = self._symbol_table().get(name)
+        return entry[1] if entry else None
 
     def parse_elf(self, elfpath: Path):
         elf = ELFFile(io.BytesIO(elfpath.read_bytes()))

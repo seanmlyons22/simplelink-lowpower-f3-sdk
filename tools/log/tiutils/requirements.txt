@@ -10,3 +10,6 @@ streams/from_replayfile/
 # --sal/--sigrok/--raw. Needs the `tracedecode` binary on PATH — see
 # tools/rftrace-decode (`cargo install --path .`).
 streams/rftrace/[logic2]
+# LogSinkBuf RAM-ring transport. The [probe] extra pulls pyOCD for the live
+# SWD path; drop it if you only decode RAM dumps (--dump).
+streams/buf/[probe]
