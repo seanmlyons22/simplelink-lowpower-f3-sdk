@@ -96,15 +96,12 @@ _AP_CSW = 0x00
 _AP_TAR = 0x04
 _AP_DRW = 0x0C
 
-# mem-AP CSW fields. We keep whatever protection/enable bits the probe already
-# set up and only force 32-bit single-auto-increment transfers.
-_CSW_SIZE_MASK = 0x7
-_CSW_ADDRINC_MASK = 0x3 << 4
-_CSW_32BIT = 0x2
-_CSW_ADDRINC_SINGLE = 0x1 << 4
-# Fallback CSW if the probe's own value can't be read: AHB privileged +
-# master-debug + debug-sw-enable, 32-bit single increment.
-_CSW_DEFAULT = 0xA2000000 | _CSW_32BIT | _CSW_ADDRINC_SINGLE
+# CSW for a 32-bit single-auto-increment word read on the CC23xx/CC27xx AHB-AP.
+# Reading the probe's own CSW and keeping its protection bits sounds portable, but
+# on the CC27xx AHB-AP those bits make the AP fault the very next transfer (-614),
+# so use this known-good value (measured working on CC2745) directly. Override with
+# the constructor's csw= if a different AP needs other HPROT bits.
+_CSW_DEFAULT = 0x23000052
 
 # TAR auto-increment is only guaranteed across a 1 KB window (the counter is
 # 10 bits), so TAR is re-written at every 1 KB boundary of a run.
@@ -321,19 +318,8 @@ class Xds110Reader(MemoryReader):
         self._connected = True
 
     def _setup_csw(self):
-        """Adopt the probe's own CSW, forcing only 32-bit auto-increment."""
-        if self._csw_override is not None:
-            self._csw = self._csw_override
-            return
-        ops = [
-            (False, False, _DP_SELECT, 0),
-            (True, True, _AP_CSW, 0),
-            (True, False, _DP_RDBUFF, 0),
-        ]
-        current = self._dap_request(ops, 2)[1]
-        if current in (0, 0xFFFFFFFF):
-            current = _CSW_DEFAULT
-        self._csw = (current & ~(_CSW_SIZE_MASK | _CSW_ADDRINC_MASK)) | _CSW_32BIT | _CSW_ADDRINC_SINGLE
+        """32-bit single-auto-increment CSW for the CC23xx/CC27xx AHB-AP."""
+        self._csw = self._csw_override if self._csw_override is not None else _CSW_DEFAULT
 
     # -- read path ---------------------------------------------------------
 
