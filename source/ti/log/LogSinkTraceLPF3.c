@@ -118,16 +118,14 @@ void LogSinkTraceLPF3_init(void)
 }
 
 /*
- *  ======== LogSinkTraceLPF3_printf ========
+ *  ======== LogSinkTraceLPF3_send ========
+ *  Shared emit path. The tracer hardware takes at most two 32-bit parameter
+ *  words per packet, so callers pass the arguments already packed into
+ *  arg01/arg23 and this helper only has to program the channel registers.
+ *  Callers guarantee numArgs <= MAX_ARG_COUNT.
  */
-void LogSinkTraceLPF3_printf(const Log_Module *handle,
-                             uint32_t header,
-                             uint32_t headerPtr,
-                             uint32_t numArgs,
-                             va_list argptr)
+static void LogSinkTraceLPF3_send(uint32_t headerPtr, uint32_t numArgs, uint32_t arg01, uint32_t arg23)
 {
-    uint32_t arg01;
-    uint32_t arg23;
     uint32_t tracerCommand;
     int32_t channelField;
     int32_t channelIndex;
@@ -143,12 +141,6 @@ void LogSinkTraceLPF3_printf(const Log_Module *handle,
 
     /* Convert channel field to the correct index */
     channelIndex = channelLut[channelField];
-
-    /* Prevent out of bounds access to nArgLut */
-    if (numArgs > MAX_ARG_COUNT)
-    {
-        numArgs = MAX_ARG_COUNT;
-    }
 
     /* Extract the 8-bit ID, which gives 256 log statements for each channel.
      * IDs 1 and 2 are reserved for legacy purposes in the tracer GUI and may
@@ -173,44 +165,13 @@ void LogSinkTraceLPF3_printf(const Log_Module *handle,
             LRFDTRC_CH1CMD_PKTHDR_M) != 0)
     {}
 
-    switch (numArgs)
+    if (numArgs >= 1)
     {
-        case 0:
-            break;
-
-        case 1:
-            arg01 = va_arg(argptr, uintptr_t);
-
-            HWREG_WRITE_LRF(LRFDTRC_BASE + LRFDTRC_O_CH1PAR01 + sizeof(uint32_t) * channelIndex) = arg01;
-            break;
-
-        case 2:
-            arg01 = va_arg(argptr, uintptr_t);
-            arg23 = va_arg(argptr, uintptr_t);
-
-            HWREG_WRITE_LRF(LRFDTRC_BASE + LRFDTRC_O_CH1PAR01 + sizeof(uint32_t) * channelIndex) = arg01;
-            HWREG_WRITE_LRF(LRFDTRC_BASE + LRFDTRC_O_CH1PAR23 + sizeof(uint32_t) * channelIndex) = arg23;
-            break;
-
-        case 3:
-            arg01 = va_arg(argptr, uintptr_t) & 0xFFFFU;
-            arg01 |= va_arg(argptr, uintptr_t) << 16;
-            arg23 = va_arg(argptr, uintptr_t) & 0xFFFFU;
-
-            HWREG_WRITE_LRF(LRFDTRC_BASE + LRFDTRC_O_CH1PAR01 + sizeof(uint32_t) * channelIndex) = arg01;
-            HWREG_WRITE_LRF(LRFDTRC_BASE + LRFDTRC_O_CH1PAR23 + sizeof(uint32_t) * channelIndex) = arg23;
-            break;
-
-        case 4:
-        default:
-            arg01 = va_arg(argptr, uintptr_t) & 0xFFFFU;
-            arg01 |= va_arg(argptr, uintptr_t) << 16;
-            arg23 = va_arg(argptr, uintptr_t) & 0xFFFFU;
-            arg23 |= va_arg(argptr, uintptr_t) << 16;
-
-            HWREG_WRITE_LRF(LRFDTRC_BASE + LRFDTRC_O_CH1PAR01 + sizeof(uint32_t) * channelIndex) = arg01;
-            HWREG_WRITE_LRF(LRFDTRC_BASE + LRFDTRC_O_CH1PAR23 + sizeof(uint32_t) * channelIndex) = arg23;
-            break;
+        HWREG_WRITE_LRF(LRFDTRC_BASE + LRFDTRC_O_CH1PAR01 + sizeof(uint32_t) * channelIndex) = arg01;
+    }
+    if (numArgs >= 2)
+    {
+        HWREG_WRITE_LRF(LRFDTRC_BASE + LRFDTRC_O_CH1PAR23 + sizeof(uint32_t) * channelIndex) = arg23;
     }
 
     /* Channel ready, transmit packet */
@@ -221,51 +182,98 @@ void LogSinkTraceLPF3_printf(const Log_Module *handle,
 }
 
 /*
+ *  ======== LogSinkTraceLPF3_printf ========
+ */
+void LogSinkTraceLPF3_printf(const Log_Module *handle,
+                             uint32_t header,
+                             uint32_t headerPtr,
+                             uint32_t numArgs,
+                             va_list argptr)
+{
+    uint32_t arg01 = 0;
+    uint32_t arg23 = 0;
+
+    /* Prevent out of bounds access to nArgLut */
+    if (numArgs > MAX_ARG_COUNT)
+    {
+        numArgs = MAX_ARG_COUNT;
+    }
+
+    /* Pack the arguments the way the tracer hardware consumes them: full
+     * 32-bit words for up to two arguments, 16-bit halves for three or four
+     * (see nArgLut). */
+    switch (numArgs)
+    {
+        case 0:
+            break;
+
+        case 1:
+            arg01 = va_arg(argptr, uintptr_t);
+            break;
+
+        case 2:
+            arg01 = va_arg(argptr, uintptr_t);
+            arg23 = va_arg(argptr, uintptr_t);
+            break;
+
+        case 3:
+            arg01 = va_arg(argptr, uintptr_t) & 0xFFFFU;
+            arg01 |= va_arg(argptr, uintptr_t) << 16;
+            arg23 = va_arg(argptr, uintptr_t) & 0xFFFFU;
+            break;
+
+        case 4:
+        default:
+            arg01 = va_arg(argptr, uintptr_t) & 0xFFFFU;
+            arg01 |= va_arg(argptr, uintptr_t) << 16;
+            arg23 = va_arg(argptr, uintptr_t) & 0xFFFFU;
+            arg23 |= va_arg(argptr, uintptr_t) << 16;
+            break;
+    }
+
+    LogSinkTraceLPF3_send(headerPtr, numArgs, arg01, arg23);
+}
+
+/*
  *  ======== LogSinkTraceLPF3_printfSingleton0 ========
  */
-void LogSinkTraceLPF3_printfSingleton0(const Log_Module *handle, uint32_t header, uint32_t headerPtr, ...)
+void LogSinkTraceLPF3_printfSingleton0(const Log_Module *handle, uint32_t header, uint32_t headerPtr)
 {
-    va_list argptr;
-
-    va_start(argptr, headerPtr);
-    LogSinkTraceLPF3_printf(handle, header, headerPtr, 0, argptr);
-    va_end(argptr);
+    LogSinkTraceLPF3_send(headerPtr, 0, 0, 0);
 }
 
 /*
  *  ======== LogSinkTraceLPF3_printfSingleton1 ========
  */
-void LogSinkTraceLPF3_printfSingleton1(const Log_Module *handle, uint32_t header, uint32_t headerPtr, ...)
+void LogSinkTraceLPF3_printfSingleton1(const Log_Module *handle, uint32_t header, uint32_t headerPtr, uintptr_t a0)
 {
-    va_list argptr;
-
-    va_start(argptr, headerPtr);
-    LogSinkTraceLPF3_printf(handle, header, headerPtr, 1, argptr);
-    va_end(argptr);
+    LogSinkTraceLPF3_send(headerPtr, 1, a0, 0);
 }
 
 /*
  *  ======== LogSinkTraceLPF3_printfSingleton2 ========
  */
-void LogSinkTraceLPF3_printfSingleton2(const Log_Module *handle, uint32_t header, uint32_t headerPtr, ...)
+void LogSinkTraceLPF3_printfSingleton2(const Log_Module *handle,
+                                       uint32_t header,
+                                       uint32_t headerPtr,
+                                       uintptr_t a0,
+                                       uintptr_t a1)
 {
-    va_list argptr;
-
-    va_start(argptr, headerPtr);
-    LogSinkTraceLPF3_printf(handle, header, headerPtr, 2, argptr);
-    va_end(argptr);
+    LogSinkTraceLPF3_send(headerPtr, 2, a0, a1);
 }
 
 /*
  *  ======== LogSinkTraceLPF3_printfSingleton3 ========
  */
-void LogSinkTraceLPF3_printfSingleton3(const Log_Module *handle, uint32_t header, uint32_t headerPtr, ...)
+void LogSinkTraceLPF3_printfSingleton3(const Log_Module *handle,
+                                       uint32_t header,
+                                       uint32_t headerPtr,
+                                       uintptr_t a0,
+                                       uintptr_t a1,
+                                       uintptr_t a2)
 {
-    va_list argptr;
-
-    va_start(argptr, headerPtr);
-    LogSinkTraceLPF3_printf(handle, header, headerPtr, 3, argptr);
-    va_end(argptr);
+    /* Three arguments travel as 16-bit halves (see nArgLut) */
+    LogSinkTraceLPF3_send(headerPtr, 3, (a0 & 0xFFFFU) | (a1 << 16), a2 & 0xFFFFU);
 }
 
 /*

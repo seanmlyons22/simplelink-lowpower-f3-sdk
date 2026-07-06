@@ -283,52 +283,54 @@ void LogSinkUART_printfSingleton(const Log_Module *handle, uint32_t header, uint
     va_end(argptr);
 }
 
+/* The fixed-argument-count delegates below are non-variadic (matching the
+ * per-arity Log_printfN_fxn typedefs) so their prologue does not spill the
+ * argument registers the way a variadic function must. They forward to the
+ * variadic implementation with an ordinary call. Routing the record building
+ * through the single variadic core keeps only one copy of the marshalling code
+ * in the image rather than a second non-variadic core that the always-linked
+ * generic wrapper would also have to feed.
+ */
+
 /*
  *  ======== LogSinkUART_printfSingleton0 ========
  */
-void LogSinkUART_printfSingleton0(const Log_Module *handle, uint32_t header, uint32_t headerPtr, ...)
+void LogSinkUART_printfSingleton0(const Log_Module *handle, uint32_t header, uint32_t headerPtr)
 {
-    va_list argptr;
-
-    va_start(argptr, headerPtr);
-    LogSinkUART_printf((LogSinkUART_Config *)&LogSinkUART_config[0], headerPtr, 0, argptr);
-    va_end(argptr);
+    LogSinkUART_printfSingleton(handle, header, headerPtr, 0);
 }
 
 /*
  *  ======== LogSinkUART_printfSingleton1 ========
  */
-void LogSinkUART_printfSingleton1(const Log_Module *handle, uint32_t header, uint32_t headerPtr, ...)
+void LogSinkUART_printfSingleton1(const Log_Module *handle, uint32_t header, uint32_t headerPtr, uintptr_t a0)
 {
-    va_list argptr;
-
-    va_start(argptr, headerPtr);
-    LogSinkUART_printf((LogSinkUART_Config *)&LogSinkUART_config[0], headerPtr, 1, argptr);
-    va_end(argptr);
+    LogSinkUART_printfSingleton(handle, header, headerPtr, 1, a0);
 }
 
 /*
  *  ======== LogSinkUART_printfSingleton2 ========
  */
-void LogSinkUART_printfSingleton2(const Log_Module *handle, uint32_t header, uint32_t headerPtr, ...)
+void LogSinkUART_printfSingleton2(const Log_Module *handle,
+                                  uint32_t header,
+                                  uint32_t headerPtr,
+                                  uintptr_t a0,
+                                  uintptr_t a1)
 {
-    va_list argptr;
-
-    va_start(argptr, headerPtr);
-    LogSinkUART_printf((LogSinkUART_Config *)&LogSinkUART_config[0], headerPtr, 2, argptr);
-    va_end(argptr);
+    LogSinkUART_printfSingleton(handle, header, headerPtr, 2, a0, a1);
 }
 
 /*
  *  ======== LogSinkUART_printfSingleton3 ========
  */
-void LogSinkUART_printfSingleton3(const Log_Module *handle, uint32_t header, uint32_t headerPtr, ...)
+void LogSinkUART_printfSingleton3(const Log_Module *handle,
+                                  uint32_t header,
+                                  uint32_t headerPtr,
+                                  uintptr_t a0,
+                                  uintptr_t a1,
+                                  uintptr_t a2)
 {
-    va_list argptr;
-
-    va_start(argptr, headerPtr);
-    LogSinkUART_printf((LogSinkUART_Config *)&LogSinkUART_config[0], headerPtr, 3, argptr);
-    va_end(argptr);
+    LogSinkUART_printfSingleton(handle, header, headerPtr, 3, a0, a1, a2);
 }
 
 /*
@@ -364,61 +366,42 @@ void LogSinkUART_printfDepInjection(const Log_Module *handle,
 /*
  *  ======== LogSinkUART_printfDepInjection0 ========
  */
-void LogSinkUART_printfDepInjection0(const Log_Module *handle, uint32_t header, uint32_t headerPtr, ...)
+void LogSinkUART_printfDepInjection0(const Log_Module *handle, uint32_t header, uint32_t headerPtr)
 {
-    va_list argptr;
-
-    LogSinkUART_Handle inst    = (LogSinkUART_Handle)handle->sinkConfig;
-    LogSinkUART_Config *config = (LogSinkUART_Config *)&LogSinkUART_config[inst->index];
-
-    va_start(argptr, headerPtr);
-    LogSinkUART_printf(config, headerPtr, 0, argptr);
-    va_end(argptr);
+    LogSinkUART_printfDepInjection(handle, header, headerPtr, 0);
 }
 
 /*
  *  ======== LogSinkUART_printfDepInjection1 ========
  */
-void LogSinkUART_printfDepInjection1(const Log_Module *handle, uint32_t header, uint32_t headerPtr, ...)
+void LogSinkUART_printfDepInjection1(const Log_Module *handle, uint32_t header, uint32_t headerPtr, uintptr_t a0)
 {
-    va_list argptr;
-
-    LogSinkUART_Handle inst    = (LogSinkUART_Handle)handle->sinkConfig;
-    LogSinkUART_Config *config = (LogSinkUART_Config *)&LogSinkUART_config[inst->index];
-
-    va_start(argptr, headerPtr);
-    LogSinkUART_printf(config, headerPtr, 1, argptr);
-    va_end(argptr);
+    LogSinkUART_printfDepInjection(handle, header, headerPtr, 1, a0);
 }
 
 /*
  *  ======== LogSinkUART_printfDepInjection2 ========
  */
-void LogSinkUART_printfDepInjection2(const Log_Module *handle, uint32_t header, uint32_t headerPtr, ...)
+void LogSinkUART_printfDepInjection2(const Log_Module *handle,
+                                     uint32_t header,
+                                     uint32_t headerPtr,
+                                     uintptr_t a0,
+                                     uintptr_t a1)
 {
-    va_list argptr;
-
-    LogSinkUART_Handle inst    = (LogSinkUART_Handle)handle->sinkConfig;
-    LogSinkUART_Config *config = (LogSinkUART_Config *)&LogSinkUART_config[inst->index];
-
-    va_start(argptr, headerPtr);
-    LogSinkUART_printf(config, headerPtr, 2, argptr);
-    va_end(argptr);
+    LogSinkUART_printfDepInjection(handle, header, headerPtr, 2, a0, a1);
 }
 
 /*
  *  ======== LogSinkUART_printfDepInjection3 ========
  */
-void LogSinkUART_printfDepInjection3(const Log_Module *handle, uint32_t header, uint32_t headerPtr, ...)
+void LogSinkUART_printfDepInjection3(const Log_Module *handle,
+                                     uint32_t header,
+                                     uint32_t headerPtr,
+                                     uintptr_t a0,
+                                     uintptr_t a1,
+                                     uintptr_t a2)
 {
-    va_list argptr;
-
-    LogSinkUART_Handle inst    = (LogSinkUART_Handle)handle->sinkConfig;
-    LogSinkUART_Config *config = (LogSinkUART_Config *)&LogSinkUART_config[inst->index];
-
-    va_start(argptr, headerPtr);
-    LogSinkUART_printf(config, headerPtr, 3, argptr);
-    va_end(argptr);
+    LogSinkUART_printfDepInjection(handle, header, headerPtr, 3, a0, a1, a2);
 }
 
 /*

@@ -128,13 +128,22 @@ extern void LogSinkBuf_printfSingleton(const Log_Module *handle,
                                        uint32_t numArgs,
                                        ...);
 
-extern void LogSinkBuf_printfSingleton0(const Log_Module *handle, uint32_t header, uint32_t index, ...);
+extern void LogSinkBuf_printfSingleton0(const Log_Module *handle, uint32_t header, uint32_t index);
 
-extern void LogSinkBuf_printfSingleton1(const Log_Module *handle, uint32_t header, uint32_t index, ...);
+extern void LogSinkBuf_printfSingleton1(const Log_Module *handle, uint32_t header, uint32_t index, uintptr_t a0);
 
-extern void LogSinkBuf_printfSingleton2(const Log_Module *handle, uint32_t header, uint32_t index, ...);
+extern void LogSinkBuf_printfSingleton2(const Log_Module *handle,
+                                        uint32_t header,
+                                        uint32_t index,
+                                        uintptr_t a0,
+                                        uintptr_t a1);
 
-extern void LogSinkBuf_printfSingleton3(const Log_Module *handle, uint32_t header, uint32_t index, ...);
+extern void LogSinkBuf_printfSingleton3(const Log_Module *handle,
+                                        uint32_t header,
+                                        uint32_t index,
+                                        uintptr_t a0,
+                                        uintptr_t a1,
+                                        uintptr_t a2);
 /*! @endcond NODOC */
 
 /*!
@@ -169,13 +178,22 @@ extern void LogSinkBuf_printfDepInjection(const Log_Module *handle,
                                           uint32_t numArgs,
                                           ...);
 
-extern void LogSinkBuf_printfDepInjection0(const Log_Module *handle, uint32_t header, uint32_t index, ...);
+extern void LogSinkBuf_printfDepInjection0(const Log_Module *handle, uint32_t header, uint32_t index);
 
-extern void LogSinkBuf_printfDepInjection1(const Log_Module *handle, uint32_t header, uint32_t index, ...);
+extern void LogSinkBuf_printfDepInjection1(const Log_Module *handle, uint32_t header, uint32_t index, uintptr_t a0);
 
-extern void LogSinkBuf_printfDepInjection2(const Log_Module *handle, uint32_t header, uint32_t index, ...);
+extern void LogSinkBuf_printfDepInjection2(const Log_Module *handle,
+                                           uint32_t header,
+                                           uint32_t index,
+                                           uintptr_t a0,
+                                           uintptr_t a1);
 
-extern void LogSinkBuf_printfDepInjection3(const Log_Module *handle, uint32_t header, uint32_t index, ...);
+extern void LogSinkBuf_printfDepInjection3(const Log_Module *handle,
+                                           uint32_t header,
+                                           uint32_t index,
+                                           uintptr_t a0,
+                                           uintptr_t a1,
+                                           uintptr_t a2);
 /*! @endcond NODOC */
 
 /*!

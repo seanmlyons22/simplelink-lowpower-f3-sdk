@@ -115,52 +115,48 @@ void LogSinkITM_printf(const Log_Module *handle, uint32_t header, uint32_t heade
     HwiP_restore(key);
 }
 
+/* The fixed-argument-count delegates below forward to the variadic
+ * implementation with an ordinary call. The emit path of this sink is so
+ * small that a dedicated argument-array path costs more flash than the
+ * forwarding calls do, so unlike the other sinks the variadic overhead is
+ * paid once in LogSinkITM_printfSingleton instead.
+ */
+
 /*
  *  ======== LogSinkITM_printfSingleton0 ========
  */
-void LogSinkITM_printfSingleton0(const Log_Module *handle, uint32_t header, uint32_t headerPtr, ...)
+void LogSinkITM_printfSingleton0(const Log_Module *handle, uint32_t header, uint32_t headerPtr)
 {
-    va_list argptr;
-
-    va_start(argptr, headerPtr);
-    LogSinkITM_printf(handle, header, headerPtr, 0, argptr);
-    va_end(argptr);
+    LogSinkITM_printfSingleton(handle, header, headerPtr, 0);
 }
 
 /*
  *  ======== LogSinkITM_printfSingleton1 ========
  */
-void LogSinkITM_printfSingleton1(const Log_Module *handle, uint32_t header, uint32_t headerPtr, ...)
+void LogSinkITM_printfSingleton1(const Log_Module *handle, uint32_t header, uint32_t headerPtr, uintptr_t a0)
 {
-    va_list argptr;
-
-    va_start(argptr, headerPtr);
-    LogSinkITM_printf(handle, header, headerPtr, 1, argptr);
-    va_end(argptr);
+    LogSinkITM_printfSingleton(handle, header, headerPtr, 1, a0);
 }
 
 /*
  *  ======== LogSinkITM_printfSingleton2 ========
  */
-void LogSinkITM_printfSingleton2(const Log_Module *handle, uint32_t header, uint32_t headerPtr, ...)
+void LogSinkITM_printfSingleton2(const Log_Module *handle, uint32_t header, uint32_t headerPtr, uintptr_t a0, uintptr_t a1)
 {
-    va_list argptr;
-
-    va_start(argptr, headerPtr);
-    LogSinkITM_printf(handle, header, headerPtr, 2, argptr);
-    va_end(argptr);
+    LogSinkITM_printfSingleton(handle, header, headerPtr, 2, a0, a1);
 }
 
 /*
- *  ======== LogSinkITM_printfSingleton1 ========
+ *  ======== LogSinkITM_printfSingleton3 ========
  */
-void LogSinkITM_printfSingleton3(const Log_Module *handle, uint32_t header, uint32_t headerPtr, ...)
+void LogSinkITM_printfSingleton3(const Log_Module *handle,
+                                 uint32_t header,
+                                 uint32_t headerPtr,
+                                 uintptr_t a0,
+                                 uintptr_t a1,
+                                 uintptr_t a2)
 {
-    va_list argptr;
-
-    va_start(argptr, headerPtr);
-    LogSinkITM_printf(handle, header, headerPtr, 3, argptr);
-    va_end(argptr);
+    LogSinkITM_printfSingleton(handle, header, headerPtr, 3, a0, a1, a2);
 }
 
 /*

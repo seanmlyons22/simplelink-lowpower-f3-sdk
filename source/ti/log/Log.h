@@ -1128,10 +1128,28 @@ typedef void (*Log_printf_fxn)(const Log_Module *handle,
                               uint32_t numArgs,
                               ...);
 
-typedef void (*Log_printfN_fxn)(const Log_Module *handle,
-                              uint32_t header,
-                              uint32_t headerPtr,
-                              ...);
+/* Dedicated fixed-argument-count printf delegates. These are deliberately not
+ * variadic: a variadic function must spill its register arguments to the stack
+ * in the prologue so va_arg can walk them, which costs flash and stack in every
+ * sink even though the Log.h call sites always pass a fixed number of
+ * arguments.
+ */
+typedef void (*Log_printf0_fxn)(const Log_Module *handle, uint32_t header, uint32_t headerPtr);
+
+typedef void (*Log_printf1_fxn)(const Log_Module *handle, uint32_t header, uint32_t headerPtr, uintptr_t a0);
+
+typedef void (*Log_printf2_fxn)(const Log_Module *handle,
+                                uint32_t header,
+                                uint32_t headerPtr,
+                                uintptr_t a0,
+                                uintptr_t a1);
+
+typedef void (*Log_printf3_fxn)(const Log_Module *handle,
+                                uint32_t header,
+                                uint32_t headerPtr,
+                                uintptr_t a0,
+                                uintptr_t a1,
+                                uintptr_t a2);
 
 typedef void (*Log_buf_fxn)(const Log_Module *handle,
                            uint32_t header,
@@ -1147,10 +1165,10 @@ typedef void (*Log_buf_fxn)(const Log_Module *handle,
 struct Log_Module {
     void                 *sinkConfig;       /*!< Pointer to the selected sink implementation and sink configuration */
     const Log_printf_fxn  printf;           /*!< Pointer to printf implementation with 4 to 8 arguments*/
-    const Log_printfN_fxn printf0;          /*!< Pointer to printf implementation with 0 arguments */
-    const Log_printfN_fxn printf1;          /*!< Pointer to printf implementation with 1 arguments */
-    const Log_printfN_fxn printf2;          /*!< Pointer to printf implementation with 2 arguments */
-    const Log_printfN_fxn printf3;          /*!< Pointer to printf implementation with 3 arguments */
+    const Log_printf0_fxn printf0;          /*!< Pointer to printf implementation with 0 arguments */
+    const Log_printf1_fxn printf1;          /*!< Pointer to printf implementation with 1 arguments */
+    const Log_printf2_fxn printf2;          /*!< Pointer to printf implementation with 2 arguments */
+    const Log_printf3_fxn printf3;          /*!< Pointer to printf implementation with 3 arguments */
     const Log_buf_fxn     buf;              /*!< Pointer to buf implementation */
     uint32_t              levels;           /*!< Log levels bitmap */
     uint32_t* const       dynamicLevelsPtr; /*!< Pointer to a new volatile levels bitmap */

@@ -178,13 +178,25 @@ extern void LogSinkTraceLPF3_printfSingleton(const Log_Module *handle,
                                              uint32_t numArgs,
                                              ...);
 
-extern void LogSinkTraceLPF3_printfSingleton0(const Log_Module *handle, uint32_t header, uint32_t headerPtr, ...);
+extern void LogSinkTraceLPF3_printfSingleton0(const Log_Module *handle, uint32_t header, uint32_t headerPtr);
 
-extern void LogSinkTraceLPF3_printfSingleton1(const Log_Module *handle, uint32_t header, uint32_t headerPtr, ...);
+extern void LogSinkTraceLPF3_printfSingleton1(const Log_Module *handle,
+                                              uint32_t header,
+                                              uint32_t headerPtr,
+                                              uintptr_t a0);
 
-extern void LogSinkTraceLPF3_printfSingleton2(const Log_Module *handle, uint32_t header, uint32_t headerPtr, ...);
+extern void LogSinkTraceLPF3_printfSingleton2(const Log_Module *handle,
+                                              uint32_t header,
+                                              uint32_t headerPtr,
+                                              uintptr_t a0,
+                                              uintptr_t a1);
 
-extern void LogSinkTraceLPF3_printfSingleton3(const Log_Module *handle, uint32_t header, uint32_t headerPtr, ...);
+extern void LogSinkTraceLPF3_printfSingleton3(const Log_Module *handle,
+                                              uint32_t header,
+                                              uint32_t headerPtr,
+                                              uintptr_t a0,
+                                              uintptr_t a1,
+                                              uintptr_t a2);
 
 extern void LogSinkTraceLPF3_init(void);
 /*!

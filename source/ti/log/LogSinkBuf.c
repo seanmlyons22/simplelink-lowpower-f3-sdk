@@ -290,52 +290,50 @@ void LogSinkBuf_printfDepInjection(const Log_Module *handle, uint32_t header, ui
     va_end(argptr);
 }
 
+/* The fixed-argument-count delegates below are non-variadic (matching the
+ * per-arity Log_printfN_fxn typedefs) so their prologue does not spill the
+ * argument registers the way a variadic function must. They forward to the
+ * variadic implementation with an ordinary call. Routing the record building
+ * through the single variadic core keeps only one copy of the marshalling code
+ * in the image rather than a second non-variadic core that the always-linked
+ * generic wrapper would also have to feed.
+ */
+
 /*
  *  ======== LogSinkBuf_printfDepInjection0 ========
  */
-void LogSinkBuf_printfDepInjection0(const Log_Module *handle, uint32_t header, uint32_t index, ...)
+void LogSinkBuf_printfDepInjection0(const Log_Module *handle, uint32_t header, uint32_t index)
 {
-    va_list argptr;
-
-    va_start(argptr, index);
-    LogSinkBuf_printf((LogSinkBuf_Handle)handle->sinkConfig, header, index, 0, argptr);
-    va_end(argptr);
+    LogSinkBuf_printfDepInjection(handle, header, index, 0);
 }
 
 /*
  *  ======== LogSinkBuf_printfDepInjection1 ========
  */
-void LogSinkBuf_printfDepInjection1(const Log_Module *handle, uint32_t header, uint32_t index, ...)
+void LogSinkBuf_printfDepInjection1(const Log_Module *handle, uint32_t header, uint32_t index, uintptr_t a0)
 {
-    va_list argptr;
-
-    va_start(argptr, index);
-    LogSinkBuf_printf((LogSinkBuf_Handle)handle->sinkConfig, header, index, 1, argptr);
-    va_end(argptr);
+    LogSinkBuf_printfDepInjection(handle, header, index, 1, a0);
 }
 
 /*
  *  ======== LogSinkBuf_printfDepInjection2 ========
  */
-void LogSinkBuf_printfDepInjection2(const Log_Module *handle, uint32_t header, uint32_t index, ...)
+void LogSinkBuf_printfDepInjection2(const Log_Module *handle, uint32_t header, uint32_t index, uintptr_t a0, uintptr_t a1)
 {
-    va_list argptr;
-
-    va_start(argptr, index);
-    LogSinkBuf_printf((LogSinkBuf_Handle)handle->sinkConfig, header, index, 2, argptr);
-    va_end(argptr);
+    LogSinkBuf_printfDepInjection(handle, header, index, 2, a0, a1);
 }
 
 /*
  *  ======== LogSinkBuf_printfDepInjection3 ========
  */
-void LogSinkBuf_printfDepInjection3(const Log_Module *handle, uint32_t header, uint32_t index, ...)
+void LogSinkBuf_printfDepInjection3(const Log_Module *handle,
+                                    uint32_t header,
+                                    uint32_t index,
+                                    uintptr_t a0,
+                                    uintptr_t a1,
+                                    uintptr_t a2)
 {
-    va_list argptr;
-
-    va_start(argptr, index);
-    LogSinkBuf_printf((LogSinkBuf_Handle)handle->sinkConfig, header, index, 3, argptr);
-    va_end(argptr);
+    LogSinkBuf_printfDepInjection(handle, header, index, 3, a0, a1, a2);
 }
 
 /*
@@ -374,49 +372,38 @@ void LogSinkBuf_printfSingleton(const Log_Module *handle, uint32_t header, uint3
 /*
  *  ======== LogSinkBuf_printfSingleton0 ========
  */
-void LogSinkBuf_printfSingleton0(const Log_Module *handle, uint32_t header, uint32_t index, ...)
+void LogSinkBuf_printfSingleton0(const Log_Module *handle, uint32_t header, uint32_t index)
 {
-    va_list argptr;
-
-    va_start(argptr, index);
-    LogSinkBuf_printf(&LogSinkBuf_CONFIG_ti_log_LogSinkBuf_0_config, header, index, 0, argptr);
-    va_end(argptr);
+    LogSinkBuf_printfSingleton(handle, header, index, 0);
 }
 
 /*
  *  ======== LogSinkBuf_printfSingleton1 ========
  */
-void LogSinkBuf_printfSingleton1(const Log_Module *handle, uint32_t header, uint32_t index, ...)
+void LogSinkBuf_printfSingleton1(const Log_Module *handle, uint32_t header, uint32_t index, uintptr_t a0)
 {
-    va_list argptr;
-
-    va_start(argptr, index);
-    LogSinkBuf_printf(&LogSinkBuf_CONFIG_ti_log_LogSinkBuf_0_config, header, index, 1, argptr);
-    va_end(argptr);
+    LogSinkBuf_printfSingleton(handle, header, index, 1, a0);
 }
 
 /*
  *  ======== LogSinkBuf_printfSingleton2 ========
  */
-void LogSinkBuf_printfSingleton2(const Log_Module *handle, uint32_t header, uint32_t index, ...)
+void LogSinkBuf_printfSingleton2(const Log_Module *handle, uint32_t header, uint32_t index, uintptr_t a0, uintptr_t a1)
 {
-    va_list argptr;
-
-    va_start(argptr, index);
-    LogSinkBuf_printf(&LogSinkBuf_CONFIG_ti_log_LogSinkBuf_0_config, header, index, 2, argptr);
-    va_end(argptr);
+    LogSinkBuf_printfSingleton(handle, header, index, 2, a0, a1);
 }
 
 /*
  *  ======== LogSinkBuf_printfSingleton3 ========
  */
-void LogSinkBuf_printfSingleton3(const Log_Module *handle, uint32_t header, uint32_t index, ...)
+void LogSinkBuf_printfSingleton3(const Log_Module *handle,
+                                 uint32_t header,
+                                 uint32_t index,
+                                 uintptr_t a0,
+                                 uintptr_t a1,
+                                 uintptr_t a2)
 {
-    va_list argptr;
-
-    va_start(argptr, index);
-    LogSinkBuf_printf(&LogSinkBuf_CONFIG_ti_log_LogSinkBuf_0_config, header, index, 3, argptr);
-    va_end(argptr);
+    LogSinkBuf_printfSingleton(handle, header, index, 3, a0, a1, a2);
 }
 
 /*
