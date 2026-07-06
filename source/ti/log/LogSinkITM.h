@@ -56,8 +56,8 @@
  *  @endcode
  *
  *  This module implements two functions that are required by the Log API:
- *   - printf(const Log_Module *handle, uint32_t header, uint32_t headerPtr, uint32_t numArgs, ...);
- *   - buf(const Log_Module *handle, uint32_t header, uint32_t headerPtr, uint8_t *data, size_t size);
+ *   - printf(const Log_Module *handle, uint32_t headerPtr, uint32_t numArgs, ...);
+ *   - buf(const Log_Module *handle, uint32_t headerPtr, uint8_t *data, size_t size);
  *
  *  Whenever a log-statement is invoked, that uses LogSinkITM as its sink, the functions above are ultimately invoked.
  *
@@ -183,7 +183,6 @@ extern void LogSinkITM_finalize(void);
  *
  *  @param[in]  handle     Unused handle
  *
- *  @param[in]  header     Unused metadata pointer
  *
  *  @param[in]  headerPtr  Pointer to metadata pointer
  *
@@ -194,23 +193,20 @@ extern void LogSinkITM_finalize(void);
  *  @endcond
  */
 extern void LogSinkITM_printfSingleton(const Log_Module *handle,
-                                       uint32_t header,
                                        uint32_t headerPtr,
                                        uint32_t numArgs,
                                        ...);
 
-extern void LogSinkITM_printfSingleton0(const Log_Module *handle, uint32_t header, uint32_t headerPtr);
+extern void LogSinkITM_printfSingleton0(const Log_Module *handle, uint32_t headerPtr);
 
-extern void LogSinkITM_printfSingleton1(const Log_Module *handle, uint32_t header, uint32_t headerPtr, uintptr_t a0);
+extern void LogSinkITM_printfSingleton1(const Log_Module *handle, uint32_t headerPtr, uintptr_t a0);
 
 extern void LogSinkITM_printfSingleton2(const Log_Module *handle,
-                                        uint32_t header,
                                         uint32_t headerPtr,
                                         uintptr_t a0,
                                         uintptr_t a1);
 
 extern void LogSinkITM_printfSingleton3(const Log_Module *handle,
-                                        uint32_t header,
                                         uint32_t headerPtr,
                                         uintptr_t a0,
                                         uintptr_t a1,
@@ -234,7 +230,6 @@ extern void LogSinkITM_printfSingleton3(const Log_Module *handle,
  *
  *  @param[in]  handle     Unused handle
  *
- *  @param[in]  header     Unused metadata pointer
  *
  *  @param[in]  headerPtr  Pointer to metadata pointer
  *
@@ -245,7 +240,6 @@ extern void LogSinkITM_printfSingleton3(const Log_Module *handle,
  *  @endcond
  */
 extern void LogSinkITM_bufSingleton(const Log_Module *handle,
-                                    uint32_t header,
                                     uint32_t headerPtr,
                                     uint8_t *data,
                                     size_t size);

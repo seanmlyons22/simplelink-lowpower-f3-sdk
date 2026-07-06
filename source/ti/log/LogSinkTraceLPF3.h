@@ -57,12 +57,12 @@
  *  @endcode
  *
  *  This module implements one function that is required by the Log API:
- *   - printf(const Log_Module *handle, uint32_t header, uint32_t headerPtr, uint32_t numArgs, ...);
+ *   - printf(const Log_Module *handle, uint32_t headerPtr, uint32_t numArgs, ...);
  *
  *  Whenever a log-statement is invoked, that uses LogSinkTraceLPF3 as its sink, the function above is ultimately
  *  invoked.
  *
- *  Note: buf(const Log_Module *handle, uint32_t header, uint32_t headerPtr, uint8_t *data, size_t size) is not
+ *  Note: buf(const Log_Module *handle, uint32_t headerPtr, uint8_t *data, size_t size) is not
  *  implemented due to hardware limitations with this sink.
  *
  *  @anchor ti_log_LogSinkTraceLPF3_Overview
@@ -162,7 +162,6 @@ extern const LogSinkTraceLPF3_Config LogSinkTraceLPF3_config;
  *
  *  @param[in]  handle     Unused handle
  *
- *  @param[in]  header     Unused metadata pointer
  *
  *  @param[in]  headerPtr  Pointer to metadata pointer
  *
@@ -173,26 +172,22 @@ extern const LogSinkTraceLPF3_Config LogSinkTraceLPF3_config;
  *  @endcond
  */
 extern void LogSinkTraceLPF3_printfSingleton(const Log_Module *handle,
-                                             uint32_t header,
                                              uint32_t headerPtr,
                                              uint32_t numArgs,
                                              ...);
 
-extern void LogSinkTraceLPF3_printfSingleton0(const Log_Module *handle, uint32_t header, uint32_t headerPtr);
+extern void LogSinkTraceLPF3_printfSingleton0(const Log_Module *handle, uint32_t headerPtr);
 
 extern void LogSinkTraceLPF3_printfSingleton1(const Log_Module *handle,
-                                              uint32_t header,
                                               uint32_t headerPtr,
                                               uintptr_t a0);
 
 extern void LogSinkTraceLPF3_printfSingleton2(const Log_Module *handle,
-                                              uint32_t header,
                                               uint32_t headerPtr,
                                               uintptr_t a0,
                                               uintptr_t a1);
 
 extern void LogSinkTraceLPF3_printfSingleton3(const Log_Module *handle,
-                                              uint32_t header,
                                               uint32_t headerPtr,
                                               uintptr_t a0,
                                               uintptr_t a1,
@@ -218,7 +213,6 @@ extern void LogSinkTraceLPF3_init(void);
  *
  *  @param[in]  handle     Unused handle
  *
- *  @param[in]  header     Unused metadata pointer
  *
  *  @param[in]  headerPtr  Pointer to metadata pointer
  *
@@ -229,7 +223,6 @@ extern void LogSinkTraceLPF3_init(void);
  *  @endcond
  */
 extern void LogSinkTraceLPF3_bufSingleton(const Log_Module *handle,
-                                          uint32_t header,
                                           uint32_t headerPtr,
                                           uint8_t *data,
                                           size_t size);

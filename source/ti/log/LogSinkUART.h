@@ -49,9 +49,9 @@
  *  @endcode
  *
  *  This module implements two functions that are required by the Log API:
- *   - printf(const Log_Module *handle, uint32_t header, uint32_t headerPtr,
+ *   - printf(const Log_Module *handle, uint32_t headerPtr,
  *     uint32_t numArgs, ...);
- *   - buf(const Log_Module *handle, uint32_t header, uint32_t headerPtr,
+ *   - buf(const Log_Module *handle, uint32_t headerPtr,
  *     uint8_t *data, size_t size);
  *
  *  Whenever a log statement that uses LogSinkUART as its sink is called, the
@@ -490,7 +490,6 @@ extern void LogSinkUART_finalize(uint_least8_t index);
  *
  *  @param[in]  handle     LogSinkUART sink handle
  *
- *  @param[in]  header     Metadata pointer
  *
  *  @param[in]  headerPtr  Pointer to metadata pointer
  *
@@ -499,23 +498,20 @@ extern void LogSinkUART_finalize(uint_least8_t index);
  *  @param[in]  ...        Variable amount of arguments
  */
 extern void LogSinkUART_printfSingleton(const Log_Module *handle,
-                                        uint32_t header,
                                         uint32_t headerPtr,
                                         uint32_t numArgs,
                                         ...);
 
-extern void LogSinkUART_printfSingleton0(const Log_Module *handle, uint32_t header, uint32_t headerPtr);
+extern void LogSinkUART_printfSingleton0(const Log_Module *handle, uint32_t headerPtr);
 
-extern void LogSinkUART_printfSingleton1(const Log_Module *handle, uint32_t header, uint32_t headerPtr, uintptr_t a0);
+extern void LogSinkUART_printfSingleton1(const Log_Module *handle, uint32_t headerPtr, uintptr_t a0);
 
 extern void LogSinkUART_printfSingleton2(const Log_Module *handle,
-                                         uint32_t header,
                                          uint32_t headerPtr,
                                          uintptr_t a0,
                                          uintptr_t a1);
 
 extern void LogSinkUART_printfSingleton3(const Log_Module *handle,
-                                         uint32_t header,
                                          uint32_t headerPtr,
                                          uintptr_t a0,
                                          uintptr_t a1,
@@ -540,7 +536,6 @@ extern void LogSinkUART_printfSingleton3(const Log_Module *handle,
  *
  *  @param[in]  handle     LogSinkUART sink handle
  *
- *  @param[in]  header     Metadata pointer
  *
  *  @param[in]  headerPtr  Pointer to metadata pointer
  *
@@ -549,26 +544,22 @@ extern void LogSinkUART_printfSingleton3(const Log_Module *handle,
  *  @param[in]  ...        Variable amount of arguments
  */
 extern void LogSinkUART_printfDepInjection(const Log_Module *handle,
-                                           uint32_t header,
                                            uint32_t headerPtr,
                                            uint32_t numArgs,
                                            ...);
 
-extern void LogSinkUART_printfDepInjection0(const Log_Module *handle, uint32_t header, uint32_t headerPtr);
+extern void LogSinkUART_printfDepInjection0(const Log_Module *handle, uint32_t headerPtr);
 
 extern void LogSinkUART_printfDepInjection1(const Log_Module *handle,
-                                            uint32_t header,
                                             uint32_t headerPtr,
                                             uintptr_t a0);
 
 extern void LogSinkUART_printfDepInjection2(const Log_Module *handle,
-                                            uint32_t header,
                                             uint32_t headerPtr,
                                             uintptr_t a0,
                                             uintptr_t a1);
 
 extern void LogSinkUART_printfDepInjection3(const Log_Module *handle,
-                                            uint32_t header,
                                             uint32_t headerPtr,
                                             uintptr_t a0,
                                             uintptr_t a1,
@@ -592,7 +583,6 @@ extern void LogSinkUART_printfDepInjection3(const Log_Module *handle,
  *
  *  @param[in]  handle     LogSinkUART sink handle
  *
- *  @param[in]  header     Unused metadata pointer
  *
  *  @param[in]  headerPtr  Pointer to metadata pointer
  *
@@ -601,7 +591,6 @@ extern void LogSinkUART_printfDepInjection3(const Log_Module *handle,
  *  @param[in]  size       Size in bytes of array to store
  */
 extern void LogSinkUART_bufDepInjection(const Log_Module *handle,
-                                        uint32_t header,
                                         uint32_t headerPtr,
                                         uint8_t *data,
                                         size_t size);

@@ -167,7 +167,7 @@ static void LogSinkBuf_cobsFinish(LogSinkBuf_Cobs *c)
 /*
  *  ======== LogSinkBuf_printf ========
  */
-void LogSinkBuf_printf(LogSinkBuf_Handle inst, uint32_t header, uint32_t index, uint32_t numArgs, va_list argptr)
+void LogSinkBuf_printf(LogSinkBuf_Handle inst, uint32_t index, uint32_t numArgs, va_list argptr)
 {
     uintptr_t       key;
     uint32_t        now, delta, off, frameLen, i, argLen;
@@ -179,7 +179,6 @@ void LogSinkBuf_printf(LogSinkBuf_Handle inst, uint32_t header, uint32_t index, 
     va_list         argCount;
     LogSinkBuf_Cobs cobs;
 
-    (void)header;
 
     if (numArgs > LogSinkBuf_MAX_ARGS)
     {
@@ -265,7 +264,7 @@ void LogSinkBuf_printf(LogSinkBuf_Handle inst, uint32_t header, uint32_t index, 
  *  The implementation will read out the LogSinkBuf_Instance address at runtime
  *  from the handle argument.
  */
-void LogSinkBuf_printfDepInjection(const Log_Module *handle, uint32_t header, uint32_t index, uint32_t numArgs, ...)
+void LogSinkBuf_printfDepInjection(const Log_Module *handle, uint32_t index, uint32_t numArgs, ...)
 {
     va_list argptr;
 
@@ -285,7 +284,7 @@ void LogSinkBuf_printfDepInjection(const Log_Module *handle, uint32_t header, ui
      */
     va_start(argptr, numArgs);
 
-    LogSinkBuf_printf(inst, header, index, numArgs, argptr);
+    LogSinkBuf_printf(inst, index, numArgs, argptr);
 
     va_end(argptr);
 }
@@ -302,38 +301,37 @@ void LogSinkBuf_printfDepInjection(const Log_Module *handle, uint32_t header, ui
 /*
  *  ======== LogSinkBuf_printfDepInjection0 ========
  */
-void LogSinkBuf_printfDepInjection0(const Log_Module *handle, uint32_t header, uint32_t index)
+void LogSinkBuf_printfDepInjection0(const Log_Module *handle, uint32_t index)
 {
-    LogSinkBuf_printfDepInjection(handle, header, index, 0);
+    LogSinkBuf_printfDepInjection(handle, index, 0);
 }
 
 /*
  *  ======== LogSinkBuf_printfDepInjection1 ========
  */
-void LogSinkBuf_printfDepInjection1(const Log_Module *handle, uint32_t header, uint32_t index, uintptr_t a0)
+void LogSinkBuf_printfDepInjection1(const Log_Module *handle, uint32_t index, uintptr_t a0)
 {
-    LogSinkBuf_printfDepInjection(handle, header, index, 1, a0);
+    LogSinkBuf_printfDepInjection(handle, index, 1, a0);
 }
 
 /*
  *  ======== LogSinkBuf_printfDepInjection2 ========
  */
-void LogSinkBuf_printfDepInjection2(const Log_Module *handle, uint32_t header, uint32_t index, uintptr_t a0, uintptr_t a1)
+void LogSinkBuf_printfDepInjection2(const Log_Module *handle, uint32_t index, uintptr_t a0, uintptr_t a1)
 {
-    LogSinkBuf_printfDepInjection(handle, header, index, 2, a0, a1);
+    LogSinkBuf_printfDepInjection(handle, index, 2, a0, a1);
 }
 
 /*
  *  ======== LogSinkBuf_printfDepInjection3 ========
  */
 void LogSinkBuf_printfDepInjection3(const Log_Module *handle,
-                                    uint32_t header,
                                     uint32_t index,
                                     uintptr_t a0,
                                     uintptr_t a1,
                                     uintptr_t a2)
 {
-    LogSinkBuf_printfDepInjection(handle, header, index, 3, a0, a1, a2);
+    LogSinkBuf_printfDepInjection(handle, index, 3, a0, a1, a2);
 }
 
 /*
@@ -348,7 +346,7 @@ void LogSinkBuf_printfDepInjection3(const Log_Module *handle,
  *  LogSinkBuf instance may be used and it will be assigned the
  *  LogsinkBuf_Instance name LogSinkBuf_CONFIG_ti_log_LogSinkBuf_0_config
  */
-void LogSinkBuf_printfSingleton(const Log_Module *handle, uint32_t header, uint32_t index, uint32_t numArgs, ...)
+void LogSinkBuf_printfSingleton(const Log_Module *handle, uint32_t index, uint32_t numArgs, ...)
 {
     va_list argptr;
 
@@ -365,51 +363,50 @@ void LogSinkBuf_printfSingleton(const Log_Module *handle, uint32_t header, uint3
      * stack. That value will still be valid when passed on further.
      */
     va_start(argptr, numArgs);
-    LogSinkBuf_printf(&LogSinkBuf_CONFIG_ti_log_LogSinkBuf_0_config, header, index, numArgs, argptr);
+    LogSinkBuf_printf(&LogSinkBuf_CONFIG_ti_log_LogSinkBuf_0_config, index, numArgs, argptr);
     va_end(argptr);
 }
 
 /*
  *  ======== LogSinkBuf_printfSingleton0 ========
  */
-void LogSinkBuf_printfSingleton0(const Log_Module *handle, uint32_t header, uint32_t index)
+void LogSinkBuf_printfSingleton0(const Log_Module *handle, uint32_t index)
 {
-    LogSinkBuf_printfSingleton(handle, header, index, 0);
+    LogSinkBuf_printfSingleton(handle, index, 0);
 }
 
 /*
  *  ======== LogSinkBuf_printfSingleton1 ========
  */
-void LogSinkBuf_printfSingleton1(const Log_Module *handle, uint32_t header, uint32_t index, uintptr_t a0)
+void LogSinkBuf_printfSingleton1(const Log_Module *handle, uint32_t index, uintptr_t a0)
 {
-    LogSinkBuf_printfSingleton(handle, header, index, 1, a0);
+    LogSinkBuf_printfSingleton(handle, index, 1, a0);
 }
 
 /*
  *  ======== LogSinkBuf_printfSingleton2 ========
  */
-void LogSinkBuf_printfSingleton2(const Log_Module *handle, uint32_t header, uint32_t index, uintptr_t a0, uintptr_t a1)
+void LogSinkBuf_printfSingleton2(const Log_Module *handle, uint32_t index, uintptr_t a0, uintptr_t a1)
 {
-    LogSinkBuf_printfSingleton(handle, header, index, 2, a0, a1);
+    LogSinkBuf_printfSingleton(handle, index, 2, a0, a1);
 }
 
 /*
  *  ======== LogSinkBuf_printfSingleton3 ========
  */
 void LogSinkBuf_printfSingleton3(const Log_Module *handle,
-                                 uint32_t header,
                                  uint32_t index,
                                  uintptr_t a0,
                                  uintptr_t a1,
                                  uintptr_t a2)
 {
-    LogSinkBuf_printfSingleton(handle, header, index, 3, a0, a1, a2);
+    LogSinkBuf_printfSingleton(handle, index, 3, a0, a1, a2);
 }
 
 /*
  *  ======== LogSinkBuf_bufDepInjection ========
  */
-void LogSinkBuf_bufDepInjection(const Log_Module *handle, uint32_t header, uint32_t index, uint8_t *data, size_t size)
+void LogSinkBuf_bufDepInjection(const Log_Module *handle, uint32_t index, uint8_t *data, size_t size)
 {
     uintptr_t       key;
     uint32_t        now, delta, off, payloadLen, worst;
@@ -418,7 +415,6 @@ void LogSinkBuf_bufDepInjection(const Log_Module *handle, uint32_t header, uint3
     uint32_t        hdrLen = 0;
     LogSinkBuf_Cobs cobs;
 
-    (void)header;
 
     if (handle == NULL)
     {

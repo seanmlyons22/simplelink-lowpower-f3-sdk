@@ -772,7 +772,6 @@ supported compiler."
                                             format,                                                     \
                                             0);                                                         \
                 LogMod_ ## module.buf(&LogMod_ ## module,                                               \
-                        (uint32_t)&_Log_CONCAT2(LogSymbol, __LINE__),                                   \
                         (uint32_t)&_Log_CONCAT3(Ptr, LogSymbol, __LINE__),                              \
                         data,                                                                           \
                         size);                                                                          \
@@ -812,18 +811,15 @@ supported compiler."
  */
 #define _Log_printf__arg1(module, level, fmt, a0)                              \
     module.printf1(&module,                                                    \
-                   (uint32_t)&_Log_CONCAT2(LogSymbol, __LINE__),               \
                    (uint32_t)&_Log_CONCAT3(Ptr, LogSymbol, __LINE__),          \
                    (uintptr_t)a0)
 #define _Log_printf__arg2(module, level, fmt, a0, a1)                          \
     module.printf2(&module,                                                    \
-                   (uint32_t)&_Log_CONCAT2(LogSymbol, __LINE__),               \
                    (uint32_t)&_Log_CONCAT3(Ptr, LogSymbol, __LINE__),          \
                    (uintptr_t)a0,                                              \
                    (uintptr_t)a1)
 #define _Log_printf__arg3(module, level, fmt, a0, a1, a2)                      \
     module.printf3(&module,                                                    \
-                   (uint32_t)&_Log_CONCAT2(LogSymbol, __LINE__),               \
                    (uint32_t)&_Log_CONCAT3(Ptr, LogSymbol, __LINE__),          \
                    (uintptr_t)a0,                                              \
                    (uintptr_t)a1,                                              \
@@ -866,14 +862,12 @@ supported compiler."
 
 #define _Log_printf__arg(module, level, ...)                                   \
     module.printf(&module,                                                     \
-                  (uint32_t)&_Log_CONCAT2(LogSymbol, __LINE__),                \
                   (uint32_t)&_Log_CONCAT3(Ptr, LogSymbol, __LINE__),           \
                   _Log_NUMARGS(__VA_ARGS__),                                   \
                   _Log_CDR_ARG(__VA_ARGS__))
 
 #define _Log_printf__noarg(module, level, ...)                                 \
     module.printf0(&module,                                                    \
-                   (uint32_t)&_Log_CONCAT2(LogSymbol, __LINE__),               \
                    (uint32_t)&_Log_CONCAT3(Ptr, LogSymbol, __LINE__))
 
 /* Empty Log_printf macro to use when a log module is not enabled in the
@@ -1123,7 +1117,6 @@ typedef enum Log_Level {
 typedef const struct Log_Module Log_Module;
 
 typedef void (*Log_printf_fxn)(const Log_Module *handle,
-                              uint32_t header,
                               uint32_t headerPtr,
                               uint32_t numArgs,
                               ...);
@@ -1134,25 +1127,22 @@ typedef void (*Log_printf_fxn)(const Log_Module *handle,
  * sink even though the Log.h call sites always pass a fixed number of
  * arguments.
  */
-typedef void (*Log_printf0_fxn)(const Log_Module *handle, uint32_t header, uint32_t headerPtr);
+typedef void (*Log_printf0_fxn)(const Log_Module *handle, uint32_t headerPtr);
 
-typedef void (*Log_printf1_fxn)(const Log_Module *handle, uint32_t header, uint32_t headerPtr, uintptr_t a0);
+typedef void (*Log_printf1_fxn)(const Log_Module *handle, uint32_t headerPtr, uintptr_t a0);
 
 typedef void (*Log_printf2_fxn)(const Log_Module *handle,
-                                uint32_t header,
                                 uint32_t headerPtr,
                                 uintptr_t a0,
                                 uintptr_t a1);
 
 typedef void (*Log_printf3_fxn)(const Log_Module *handle,
-                                uint32_t header,
                                 uint32_t headerPtr,
                                 uintptr_t a0,
                                 uintptr_t a1,
                                 uintptr_t a2);
 
 typedef void (*Log_buf_fxn)(const Log_Module *handle,
-                           uint32_t header,
                            uint32_t headerPtr,
                            uint8_t *data,
                            size_t size);

@@ -261,7 +261,7 @@ void LogSinkUART_printf(LogSinkUART_Config *config, uint32_t headerPtr, uint32_t
 /*
  *  ======== LogSinkUART_printfSingleton ========
  */
-void LogSinkUART_printfSingleton(const Log_Module *handle, uint32_t header, uint32_t headerPtr, uint32_t numArgs, ...)
+void LogSinkUART_printfSingleton(const Log_Module *handle, uint32_t headerPtr, uint32_t numArgs, ...)
 {
     va_list argptr;
 
@@ -295,49 +295,46 @@ void LogSinkUART_printfSingleton(const Log_Module *handle, uint32_t header, uint
 /*
  *  ======== LogSinkUART_printfSingleton0 ========
  */
-void LogSinkUART_printfSingleton0(const Log_Module *handle, uint32_t header, uint32_t headerPtr)
+void LogSinkUART_printfSingleton0(const Log_Module *handle, uint32_t headerPtr)
 {
-    LogSinkUART_printfSingleton(handle, header, headerPtr, 0);
+    LogSinkUART_printfSingleton(handle, headerPtr, 0);
 }
 
 /*
  *  ======== LogSinkUART_printfSingleton1 ========
  */
-void LogSinkUART_printfSingleton1(const Log_Module *handle, uint32_t header, uint32_t headerPtr, uintptr_t a0)
+void LogSinkUART_printfSingleton1(const Log_Module *handle, uint32_t headerPtr, uintptr_t a0)
 {
-    LogSinkUART_printfSingleton(handle, header, headerPtr, 1, a0);
+    LogSinkUART_printfSingleton(handle, headerPtr, 1, a0);
 }
 
 /*
  *  ======== LogSinkUART_printfSingleton2 ========
  */
 void LogSinkUART_printfSingleton2(const Log_Module *handle,
-                                  uint32_t header,
                                   uint32_t headerPtr,
                                   uintptr_t a0,
                                   uintptr_t a1)
 {
-    LogSinkUART_printfSingleton(handle, header, headerPtr, 2, a0, a1);
+    LogSinkUART_printfSingleton(handle, headerPtr, 2, a0, a1);
 }
 
 /*
  *  ======== LogSinkUART_printfSingleton3 ========
  */
 void LogSinkUART_printfSingleton3(const Log_Module *handle,
-                                  uint32_t header,
                                   uint32_t headerPtr,
                                   uintptr_t a0,
                                   uintptr_t a1,
                                   uintptr_t a2)
 {
-    LogSinkUART_printfSingleton(handle, header, headerPtr, 3, a0, a1, a2);
+    LogSinkUART_printfSingleton(handle, headerPtr, 3, a0, a1, a2);
 }
 
 /*
  *  ======== LogSinkUART_printfDepInjection ========
  */
 void LogSinkUART_printfDepInjection(const Log_Module *handle,
-                                    uint32_t header,
                                     uint32_t headerPtr,
                                     uint32_t numArgs,
                                     ...)
@@ -366,49 +363,46 @@ void LogSinkUART_printfDepInjection(const Log_Module *handle,
 /*
  *  ======== LogSinkUART_printfDepInjection0 ========
  */
-void LogSinkUART_printfDepInjection0(const Log_Module *handle, uint32_t header, uint32_t headerPtr)
+void LogSinkUART_printfDepInjection0(const Log_Module *handle, uint32_t headerPtr)
 {
-    LogSinkUART_printfDepInjection(handle, header, headerPtr, 0);
+    LogSinkUART_printfDepInjection(handle, headerPtr, 0);
 }
 
 /*
  *  ======== LogSinkUART_printfDepInjection1 ========
  */
-void LogSinkUART_printfDepInjection1(const Log_Module *handle, uint32_t header, uint32_t headerPtr, uintptr_t a0)
+void LogSinkUART_printfDepInjection1(const Log_Module *handle, uint32_t headerPtr, uintptr_t a0)
 {
-    LogSinkUART_printfDepInjection(handle, header, headerPtr, 1, a0);
+    LogSinkUART_printfDepInjection(handle, headerPtr, 1, a0);
 }
 
 /*
  *  ======== LogSinkUART_printfDepInjection2 ========
  */
 void LogSinkUART_printfDepInjection2(const Log_Module *handle,
-                                     uint32_t header,
                                      uint32_t headerPtr,
                                      uintptr_t a0,
                                      uintptr_t a1)
 {
-    LogSinkUART_printfDepInjection(handle, header, headerPtr, 2, a0, a1);
+    LogSinkUART_printfDepInjection(handle, headerPtr, 2, a0, a1);
 }
 
 /*
  *  ======== LogSinkUART_printfDepInjection3 ========
  */
 void LogSinkUART_printfDepInjection3(const Log_Module *handle,
-                                     uint32_t header,
                                      uint32_t headerPtr,
                                      uintptr_t a0,
                                      uintptr_t a1,
                                      uintptr_t a2)
 {
-    LogSinkUART_printfDepInjection(handle, header, headerPtr, 3, a0, a1, a2);
+    LogSinkUART_printfDepInjection(handle, headerPtr, 3, a0, a1, a2);
 }
 
 /*
  *  ======== LogSinkUART_bufDepInjection ========
  */
 void LogSinkUART_bufDepInjection(const Log_Module *handle,
-                                 uint32_t header,
                                  uint32_t headerPtr,
                                  uint8_t *data,
                                  size_t size)

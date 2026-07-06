@@ -185,7 +185,6 @@ static void LogSinkTraceLPF3_send(uint32_t headerPtr, uint32_t numArgs, uint32_t
  *  ======== LogSinkTraceLPF3_printf ========
  */
 void LogSinkTraceLPF3_printf(const Log_Module *handle,
-                             uint32_t header,
                              uint32_t headerPtr,
                              uint32_t numArgs,
                              va_list argptr)
@@ -237,7 +236,7 @@ void LogSinkTraceLPF3_printf(const Log_Module *handle,
 /*
  *  ======== LogSinkTraceLPF3_printfSingleton0 ========
  */
-void LogSinkTraceLPF3_printfSingleton0(const Log_Module *handle, uint32_t header, uint32_t headerPtr)
+void LogSinkTraceLPF3_printfSingleton0(const Log_Module *handle, uint32_t headerPtr)
 {
     LogSinkTraceLPF3_send(headerPtr, 0, 0, 0);
 }
@@ -245,7 +244,7 @@ void LogSinkTraceLPF3_printfSingleton0(const Log_Module *handle, uint32_t header
 /*
  *  ======== LogSinkTraceLPF3_printfSingleton1 ========
  */
-void LogSinkTraceLPF3_printfSingleton1(const Log_Module *handle, uint32_t header, uint32_t headerPtr, uintptr_t a0)
+void LogSinkTraceLPF3_printfSingleton1(const Log_Module *handle, uint32_t headerPtr, uintptr_t a0)
 {
     LogSinkTraceLPF3_send(headerPtr, 1, a0, 0);
 }
@@ -254,7 +253,6 @@ void LogSinkTraceLPF3_printfSingleton1(const Log_Module *handle, uint32_t header
  *  ======== LogSinkTraceLPF3_printfSingleton2 ========
  */
 void LogSinkTraceLPF3_printfSingleton2(const Log_Module *handle,
-                                       uint32_t header,
                                        uint32_t headerPtr,
                                        uintptr_t a0,
                                        uintptr_t a1)
@@ -266,7 +264,6 @@ void LogSinkTraceLPF3_printfSingleton2(const Log_Module *handle,
  *  ======== LogSinkTraceLPF3_printfSingleton3 ========
  */
 void LogSinkTraceLPF3_printfSingleton3(const Log_Module *handle,
-                                       uint32_t header,
                                        uint32_t headerPtr,
                                        uintptr_t a0,
                                        uintptr_t a1,
@@ -280,7 +277,6 @@ void LogSinkTraceLPF3_printfSingleton3(const Log_Module *handle,
  *  ======== LogSinkTraceLPF3_printfSingleton ========
  */
 void LogSinkTraceLPF3_printfSingleton(const Log_Module *handle,
-                                      uint32_t header,
                                       uint32_t headerPtr,
                                       uint32_t numArgs,
                                       ...)
@@ -288,7 +284,7 @@ void LogSinkTraceLPF3_printfSingleton(const Log_Module *handle,
     va_list argptr;
 
     va_start(argptr, numArgs);
-    LogSinkTraceLPF3_printf(handle, header, headerPtr, numArgs, argptr);
+    LogSinkTraceLPF3_printf(handle, headerPtr, numArgs, argptr);
     va_end(argptr);
 }
 
@@ -296,7 +292,6 @@ void LogSinkTraceLPF3_printfSingleton(const Log_Module *handle,
  *  ======== LogSinkTraceLPF3_bufSingleton ========
  */
 void LogSinkTraceLPF3_bufSingleton(const Log_Module *handle,
-                                   uint32_t header,
                                    uint32_t headerPtr,
                                    uint8_t *data,
                                    size_t size)

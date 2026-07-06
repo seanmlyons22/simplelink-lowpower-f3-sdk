@@ -114,7 +114,6 @@ typedef LogSinkBuf_Instance *LogSinkBuf_Handle;
  *
  *  @param[in]  handle     Unused handle
  *
- *  @param[in]  header     Metadata pointer
  *
  *  @param[in]  headerPtr  Unused pointer to metadata pointer
  *
@@ -123,23 +122,20 @@ typedef LogSinkBuf_Instance *LogSinkBuf_Handle;
  *  @param[in]  ...        Variable number of arguments
  */
 extern void LogSinkBuf_printfSingleton(const Log_Module *handle,
-                                       uint32_t header,
                                        uint32_t index,
                                        uint32_t numArgs,
                                        ...);
 
-extern void LogSinkBuf_printfSingleton0(const Log_Module *handle, uint32_t header, uint32_t index);
+extern void LogSinkBuf_printfSingleton0(const Log_Module *handle, uint32_t index);
 
-extern void LogSinkBuf_printfSingleton1(const Log_Module *handle, uint32_t header, uint32_t index, uintptr_t a0);
+extern void LogSinkBuf_printfSingleton1(const Log_Module *handle, uint32_t index, uintptr_t a0);
 
 extern void LogSinkBuf_printfSingleton2(const Log_Module *handle,
-                                        uint32_t header,
                                         uint32_t index,
                                         uintptr_t a0,
                                         uintptr_t a1);
 
 extern void LogSinkBuf_printfSingleton3(const Log_Module *handle,
-                                        uint32_t header,
                                         uint32_t index,
                                         uintptr_t a0,
                                         uintptr_t a1,
@@ -164,7 +160,6 @@ extern void LogSinkBuf_printfSingleton3(const Log_Module *handle,
  *
  *  @param[in]  handle     Handle to the module and sink instance
  *
- *  @param[in]  header     Metadata pointer
  *
  *  @param[in]  headerPtr  Unused pointer to metadata pointer
  *
@@ -173,23 +168,20 @@ extern void LogSinkBuf_printfSingleton3(const Log_Module *handle,
  *  @param[in]  ...        Variable number of arguments
  */
 extern void LogSinkBuf_printfDepInjection(const Log_Module *handle,
-                                          uint32_t header,
                                           uint32_t index,
                                           uint32_t numArgs,
                                           ...);
 
-extern void LogSinkBuf_printfDepInjection0(const Log_Module *handle, uint32_t header, uint32_t index);
+extern void LogSinkBuf_printfDepInjection0(const Log_Module *handle, uint32_t index);
 
-extern void LogSinkBuf_printfDepInjection1(const Log_Module *handle, uint32_t header, uint32_t index, uintptr_t a0);
+extern void LogSinkBuf_printfDepInjection1(const Log_Module *handle, uint32_t index, uintptr_t a0);
 
 extern void LogSinkBuf_printfDepInjection2(const Log_Module *handle,
-                                           uint32_t header,
                                            uint32_t index,
                                            uintptr_t a0,
                                            uintptr_t a1);
 
 extern void LogSinkBuf_printfDepInjection3(const Log_Module *handle,
-                                           uint32_t header,
                                            uint32_t index,
                                            uintptr_t a0,
                                            uintptr_t a1,
@@ -213,7 +205,6 @@ extern void LogSinkBuf_printfDepInjection3(const Log_Module *handle,
  *
  *  @param[in]  handle     LogSinkBuf sink handle
  *
- *  @param[in]  header     Metadata pointer
  *
  *  @param[in]  headerPtr  Unused pointer to metadata pointer
  *
@@ -222,7 +213,6 @@ extern void LogSinkBuf_printfDepInjection3(const Log_Module *handle,
  *  @param[in]  size       Size in bytes of array to store
  */
 extern void LogSinkBuf_bufDepInjection(const Log_Module *handle,
-                                       uint32_t header,
                                        uint32_t index,
                                        uint8_t *data,
                                        size_t size);
