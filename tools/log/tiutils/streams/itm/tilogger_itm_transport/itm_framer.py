@@ -56,6 +56,13 @@ HDR_OVERFLOW = 0x70
 MAX_ITM_FRAME_SIZE = 5
 ITM_RESET_TOKEN = bytes([0xFB, 0xBB, 0xBB, 0xBB, 0xBB])
 
+# Late-attach alignment marker: a real ITM synchronization packet is >= 47 zero
+# bits ended by a one, i.e. a run of zero bytes then 0x80. Requiring several zero
+# bytes keeps a zero-valued argument in the data from looking like a sync when a
+# host attaches to an already-running target (which never sent the boot reset
+# token). Needs the device to emit sync packets (ITM_enableSyncPackets).
+ITM_SYNC_MIN_ZEROS = 5
+
 
 class ITMStimulusPort(Enum):
     """ITM ports for software packets"""
@@ -355,10 +362,13 @@ class ITMFramer:
         q: Output queue; anything with a put(frame) method.
     """
 
-    def __init__(self, output_queue):
+    def __init__(self, output_queue, late_attach=False):
         self._output_queue = output_queue
         self.last_ts_counter = 0
         self._first_read = True
+        # When True, sync on the next ITM sync packet if the boot reset token was
+        # missed (attaching to an already-running target).
+        self._late_attach = late_attach
 
     def parse(self, buf: bytearray) -> bytearray:
         """
@@ -389,6 +399,20 @@ class ITMFramer:
         # rather than misparsing the token head as frames.
         elif (self._first_read and buf[-1] == 0xBB) or buf[-1] == 0xFB:
             return buf
+        elif self._first_read and self._late_attach:
+            # No boot reset token (attached to an already-running target). Align on
+            # the next ITM sync packet - a run of >= ITM_SYNC_MIN_ZEROS zero bytes,
+            # whose zeros + 0x80 the loop's sync handler then consumes.
+            sync_at = buf.find(b"\x00" * ITM_SYNC_MIN_ZEROS)
+            if sync_at < 0:
+                # No marker yet: keep a short tail so a run split across reads still
+                # matches next time, drop the rest.
+                tail = ITM_SYNC_MIN_ZEROS - 1
+                if len(buf) > tail:
+                    del buf[: len(buf) - tail]
+                return buf
+            if sync_at:
+                del buf[:sync_at]
         elif self._first_read:
             logger.debug("Waiting for a reset frame to begin parsing.")
             return bytearray()

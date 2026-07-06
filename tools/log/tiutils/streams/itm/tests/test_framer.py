@@ -226,6 +226,46 @@ def test_sync_split_across_reads():
     assert [f.opcode for f in sink] == [ITMOpcode.SOURCE_SW, ITMOpcode.SYNCHRONIZATION, ITMOpcode.PACKET_PC]
 
 
+def test_late_attach_aligns_on_sync_without_reset():
+    """Attaching to an already-running target (the boot reset token is long
+    gone): late_attach byte-aligns on the next sync packet, then decodes."""
+    sink = ListSink()
+    framer = ITMFramer(sink, late_attach=True)
+    # Arrive mid-frame: leading garbage, no reset token, then a real sync.
+    stream = b"\x37\x99\xab" + synth.sync_packet(47, terminator=0x80)
+    stream += synth.pc_sample(0xCAFE) + b"\xff" * 5
+    framer.parse(bytearray(stream))
+    pcs = [f for f in sink if f.opcode == ITMOpcode.PACKET_PC]
+    assert pcs and pcs[0].value == 0xCAFE
+
+
+def test_late_attach_off_still_requires_reset_token():
+    """Default (late_attach=False): a sync packet alone is not enough. Without
+    the boot reset token nothing decodes, preserving reset-detection."""
+    sink = ListSink()
+    framer = ITMFramer(sink)
+    stream = b"\x37\x99\xab" + synth.sync_packet(47, terminator=0x80)
+    stream += synth.pc_sample(0xCAFE) + b"\xff" * 5
+    framer.parse(bytearray(stream))
+    assert sink == []
+
+
+@pytest.mark.parametrize("chunk_size", [1, 3, 8])
+def test_late_attach_sync_split_across_reads(chunk_size):
+    """The zero-run marker split across reads still aligns: the short tail is
+    carried so a run spanning a read boundary is not missed."""
+    sink = ListSink()
+    framer = ITMFramer(sink, late_attach=True)
+    stream = b"\x37\x99" + synth.sync_packet(47, terminator=0x80)
+    stream += synth.pc_sample(0xBEEF) + b"\xff" * 5
+    leftover = bytearray()
+    for i in range(0, len(stream), chunk_size):
+        leftover.extend(stream[i : i + chunk_size])
+        leftover = framer.parse(leftover)
+    pcs = [f for f in sink if f.opcode == ITMOpcode.PACKET_PC]
+    assert pcs and pcs[0].value == 0xBEEF
+
+
 def test_reserved_hw_discriminators_skip_payload():
     """Discriminators 3..7 and 24..31 are reserved in v7-M and v8-M; the
     encoded payload length must still be honored so the stream stays in sync."""

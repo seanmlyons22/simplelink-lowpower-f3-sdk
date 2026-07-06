@@ -63,7 +63,8 @@ class _FrameSink(list):
 
 
 class ITM_Transport(TransportABC):
-    def __init__(self, port: str, baudrate: int, trace_db: TraceDB, alias: str, pcsample: Optional[Path] = None):
+    def __init__(self, port: str, baudrate: int, trace_db: TraceDB, alias: str,
+                 pcsample: Optional[Path] = None, late_attach: bool = False):
         super().__init__()
 
         self._com_port = port
@@ -71,6 +72,7 @@ class ITM_Transport(TransportABC):
         self._trace_db = trace_db
         self._alias = alias
         self._pcsample = pcsample
+        self._late_attach = late_attach
         self._packetiser: Optional[ITMPacketiser] = None
         self._profile_written = False
         self.serial: Optional[SerialRx] = None
@@ -102,7 +104,7 @@ class ITM_Transport(TransportABC):
         atexit.register(self.serial.close)
 
         frames = _FrameSink()
-        framer = ITMFramer(frames)
+        framer = ITMFramer(frames, late_attach=self._late_attach)
 
         # Note we use "Logger == None" as our 'ITM only mode' flag
         if logger:
@@ -155,6 +157,13 @@ def transport_factory_cli(app: typer.Typer):
             help="Write a speedscope profile of DWT PC samples to this file on "
             "exit and open the interactive viewer in the default browser",
         ),
+        late_attach: bool = typer.Option(
+            False,
+            "--late-attach",
+            help="Attach to an already-running target: byte-align on the next ITM "
+            "sync packet instead of waiting for the boot reset token. Requires the "
+            "device to emit sync packets (ITM_enableSyncPackets).",
+        ),
     ):
         """Add ITM transport as input to log.
 
@@ -182,7 +191,7 @@ def transport_factory_cli(app: typer.Typer):
             sys.exit(1)
 
         db = TraceDB(elves, repickle=False)
-        itm_transport = ITM_Transport(port, baudrate, db, alias or port, pcsample=pcsample)
+        itm_transport = ITM_Transport(port, baudrate, db, alias or port, pcsample=pcsample, late_attach=late_attach)
         return itm_transport
 
 

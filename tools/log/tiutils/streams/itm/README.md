@@ -43,6 +43,26 @@ tilogger --elf app.out itm PORT 12000000 to-replayfile --file cap.json
 tilogger from-replayfile cap.json stdout
 ```
 
+### Attaching to an already-running target (`--late-attach`)
+
+The boot reset frame is sent once, so an attach after boot normally sees
+nothing until you reset the board. `--late-attach` instead byte-aligns on the
+next ITM synchronization packet (a run of zero bytes ended by `0x80`), so no
+reset is needed:
+
+```
+tilogger --elf app.out itm --late-attach PORT 12000000 stdout
+```
+
+This needs the device to emit sync packets: call
+`ITM_enableSyncPackets(ITM_SYNC_TAP_BIT24)` on the target. The tap is off
+CYCCNT, which only advances while the core is awake, so a mostly-sleeping app
+(e.g. a BLE peripheral between advertising events) emits them rarely and
+late-attach can take a long time or stall. On such targets a one-shot board
+reset (which re-sends the boot frame the framer also aligns on) is the reliable
+path. A busy/torture target emits sync packets promptly and late-attach is
+immediate.
+
 DWT hardware events (PC samples, exception entry/exit/return, watchpoints,
 counter wraps) and ITM overflow warnings show up next to the `Log_*` records
 as module `DWT`/`ITM`, symbolized from the `--elf` file, on the same clock.
