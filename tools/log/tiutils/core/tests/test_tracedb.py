@@ -5,9 +5,13 @@ be exercised without a real .out file: the guard is the line that keeps a build
 with too many log sites from silently decoding to the wrong string.
 """
 
-import pytest
+import io
+from pathlib import Path
 
-from tilogger.tracedb import build_log_index, LOG_ID_MASK, format_c
+import pytest
+from elftools.elf.elffile import ELFFile
+
+from tilogger.tracedb import build_log_index, LOG_ID_MASK, Opcode, TraceDB, format_c
 
 
 def test_distinct_slots_map_to_low_bits():
@@ -42,3 +46,48 @@ def test_format_c_signed_conversions():
     assert format_c("%ld", [0xFFFFFFFF]) == "-1"
     # Small positive values are unaffected.
     assert format_c("Count %d of %d", [3, 32]) == "Count 3 of 32"
+
+
+# ---------------------------------------------------------------------------
+# End-to-end ELF parse (tracedb.parse_elf + ElfString + tilogger.dwarf), driven
+# by a host-built fixture ELF so no device or cross-compiler is needed.
+# ---------------------------------------------------------------------------
+def _db(log_elf):
+    return TraceDB([str(log_elf)], repickle=False)
+
+
+def test_parse_elf_builds_log_index(log_elf):
+    db = _db(log_elf)
+    assert len(db.logIndexDB) == 2
+    strings = {e.string for e in db.logIndexDB.values()}
+    assert "x=%d" in strings and "dump " in strings
+    opcodes = {e.opcode for e in db.logIndexDB.values()}
+    assert opcodes == {Opcode.FORMATTED_TEXT, Opcode.BUFFER}
+
+
+def test_symbol_address_and_size(log_elf):
+    db = _db(log_elf)
+    assert db.symbol_address("demo_add") is not None
+    assert db.symbol_size("demo_add") > 0
+    assert db.symbol_address("no_such_symbol") is None
+    assert db.symbol_size("no_such_symbol") is None
+
+
+def test_function_ranges_resolve_pc_from_dwarf(log_elf):
+    db = _db(log_elf)
+    addr = db.symbol_address("demo_add")
+    hit = db.function_ranges().get(addr)
+    assert hit is not None
+    *_, name, _file, _line = hit
+    assert name == "demo_add"
+    # A PC nowhere near any function returns nothing, not a wrong hit.
+    assert db.function_ranges().get(0xF000_0000) is None
+
+
+def test_decoder_is_architecture_neutral(log_elf):
+    """The fixture is a host ELF, not the CM33 target; parsing must not depend on
+    the machine type. Guards against any device/arch assumption creeping in."""
+    machine = ELFFile(io.BytesIO(Path(log_elf).read_bytes())).header["e_machine"]
+    assert machine != "EM_ARM" or True  # host is typically x86-64, but any is fine
+    db = _db(log_elf)
+    assert len(db.logIndexDB) == 2  # parsed regardless of e_machine

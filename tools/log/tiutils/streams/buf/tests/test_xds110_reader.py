@@ -122,3 +122,88 @@ def test_setup_csw_reads_and_forces_transfer_bits():
     reader = Xds110Reader(link=FakeLink([_dap_response([0x00000000, probe_csw])]))
     reader._setup_csw()
     assert reader._csw == 0x23000052  # 0x40 kept, | 32-bit(0x2) | addrinc(0x10)
+
+
+# ---------------------------------------------------------------------------
+# Session bring-up and teardown (no pre-set _connected)
+# ---------------------------------------------------------------------------
+def _cmd_ok(result=b""):
+    """A command response with error 0 and an optional result payload."""
+    return _frame(struct.pack("<i", 0) + result)
+
+
+# XDS_CONNECT, XDS_VERSION (recent firmware), SWD_CONNECT, CMAPI_CONNECT, CMAPI_ACQUIRE.
+_CONNECT_SEQ = [
+    _cmd_ok(),
+    _cmd_ok(struct.pack("<I", 0x02030011)),
+    _cmd_ok(),
+    _cmd_ok(),
+    _cmd_ok(),
+]
+
+
+def test_connect_brings_up_session_then_reads():
+    word = 0x12345678
+    reader = Xds110Reader(link=FakeLink(_CONNECT_SEQ + [_dap_response([0x00000000, word])]))
+    assert not reader._connected
+    assert reader.read(0x20000000, 4) == struct.pack("<I", word)  # lazily connects
+    assert reader._connected
+
+
+def test_connect_rejects_old_firmware():
+    reader = Xds110Reader(link=FakeLink([_cmd_ok(), _cmd_ok(struct.pack("<I", 0x02030010))]))
+    with pytest.raises(Xds110Error, match="firmware"):
+        reader.read(0x20000000, 4)
+
+
+def test_command_error_raises():
+    reader = Xds110Reader(link=FakeLink([_frame(struct.pack("<i", -5))]))  # XDS_CONNECT fails
+    with pytest.raises(Xds110Error):
+        reader.read(0x20000000, 4)
+
+
+def test_close_after_connect_sends_teardown_and_frees_link():
+    # close() best-effort executes four teardown commands then frees the link.
+    reader = _reader([_cmd_ok(), _cmd_ok(), _cmd_ok(), _cmd_ok()])
+    reader.close()
+    assert reader._connected is False
+    assert reader._link is None
+
+
+def test_close_without_link_is_noop():
+    Xds110Reader(link=None).close()  # nothing claimed, must not raise
+
+
+def test_swd_fault_clears_sticky_then_retries():
+    word = 0x0BADF00D
+    reader = _reader([
+        _dap_response([], error=-614),      # SWD FAULT
+        _cmd_ok(),                          # _clear_sticky's ABORT write
+        _dap_response([0x00000000, word]),  # retry succeeds
+    ])
+    assert reader.read(0x20000000, 4) == struct.pack("<I", word)
+
+
+# ---------------------------------------------------------------------------
+# _UsbLink bulk wrapper over an injected device
+# ---------------------------------------------------------------------------
+class FakeDev:
+    def __init__(self):
+        self.written = []
+
+    def write(self, ep, data, timeout):
+        self.written.append((ep, bytes(data), timeout))
+
+    def read(self, ep, size, timeout):
+        return b"\x01\x02\x03"
+
+
+def test_usblink_write_read_close():
+    from tilogger_buf_transport.xds110_reader import _UsbLink
+
+    dev = FakeDev()
+    link = _UsbLink(dev, interface=0, ep_in=0x81, ep_out=0x02)
+    link.write(b"hi")
+    assert dev.written[0][0] == 0x02 and dev.written[0][1] == b"hi"
+    assert link.read(3, 100) == b"\x01\x02\x03"
+    link.close()  # release/dispose on a non-usb object is swallowed, must not raise
