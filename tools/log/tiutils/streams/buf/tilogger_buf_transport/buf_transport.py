@@ -365,6 +365,12 @@ def transport_factory_cli(app: typer.Typer):
             help="Live read backend: 'pyocd' (CMSIS-DAP, robust default) or 'xds110' "
             "(native XDS110 protocol, higher throughput; opt-in)",
         ),
+        csw: Optional[str] = typer.Option(
+            None,
+            help="xds110 backend only: AHB-AP CSW value (hex) for the target's mem-AP. "
+            "Default suits the Cortex-M AHB-AP on CC23xx/CC27xx; override for a "
+            "different mem-AP. The pyocd backend derives this itself.",
+        ),
         alias: Optional[str] = typer.Option(None, help="Alias for this device in the log"),
     ):
         """Add LogSinkBuf transport as input to log.
@@ -397,7 +403,7 @@ def transport_factory_cli(app: typer.Typer):
             # (vs CMSIS-DAP's ~14), so it clears the pyOCD read ceiling. Opt-in.
             from .xds110_reader import Xds110Reader
 
-            reader = Xds110Reader(serial=probe)
+            reader = Xds110Reader(serial=probe, csw=int(csw, 0) if csw else None)
             one_shot = False
         else:
             reader = PyocdReader(

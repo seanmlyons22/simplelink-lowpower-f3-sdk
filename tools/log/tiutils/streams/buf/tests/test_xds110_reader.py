@@ -124,6 +124,14 @@ def test_setup_csw_reads_and_forces_transfer_bits():
     assert reader._csw == 0x23000052  # 0x40 kept, | 32-bit(0x2) | addrinc(0x10)
 
 
+def test_csw_override_lets_a_different_mem_ap_be_targeted():
+    """A caller can force a CSW for a mem-AP unlike the CC23xx/CC27xx default,
+    so the native backend is not pinned to one device family."""
+    reader = Xds110Reader(link=FakeLink([]), csw=0xA5A50052)
+    reader._setup_csw()
+    assert reader._csw == 0xA5A50052
+
+
 # ---------------------------------------------------------------------------
 # Session bring-up and teardown (no pre-set _connected)
 # ---------------------------------------------------------------------------
