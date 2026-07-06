@@ -407,3 +407,22 @@ fn stream_decode_crosses_chunk_boundaries() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- raw file reader + symbol-DB helpers ----
+
+#[test]
+fn read_raw_reads_a_file_and_empty_db_reports_empty() {
+    use rftrace_decode::sample::read_raw;
+    use rftrace_decode::types::DbgIdDb;
+
+    let path = std::env::temp_dir().join("rftrace_read_raw_test.bin");
+    let bytes = [0u8, 1, 2, 3, 250, 251, 255];
+    std::fs::write(&path, bytes).unwrap();
+    assert_eq!(read_raw(path.to_str().unwrap()).unwrap(), bytes);
+    let _ = std::fs::remove_file(&path);
+
+    // is_empty pairs with len() on the symbol DB.
+    let db = DbgIdDb::default();
+    assert!(db.is_empty());
+    assert_eq!(db.len(), 0);
+}
