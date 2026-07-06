@@ -1,61 +1,64 @@
-# Host tooling test coverage (buf + itm)
+# Host tooling test coverage (buf + itm + core)
 
 Measured with `pytest-cov` over the offline suites (`core/tests`,
 `streams/itm/tests`, `streams/buf/tests`). HIL/bench tests stay skipped while
 their env vars are unset, so these numbers are pure host-decode coverage with
-no board attached.
+no board attached. Every substantive module is above 70%.
 
-Reproduce (per package gives stable per-file numbers; a single combined run
-mis-attributes a couple of transport modules to 0% due to a pytest-cov
-multi-root quirk):
+## Reproduce
+
+Per-package runs give the authoritative per-file numbers:
 
 ```
 cd tools/log/tiutils
+.venv/bin/python -m pytest core/tests   --cov=tilogger              --cov-report=term-missing
 .venv/bin/python -m pytest streams/itm/tests --cov=tilogger_itm_transport --cov-report=term-missing
 .venv/bin/python -m pytest streams/buf/tests --cov=tilogger_buf_transport --cov-report=term-missing
-.venv/bin/python -m pytest core/tests streams/itm/tests streams/buf/tests --cov=core/tilogger --cov-report=term-missing
 ```
 
-Two throughput tests (`test_rate_spike_sustained_3mbps`,
-`test_decode_faster_than_the_wire`) fail *only* under coverage: the tracer
-throttles the parser below the asserted MB/s. They pass clean without `--cov`.
-Deselect them when collecting coverage.
+`logger.py`'s dobby-format path is covered from the buf suite, so run all three
+together (`--cov=tilogger`) to see its full number.
 
-## Numbers
+Caveats when collecting coverage:
+- Two throughput tests (`test_rate_spike_sustained_3mbps`,
+  `test_decode_faster_than_the_wire`) fail *only* under the tracer, which
+  throttles the parser below the asserted MB/s. Deselect them.
+- A single combined run under-reports `itm_transport.py` and `serial_rx.py`
+  because the pty integration test exercises them on a background thread and
+  coverage of threads is timing-dependent across a large multi-root session.
+  Their per-suite numbers (75% / 85%) are the real ones.
+- `__main__.py` `python -m` entry shims are omitted in `.coveragerc`: they are
+  argparse glue over already-tested library code, exercised end-to-end.
 
-Decode / parse hot paths are well covered; the gaps are hardware I/O and CLI
-glue that need a real board, a real ELF, or an interactive run.
+## Numbers (per-suite)
 
-| Module | Stmts | Cov | What is not covered |
-|--------|------:|----:|---------------------|
-| `itm_framer.py`        | 305 | 92% | multi-byte extension packet, a few reserved-header branches |
-| `itm_to_log.py`        | 281 | 94% | DWT-event corner cases, some str() variants |
-| `pcsample.py`          |  44 |100% | - |
-| `serial_rx.py`         |  54 | 85% | live-serial open/close error paths |
-| `itm_transport.py`     | 102 | 65% | CLI callback + profile-write (needs a run) |
-| `core/interface.py`    |  66 | 95% | - |
-| `core/bufdecode.py`    | 188 | 90% | malformed-COBS / truncated-record branches |
-| `core/helpers.py`      |   6 |100% | - |
-| `buf_transport.py`     | 185 | 73% | CLI `main()` + live-stream loop (lines 310-408) |
-| `xds110_reader.py`     | 216 | 63% | native USB DAP protocol (needs the probe) |
-| `memory.py` (buf)      |  63 | 40% | PyocdReader live path (needs the probe) |
-| `core/tracedb.py`      | 266 | 32% | ELF/DWARF symbol DB load (needs a real .out) |
-| `core/dwarf.py`        | 145 | 32% | DWARF parse (needs a real .out) |
-| `core/logger.py`       | 109 | 45% | top-level orchestration / output routing |
-| `__main__.py` (all)    |   - |  0% | module entry points |
+| Module | Stmts | Cov |
+|--------|------:|----:|
+| core/tilogger/bufdecode.py     | 188 | 93% |
+| core/tilogger/tracedb.py       | 263 | 88% |
+| core/tilogger/dwarf.py         | 145 | 88% |
+| core/tilogger/interface.py     |  66 | 95% |
+| core/tilogger/logger.py        | 107 | 72% |
+| core/tilogger/helpers.py       |   6 |100% |
+| itm/itm_framer.py              | 305 | 98% |
+| itm/itm_to_log.py              | 281 | 94% |
+| itm/itm_transport.py           | 102 | 75% |
+| itm/pcsample.py                |  44 |100% |
+| itm/serial_rx.py               |  54 | 85% |
+| buf/buf_transport.py           | 185 | 73% |
+| buf/xds110_reader.py           | 216 | 84% |
+| buf/memory.py                  |  61 | 72% |
 
-Package totals: ITM 89%, BUF transport 61%.
+## How the hard-to-reach code is covered
 
-## Where coverage is intentionally low
-
-- **Probe / USB code** (`xds110_reader.py`, `memory.py` PyocdReader): exercised
-  only by the HIL suites against real hardware, not offline.
-- **Symbol database** (`tracedb.py`, `dwarf.py`): needs a real `.out`; covered
-  when a HIL/e2e run loads one.
-- **CLI entry glue** (`__main__.py`, transport callbacks, `buf_transport.main`):
-  covered by end-to-end invocation, not unit tests.
-
-The pure-logic parsers - the code most likely to break silently on bad wire
-data - sit at 90%+. Remaining logic gaps (framer extension packets, bufdecode
-truncation handling, xds110 TAR-wrap arithmetic) are the targets for the stress
-tests, which do not need a board.
+- **ELF symbol DB + DWARF** (`tracedb.py`, `dwarf.py`): a tiny ELF is built at
+  test time with the host `cc` (`.log_data`/`.log_ptr` sections plus DWARF), so
+  `parse_elf`, `ElfString`, and the DWARF helpers run with no device or
+  cross-compiler. The fixture is a host-arch ELF, which also proves the decoder
+  is architecture-neutral - it keys on sections/symbols/DWARF, never `e_machine`.
+- **Probe readers** (`memory.py` PyocdReader, `xds110_reader.py`): a fake pyOCD
+  target and a `FakeLink` inject the transport layer, so word-align/trim, lazy
+  connect, session bring-up/teardown, and SWD-fault retry run without a probe.
+- **Remaining gaps** are the live-run tails: `buf_transport` stream loop and
+  `itm_transport.start()` need a probe / serial port and are exercised by the
+  HIL suites, and `_open_usb` needs a real XDS110.

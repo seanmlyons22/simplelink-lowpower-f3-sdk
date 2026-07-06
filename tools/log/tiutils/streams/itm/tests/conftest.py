@@ -4,6 +4,8 @@ packetiser drivers, so every test runs offline on constructed bytes."""
 from __future__ import annotations
 
 import logging
+import shutil
+import subprocess
 from typing import List
 
 import pytest
@@ -133,3 +135,36 @@ def db() -> FakeTraceDB:
     tdb.add_fmt(0x9000_0200, "Boot complete", 0, level="Log_WARNING", line="77")
     tdb.add_buf(0x9000_0300, "buffer: ")
     return tdb
+
+
+# A tiny host-arch ELF with .log_data/.log_ptr sections, so the CLI callback can
+# build a real TraceDB without a device .out. Architecture-neutral: TraceDB reads
+# sections/symbols, never the machine type. Skips where no cc is available.
+_LOGSEC_S = r"""
+	.section .log_data,"a",@progbits
+LogSymbol_x:
+	.asciz "LOG_OPCODE_FORMATED_TEXT\036file.c\03642\036Log_DEBUG\036LogMod_App\036x=%d\0361"
+	.size LogSymbol_x, .-LogSymbol_x
+	.section .log_ptr,"a",@progbits
+Ptr_LogSymbol_x:
+	.long LogSymbol_x
+	.size Ptr_LogSymbol_x, 4
+"""
+
+
+@pytest.fixture(scope="session")
+def log_elf(tmp_path_factory):
+    cc = shutil.which("cc") or shutil.which("gcc")
+    if cc is None:
+        pytest.skip("no C toolchain to build the log ELF fixture")
+    d = tmp_path_factory.mktemp("logelf")
+    (d / "logsec.s").write_text(_LOGSEC_S)
+    elf = d / "fixture.elf"
+    try:
+        subprocess.run([cc, "-c", str(d / "logsec.s"), "-o", str(d / "logsec.o")],
+                       check=True, capture_output=True)
+        subprocess.run([cc, "-nostdlib", "-no-pie", "-Wl,--entry=0", str(d / "logsec.o"), "-o", str(elf)],
+                       check=True, capture_output=True)
+    except (subprocess.CalledProcessError, OSError) as exc:
+        pytest.skip("log ELF fixture build failed: %s" % exc)
+    return elf
