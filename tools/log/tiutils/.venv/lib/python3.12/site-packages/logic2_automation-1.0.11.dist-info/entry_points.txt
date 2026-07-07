@@ -1,0 +1,2 @@
+[console_scripts]
+build-protobufs = build_protobufs:main

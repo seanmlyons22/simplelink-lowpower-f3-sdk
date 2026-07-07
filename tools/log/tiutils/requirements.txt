@@ -5,3 +5,11 @@ streams/wireshark/
 streams/stdout/
 streams/to_replayfile/
 streams/from_replayfile/
+# RF-core (LRFDTRC) trace transport. The [logic2] extra pulls logic2-automation
+# for the Saleae Logic Pro `--logic2` live path; drop it if you only use
+# --sal/--sigrok/--raw. Needs the `tracedecode` binary on PATH — see
+# tools/rftrace-decode (`cargo install --path .`).
+streams/rftrace/[logic2]
+# LogSinkBuf RAM-ring transport. The [probe] extra pulls pyOCD for the live
+# SWD path; drop it if you only decode RAM dumps (--dump).
+streams/buf/[probe,xds110]

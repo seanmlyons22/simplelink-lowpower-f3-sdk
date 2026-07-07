@@ -38,6 +38,7 @@ import json
 import enum
 import struct
 import io
+import re
 
 from pathlib import Path
 from typing import Dict, Optional, List
@@ -54,6 +55,64 @@ import threading
 logger = logging.getLogger("TraceDB")
 
 TRACE_SECTION_NAMES = [".log_data", ".log_ptr"]
+
+# Sinks transmit only the low LOG_ID_BITS of a .log_ptr slot address to name a
+# log site. The host recovers the full slot, and thus the format string, from
+# the .out file, so the target never needs to know the section base address.
+LOG_ID_BITS = 16
+LOG_ID_MASK = (1 << LOG_ID_BITS) - 1
+# Width of the id on the wire and at the head of a LogPacket's data.
+LOG_ID_SIZE = LOG_ID_BITS // 8
+
+# Bumped when the pickled database layout changes so stale caches rebuild even
+# though the .out file (and thus its hash) is unchanged.
+PICKLE_VERSION = "v2"
+
+
+# Matches one printf conversion, skipping any flags/width/precision/length
+# between '%' and the conversion character. Group 1 is the conversion char.
+_C_CONV = re.compile(r"%[-+ #0]*[0-9*]*(?:\.[0-9*]*)?(?:hh|ll|[hljztL])?([diouxXeEfFgGaAcsp%])")
+
+
+def format_c(fmt, args):
+    """Apply a C printf format string to the target's promoted 32-bit args.
+
+    Each arg arrives as a raw 32-bit word, so a negative %d value comes across as
+    its unsigned two's complement (e.g. -38 -> 0xFFFFFFDA). Python's % would print
+    that as 4294967258, so reinterpret %d/%i args as int32 to match C and print -38.
+    """
+    specs = [m.group(1) for m in _C_CONV.finditer(fmt) if m.group(1) != "%"]
+    out = list(args)
+    for i, spec in enumerate(specs):
+        if i < len(out) and spec in ("d", "i") and 0x80000000 <= out[i] <= 0xFFFFFFFF:
+            out[i] -= 0x100000000
+    return fmt % tuple(out)
+
+
+def build_log_index(slots):
+    """Map the low bits of each .log_ptr slot address to its ElfString.
+
+    The mapping is unique only while .log_ptr fits inside a single 64 kB window
+    (~16382 sites). Past that, two slots share the same low bits and a decoded
+    id would be ambiguous, so refuse to build rather than return an aliased log.
+
+    slots: iterable of (slot_address, ElfString).
+    """
+    index = {}
+    owner = {}
+    for slot_addr, elf_string in slots:
+        key = slot_addr & LOG_ID_MASK
+        prev = owner.get(key)
+        if prev is not None and prev != slot_addr:
+            raise ValueError(
+                "Log site id collision: .log_ptr slots 0x%08x and 0x%08x share the "
+                "low %d bits (0x%04x). This build has more log sites than a %d-bit id "
+                "can name (~%d sites). Reduce the number of enabled logs."
+                % (prev, slot_addr, LOG_ID_BITS, key, LOG_ID_BITS, LOG_ID_MASK // 4)
+            )
+        owner[key] = slot_addr
+        index[key] = elf_string
+    return index
 
 
 class Opcode(enum.Enum):
@@ -129,9 +188,12 @@ class TraceDB:
         self.device = ""
         self._traceDB = {}
         self._eventDB = {}
+        self._logIndexDB = {}
         self.timestamp_fmt_32 = b""
         self.timestamp_fmt_64 = b""
         self.stringpointers = {}
+        self._function_ranges = None
+        self._symbols = None
 
         self.changed_event = threading.Event()
         self.change_handler = ElfWatcherHandler(self.elves, self.changed_event)
@@ -151,6 +213,7 @@ class TraceDB:
         # Clear existing info
         self._traceDB = {}
         self._eventDB = {}
+        self._logIndexDB = {}
         self.timestamp_fmt_32 = b""
         self.timestamp_fmt_64 = b""
         self.stringpointers = {}
@@ -163,10 +226,11 @@ class TraceDB:
             except FileNotFoundError as e:
                 logger.error("Not able to open elf file " + elf.as_uri())
                 raise e
-        current_hash = hasher.hexdigest()
+        current_hash = f"{hasher.hexdigest()}.{PICKLE_VERSION}"
 
         trace_db_pickle_file = (self.user_data_dir / f"{current_hash}.trace_db.pkl").resolve()
         event_db_pickle_file = (self.user_data_dir / f"{current_hash}.event_db.pkl").resolve()
+        log_index_pickle_file = (self.user_data_dir / f"{current_hash}.log_index.pkl").resolve()
         timestamp_fmt_32_pickle_file = (self.user_data_dir / f"{current_hash}.timestamp_fmt_32.pkl").resolve()
         timestamp_fmt_64_pickle_file = (self.user_data_dir / f"{current_hash}.timestamp_fmt_64.pkl").resolve()
 
@@ -185,6 +249,10 @@ class TraceDB:
                 self._eventDB = pickle.loads(event_db_pickle_file.read_bytes())
                 for elfstring in self._eventDB:
                     self._eventDB[elfstring].trace_db = self
+
+                self._logIndexDB = pickle.loads(log_index_pickle_file.read_bytes())
+                for log_id in self._logIndexDB:
+                    self._logIndexDB[log_id].trace_db = self
 
                 self.timestamp_fmt_32 = pickle.loads(timestamp_fmt_32_pickle_file.read_bytes())
                 self.timestamp_fmt_64 = pickle.loads(timestamp_fmt_64_pickle_file.read_bytes())
@@ -205,6 +273,9 @@ class TraceDB:
             # Pickle event database
             with open(event_db_pickle_file, "wb") as f:
                 pickle.dump(self._eventDB, f)
+            # Pickle log-id index
+            with open(log_index_pickle_file, "wb") as f:
+                pickle.dump(self._logIndexDB, f)
             # Pickle timestamp format 32 information
             with open(timestamp_fmt_32_pickle_file, "wb") as f:
                 pickle.dump(self.timestamp_fmt_32, f)
@@ -227,6 +298,62 @@ class TraceDB:
             self.changed_event.clear()
             self.init_db()
         return self._eventDB
+
+    @property
+    def logIndexDB(self):
+        """Maps a 16-bit sink log id (low bits of a .log_ptr slot) to its ElfString."""
+        if self.changed_event.wait(0):
+            self.changed_event.clear()
+            self.init_db()
+        return self._logIndexDB
+
+    def function_ranges(self):
+        """PC -> (CU, DIE, function, file, line) lookup built from the DWARF
+        info of the loaded ELF files (tilogger.dwarf.get_all_functions_range).
+
+        Built once on first use and cached: iterating the DWARF of a full
+        application image takes seconds, while PC samples arrive at kHz
+        rates. Not pickled; DIE objects do not survive pickling.
+        """
+        if self._function_ranges is None:
+            from tilogger.dwarf import get_all_functions_range
+
+            infos = []
+            for elfpath in self.elves:
+                elf = ELFFile(io.BytesIO(elfpath.read_bytes()))
+                if elf.has_dwarf_info():
+                    infos.append(elf.get_dwarf_info())
+            self._function_ranges = get_all_functions_range(infos)
+        return self._function_ranges
+
+    def _symbol_table(self):
+        """{name -> (st_value, st_size)} over all loaded ELFs, built lazily.
+
+        Not pickled: transports that poll device memory (e.g. the buf sink)
+        need a handful of named addresses, so one linear .symtab scan on
+        first use is plenty.
+        """
+        if self._symbols is None:
+            self._symbols = {}
+            for elfpath in self.elves:
+                elf = ELFFile(io.BytesIO(elfpath.read_bytes()))
+                symtab = elf.get_section_by_name(".symtab")
+                if symtab is None:
+                    continue
+                for sym in symtab.iter_symbols():
+                    if sym.name:
+                        self._symbols.setdefault(sym.name, (sym.entry.st_value, sym.entry.st_size))
+        return self._symbols
+
+    def symbol_address(self, name: str) -> Optional[int]:
+        """Return the st_value (load address) of a named symbol, or None."""
+        entry = self._symbol_table().get(name)
+        return entry[0] if entry else None
+
+    def symbol_size(self, name: str) -> Optional[int]:
+        """Return the st_size of a named symbol, or None."""
+        entry = self._symbol_table().get(name)
+        return entry[1] if entry else None
 
     def parse_elf(self, elfpath: Path):
         elf = ELFFile(io.BytesIO(elfpath.read_bytes()))
@@ -298,6 +425,17 @@ class TraceDB:
                     self._traceDB[self.stringpointers[sym.entry.st_value]] = elf_string
 
                 logger.debug("0x%x --> %s", sym.entry.st_value, value.replace("\x1e", ", "))
+
+        # Build the id -> ElfString map the sinks decode against. stringpointers
+        # accumulates across every parsed elf, so rebuilding from it here keeps a
+        # single map that spans all images and lets the collision guard see them
+        # all at once.
+        slots = []
+        for string_addr, slot_addr in self.stringpointers.items():
+            elf_string = self._traceDB.get(slot_addr, self._traceDB.get(string_addr))
+            if elf_string is not None:
+                slots.append((slot_addr, elf_string))
+        self._logIndexDB = build_log_index(slots)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# Wireshark extcap wrapper for the RF-core trace decoder.
+#
+# Wireshark invokes every program in its extcap directory with --extcap-interfaces,
+# --extcap-dlts, --extcap-config, and finally --capture --fifo <path> <config args>.
+# Our binary handles all of that under its `wireshark` subcommand, so this wrapper just
+# prepends the subcommand and execs.
+#
+# Install: symlink (or copy) this file into Wireshark's extcap directory, then set
+# TRACEDECODE to the built binary if it isn't already on PATH:
+#   Help > About Wireshark > Folders > "Personal Extcap path"   (or the global one)
+#   ln -s "$(pwd)/extcap/rftrace-decode" ~/.config/wireshark/extcap/rftrace-decode
+#   cargo build --release   # produces target/release/tracedecode
+# The DLT_USER 147 dissector must also be installed (see README, "Wireshark setup").
+set -euo pipefail
+
+# Locate the tracedecode binary: $TRACEDECODE, else PATH, else the crate's release build.
+here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+bin="${TRACEDECODE:-}"
+if [[ -z "$bin" ]]; then
+  if command -v tracedecode >/dev/null 2>&1; then
+    bin="$(command -v tracedecode)"
+  else
+    bin="$here/../target/release/tracedecode"
+  fi
+fi
+
+exec "$bin" wireshark "$@"

@@ -45,7 +45,7 @@ from typing import Optional
 
 from tilogger.interface import LogPacket
 from tilogger.logger import Logger
-from tilogger.tracedb import ElfString, Opcode
+from tilogger.tracedb import ElfString, Opcode, LOG_ID_SIZE
 from tilogger.helpers import build_value
 
 from .uart_framer import UARTFrame, UARTDataFrame, UARTOpcode
@@ -129,7 +129,7 @@ class TimestampInfo:
 
     @staticmethod
     def from_native_format(ts_format: bytearray):
-        value = struct.unpack("L", ts_format)[0]
+        value = struct.unpack("<I", ts_format)[0]
         frac_width = value & 0xF
         int_width = (value >> 4) & 0xF
         exponent = (value >> 8) & 0xFF
@@ -232,19 +232,18 @@ class UARTPacketiser:
 
     def append_packet(self, uart_frame: UARTDataFrame, time_offset) -> Optional[UartLogPacketData]:
 
-        # Get elf data from header
-        header = build_value(uart_frame.data[0:4])
-        device_timestamp = self._ts_info.parse_native(build_value(uart_frame.data[4:8]))
-        py_logger.debug(
-            "timestamp raw: %d, formatted: %f",
-            build_value(uart_frame.data[4:8]),
-            self._ts_info.parse_native(build_value(uart_frame.data[4:8])),
-        )
-        # Delete the timestamp from the data, to align with expected format: [ptr arg0 arg1 ... argn]
-        del uart_frame.data[4:8]
+        # The frame is [id timestamp args...]; the framer already stripped the
+        # frame header byte (and the size field for buffer records).
+        ts_offset = LOG_ID_SIZE
+        log_id = build_value(uart_frame.data[0:LOG_ID_SIZE])
+        raw_timestamp = build_value(uart_frame.data[ts_offset : ts_offset + 4])
+        device_timestamp = self._ts_info.parse_native(raw_timestamp)
+        py_logger.debug("timestamp raw: %d, formatted: %f", raw_timestamp, device_timestamp)
+        # Delete the timestamp from the data, to align with expected format: [id arg0 arg1 ... argn]
+        del uart_frame.data[ts_offset : ts_offset + 4]
 
-        if header in self._trace_db.traceDB:
-            elf_string = self._trace_db.traceDB[header]
+        if log_id in self._trace_db.logIndexDB:
+            elf_string = self._trace_db.logIndexDB[log_id]
             self._current_packet = UartLogPacketData(
                 elf_string,
                 uart_frame,
@@ -253,14 +252,14 @@ class UARTPacketiser:
                 timestamp=device_timestamp,
             )
             py_logger.debug(
-                "FRAMING: New Frame with len %d header 0x%x, timestamp %f",
+                "FRAMING: New Frame with len %d log id 0x%x, timestamp %f",
                 self._current_packet.remaining_length,
-                header,
+                log_id,
                 device_timestamp,
             )
         else:
-            # This address does not exist in the trace database
-            py_logger.warning("FRAMING: corruption: no trace database information at 0x%x", header)
+            # This log id does not exist in the trace database
+            py_logger.warning("FRAMING: corruption: no trace database information for log id 0x%x", log_id)
             self._current_packet = None
 
         packet = self._current_packet

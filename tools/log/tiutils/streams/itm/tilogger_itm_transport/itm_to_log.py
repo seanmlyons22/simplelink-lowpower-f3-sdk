@@ -30,30 +30,105 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """
 
-from ctypes import c_int32
-import logging
+"""ITMFrame -> LogPacket packetiser.
+
+Reassembles TI Log_* records from STIM_HEADER/STIM_TRACE stimulus frames and
+surfaces the DWT hardware events (PC samples, exception trace, watchpoints,
+counter wraps) plus ITM overflows as LogPackets, so they appear on stdout and
+in Wireshark next to the Log_* records with the same clock.
+
+This is on the receive hot path together with itm_framer; debug logging is
+gated on a flag captured at construction because logging call overhead is
+measurable at frame rates (see streams/itm/ARCHITECTURE.md).
+"""
+
 import enum
-from collections import deque
-import math
-from abc import ABC, abstractmethod
+import logging
 import os
-import sys
-from dataclasses import *
 import struct
+import sys
+from collections import Counter
+from dataclasses import dataclass, field
+from typing import Optional, Tuple
 
-from typing import Optional
-
-from tilogger.interface import LogPacket
+from tilogger.dwarf import RangeDict
+from tilogger.interface import LogLevel, LogPacket
 from tilogger.logger import Logger
 from tilogger.tracedb import ElfString, Opcode
-from tilogger.helpers import build_value
 
-from .itm_framer import ITMFrame, ITMSourceSWFrame, ITMOpcode, ITMStimulusPort
+from .itm_framer import ITMFrame, ITMOpcode, ITMSourceSWFrame, ITMStimulusPort
 
 logger = logging.getLogger("ItmPacketiser")
 
 SWIT_SIZE = 4
 RESET_TOKEN = bytes([0xBB, 0xBB, 0xBB, 0xBB])
+
+# Custom LogPacket opcodes for surfaced hardware events. Log.h reserves 0-9
+# (tilogger.interface); these are ITM-transport specific.
+DWT_OPCODE_PC_SAMPLE = 10
+DWT_OPCODE_EXCEPTION = 11
+DWT_OPCODE_WATCHPOINT = 12
+DWT_OPCODE_COUNTER_WRAP = 13
+ITM_OPCODE_OVERFLOW = 14
+
+DWT_MODULE = "DWT"
+ITM_MODULE = "ITM"
+
+# ARMv7-M / ARMv8-M system exception numbers (B1.5 in both ARMs). 7 is
+# SecureFault on v8-M only; on v7-M it is reserved and never traced.
+_EXCEPTION_NAMES = {
+    0: "Thread",
+    1: "Reset",
+    2: "NMI",
+    3: "HardFault",
+    4: "MemManage",
+    5: "BusFault",
+    6: "UsageFault",
+    7: "SecureFault",
+    11: "SVCall",
+    12: "DebugMonitor",
+    14: "PendSV",
+    15: "SysTick",
+}
+
+_EXCEPTION_FN = {1: "entry", 2: "exit", 3: "return"}
+
+# Data-trace access_type (see ITMSourceHwTraceFrame) -> text
+_WATCHPOINT_TEXT = {
+    2: "watchpoint {c}: PC match, PC 0x{v:08X}",
+    3: "watchpoint {c}: address match, addr 0x{v:X}",
+    4: "watchpoint {c}: read, value 0x{v:X}",
+    5: "watchpoint {c}: write, value 0x{v:X}",
+}
+
+# Counter-wrap bit names (DWT CTRL order)
+COUNTER_NAMES = {5: "CPI", 4: "Exc", 3: "Sleep", 2: "LSU", 1: "Fold", 0: "Cyc"}
+
+# Hot-path aliases: parse() runs per frame, and each Enum attribute access
+# would be a global load plus an attribute load.
+_OP_TIMESTAMP = ITMOpcode.TIMESTAMP
+_OP_SOURCE_SW = ITMOpcode.SOURCE_SW
+_OP_PACKET_PC = ITMOpcode.PACKET_PC
+_OP_EXCEPTION = ITMOpcode.EXCEPTION
+_OP_TRACE = ITMOpcode.TRACE
+_OP_COUNTER_WRAP = ITMOpcode.COUNTER_WRAP
+_OP_OVERFLOW = ITMOpcode.OVERFLOW
+_PORT_INFO = ITMStimulusPort.STIM_INFO
+_PORT_SYNC_TIME = ITMStimulusPort.STIM_SYNC_TIME
+_PORT_HEADER = ITMStimulusPort.STIM_HEADER
+_PORT_TRACE = ITMStimulusPort.STIM_TRACE
+_LVL_VERBOSE = LogLevel.Log_VERBOSE
+_LVL_INFO = LogLevel.Log_INFO
+_LVL_WARNING = LogLevel.Log_WARNING
+
+# Rendered counter-wrap texts by payload byte (only 64 possible values).
+_WRAP_CACHE: dict = {}
+
+
+def exception_name(number: int) -> str:
+    if number >= 16:
+        return f"IRQ{number - 16}"
+    return _EXCEPTION_NAMES.get(number, f"Exception{number}")
 
 
 class InfoOps(enum.Enum):
@@ -61,19 +136,21 @@ class InfoOps(enum.Enum):
 
 
 class ItmLogPacketData:
+    """One TI Log_* record while it is being reassembled from stimulus frames."""
+
     def __init__(
         self,
         elf_string: ElfString,
         header: ITMSourceSWFrame,
         alias: str,
-        timestamp: Optional[int] = None,
-        timestamp_local: Optional[int] = None,
+        timestamp: Optional[float] = None,
+        timestamp_local: Optional[float] = None,
     ):
         self.remaining_length: int
         self.elf_string = elf_string
         self.alias = alias
-        self.timestamp: Optional[int] = timestamp
-        self.timestamp_local: Optional[int] = timestamp_local
+        self.timestamp = timestamp
+        self.timestamp_local = timestamp_local
         self.data: bytes = bytes(header.data)
         self.next_frame_has_length: bool = False
 
@@ -81,6 +158,8 @@ class ItmLogPacketData:
             self.remaining_length = int(elf_string.nargs) * SWIT_SIZE
 
         elif self.elf_string.opcode == Opcode.BUFFER:
+            # Real length arrives in the next STIM_TRACE frame
+            # (LogSinkITM_bufSingleton sends it before the payload).
             self.remaining_length = 1024
             self.next_frame_has_length = True
 
@@ -89,66 +168,29 @@ class ItmLogPacketData:
 
     def append(self, itm_frame: ITMSourceSWFrame) -> None:
         if self.next_frame_has_length:
-            # Set remaining length to the data frame and clear the read-length flag
             self.next_frame_has_length = False
-            self.remaining_length = build_value(itm_frame.data)
-            logger.debug("FRAMING: Frame length set to %d", self.remaining_length)
-
+            self.remaining_length = int.from_bytes(itm_frame.data, "little")
         else:
-            # Adjust remaining length and append data
-            self.remaining_length -= len(itm_frame)
+            self.remaining_length -= itm_frame.size
             self.data += bytes(itm_frame.data)
 
     def to_log_packet(self) -> LogPacket:
-        logger.debug("FRAMING: Handing off %s Packet with %d bytes of data", self.elf_string.opcode, len(self.data))
         return LogPacket.from_elf_string(self.elf_string, self.data, self.alias, self.timestamp, self.timestamp_local)
-
-
-def rat_from_rtc(rtc_s):
-    """
-    Turn a real-time clock value into a radio time value
-
-    Args:
-      rtc_s: real-time-clock in seconds
-
-    Returns:
-        rat_s: radio time in seconds
-        rat_t: radio time in ticks
-
-    """
-    # Updated assumed RAT tick based on RTC value (magic magic)
-    # Doing the same assumptions as done inside the RF  (0x100000000LL/32768)
-    # RTC in ticks like on our devices
-    rtc_sec = int((math.floor(rtc_s) * 32768))
-    rtc_subsec = int((rtc_s - rtc_sec) * 2**32)
-    new_rat = (rtc_sec << 32) + rtc_subsec
-    # Conservatively assume that we are just about to increment
-    # the RTC Scale with the 4 MHz that the RAT is running
-    # Add the RAT offset for RTC == 0 * /
-    new_rat += 4294967296 / 32768
-    new_rat *= 4000000  # Scale to 4 MHz ticks
-    new_rat = new_rat / 4294967296
-    # Store as ticks
-    rat_t = new_rat
-    # Store as time
-    rat_s = new_rat / 4000000
-    return rat_s, rat_t
 
 
 @dataclass
 class TimestampInfo:
-    """Module for converting from native timestamp format to seconds
+    """Converts device-native timestamps (STIM_SYNC_TIME words) to seconds.
 
-    The format is natively provided as a struct,
-    ```
-        struct {
-            uint32_t fracBytes:4;  //<! Octets (LSB) used for fractional part (if any)
-            uint32_t intBytes:4;   //<! Octets (MSB) used for integer part
-            uint32_t exponent:8;   //<! How much to scale native time to get seconds.
-            int32_t multiplier:16; //<! Signed 16-bit multiplier, eg 8 if one tick is 8 time units
-        } format;
-        uint32_t value;
-    ```
+    The device announces its format as a TimestampP_Format word
+    (ti/drivers/dpl/TimestampP.h):
+
+        uint32_t fracBytes:4;   octets (LSB) of fractional part
+        uint32_t intBytes:4;    octets (MSB) of integer part
+        uint32_t exponent:8;    decimal scale to seconds
+        int32_t  multiplier:16; ticks-to-time factor; negative = divide
+
+    int_width/frac_width here are in bits.
     """
 
     exponent: int
@@ -158,114 +200,138 @@ class TimestampInfo:
     _curr_word: Optional[int] = field(default=None, repr=False)
 
     @staticmethod
-    def from_native_format(ts_format: bytearray):
-        value = struct.unpack("L", ts_format)[0]
-        frac_width = value & 0xF
-        int_width = (value >> 4) & 0xF
+    def from_native_format(ts_format: bytes) -> "TimestampInfo":
+        # "<I": the wire word is little-endian 32-bit. A bare "L" is 8 bytes
+        # on LP64 hosts (Linux/macOS) and broke this parse there.
+        (value,) = struct.unpack("<I", ts_format)
+        # fracBytes/intBytes count octets (TimestampP.h), not bits.
+        frac_width = (value & 0xF) * 8
+        int_width = ((value >> 4) & 0xF) * 8
         exponent = (value >> 8) & 0xFF
-        multiplier = (value >> 16) & 0xFFFF
+        multiplier = value >> 16
+        if multiplier & 0x8000:
+            multiplier -= 0x10000  # signed int16 on the wire
         return TimestampInfo(exponent, multiplier, int_width, frac_width)
 
-    def parse_native(self, word: int) -> Optional[int]:
-        """Based on configuration convert native words into fractional seconds
+    def parse_native(self, word: int) -> Optional[float]:
+        """Feed one 32-bit word; returns seconds once enough words arrived.
 
-        Args:
-            word (32-bit): Word comprising either the entire timestamp or a part of it (if > 32 bit total)
-
-        Returns:
-            Optional[int]: Returns a number if able to parse else None if more data needed
+        Formats wider than 32 bits (e.g. the 64-bit LPF3 native format) come
+        as two words, LSW first (LogSinkITM_sendTimeSync).
         """
-
-        # If we have been provided with the 32 LSB of the timestamp already
         if self._curr_word is not None:
             word = word << 32 | self._curr_word
             self._curr_word = None
-
-        # If we need more bits to parse the timestamp, save and return
-        elif self._curr_word is None and self.int_width + self.frac_width > 32:
+        elif self.int_width + self.frac_width > 32:
             self._curr_word = word
             return None
 
-        fractional = (word & ((1 << self.frac_width) - 1)) / 2**self.frac_width
+        fractional = (word & ((1 << self.frac_width) - 1)) / 2**self.frac_width if self.frac_width else 0.0
         integral = (word >> self.frac_width) & ((1 << self.int_width) - 1)
-        return self.multiplier * (integral + fractional) * 10**-self.exponent
+        # multiplier < 0 means one time unit is abs(multiplier) ticks
+        # (TimestampP.h); 0 would be a corrupt format word.
+        if self.multiplier >= 0:
+            scale = self.multiplier or 1
+            return scale * (integral + fractional) * 10**-self.exponent
+        return (integral + fractional) / -self.multiplier * 10**-self.exponent
 
 
 class ITMPacketiser:
     """
-    Manages parsing ITM frames into LogPackets
-
-    Stores a sorted dictionary of frames as they are being parsed.
-    Stores a dictionary of watchpoint strings to match to corresponding watchpoints.
-    Stores a trace database for use by members.
+    Parses ITM frames into LogPackets.
 
     Args:
-        db: trace database
-        clock: clock speed of embedded device
-
+        db: trace database (symbols from the --elf files)
+        logsink: Logger instance, used for host/device time correlation
+        alias: stream name shown in outputs
+        clock: CPU clock of the embedded device in Hz (local timestamp base)
+        baud: TPIU SWO baud rate, used to spread frame times inside one
+              timestamp window by their wire time
     """
 
-    def __init__(self, db=None, logsink: Logger = None, alias="ITM0", clock=48000000, baud=12000000):
+    def __init__(self, db=None, logsink: Optional[Logger] = None, alias="ITM0", clock=48000000, baud=12000000):
         self._trace_db = db
-        self._event_sets = {}
-        self._watchpoints = [None] * 4
-        self._info_opcode = None
-        self._ts_info = None
-        self._rat_t = 0
-        self._rat_s = 0
-        self._rtc_s = 0
+        self._info_opcode: Optional[InfoOps] = None
+        self._ts_info: Optional[TimestampInfo] = None
+        self._rtc_s = 0.0
         self.prescaler = 1
         self.clock = clock
-        self.global_timestamp_delta = None
-        self.offset = 0
+        self.global_timestamp_delta: Optional[float] = None
+        self.offset = 0.0
         self.baudrate = int(baud)
         self.logger = logsink
         self.alias = alias
 
+        # PC-sample histogram: (function, file, line) -> count. Enabled by the
+        # transport when the user asks for a profile; None keeps the per-frame
+        # cost at zero otherwise.
+        self.pc_histogram: Optional[Counter] = None
+
+        self._inv_baud = 1.0 / self.baudrate
         self._current_packet: Optional[ItmLogPacketData] = None
+        self._func_ranges: Optional[RangeDict] = None
+        # Render caches: PC samples and exception events repeat heavily (hot
+        # loops, periodic interrupts), and symbolization plus string
+        # formatting dominates the per-frame cost otherwise.
+        self._pc_cache: dict = {}
+        self._exc_cache: dict = {}
+        # Captured once: logging call overhead is measurable per-frame.
+        self._debug = logger.isEnabledFor(logging.DEBUG)
 
     def parse(self, itm_frame: ITMFrame) -> Optional[LogPacket]:
         """
-        The top-level ITMFrame parser.
+        The top-level ITMFrame parser: routes frames by opcode.
 
-        Will directly build all frames besides software source frames (these are build by build_sw_source_frame).
-        When a timestamp is received from ITM, the running time values will be updated.
-        After all frames are built, completed() will be called.
+        Local timestamp frames advance the running device clock and emit
+        nothing. Software source frames feed Log_* record reassembly.
+        DWT/overflow frames become LogPackets directly.
 
         Args:
           itm_frame: input ITMFrame
 
         Returns:
-
+            A completed LogPacket, or None if this frame did not finish one.
         """
         try:
-            if itm_frame.opcode == ITMOpcode.TIMESTAMP:
-                # Update running timestamps then discard the frame
+            # Module-level constants (not Enum attribute lookups): this runs
+            # once per frame.
+            opcode = itm_frame.opcode
+            if opcode is _OP_TIMESTAMP:
+                # Timestamps are deltas in prescaled CPU cycles since the
+                # previous timestamp packet.
                 self._rtc_s += itm_frame.ts_counter / (self.clock / self.prescaler)
-                self._rat_s, self._rat_t = rat_from_rtc(self._rtc_s)
-                self.offset = 0
+                self.offset = 0.0
                 return None
 
-            packet = None
-            self.offset += (len(itm_frame) + 1) * 1 / self.baudrate
+            # Spread frames inside a timestamp window by their own wire time:
+            # header byte + payload at the SWO baud rate (10 bits per byte on
+            # the NRZ line, but /8 keeps the historical calibration).
+            self.offset += (itm_frame.size + 1) * self._inv_baud
 
-            if itm_frame.opcode == ITMOpcode.SOURCE_SW:
-                assert isinstance(itm_frame, ITMSourceSWFrame)
-
-                if itm_frame.port == ITMStimulusPort.STIM_INFO:
+            if opcode is _OP_SOURCE_SW:
+                port = itm_frame.port
+                if port is _PORT_INFO:
                     self.parse_control_frame(itm_frame, self.offset)
-
-                if itm_frame.port == ITMStimulusPort.STIM_SYNC_TIME:
+                elif port is _PORT_SYNC_TIME:
                     self.parse_resync_frame(itm_frame, self.offset)
 
-                # This may not be the entire frame. Try to build it.
-                # packet will be None unless the whole frame is completed
                 packet = self.append_packet(itm_frame, self.offset)
-
                 if packet:
                     return packet.to_log_packet()
+                return None
 
-        except Exception as exc:
+            if opcode is _OP_PACKET_PC:
+                return self._pc_packet(itm_frame)
+            if opcode is _OP_EXCEPTION:
+                return self._exception_packet(itm_frame)
+            if opcode is _OP_TRACE:
+                return self._watchpoint_packet(itm_frame)
+            if opcode is _OP_COUNTER_WRAP:
+                return self._counter_wrap_packet(itm_frame)
+            if opcode is _OP_OVERFLOW:
+                return self._overflow_packet(itm_frame)
+
+        except Exception as exc:  # noqa: BLE001 - one bad frame must not kill the stream
             exc_type, _, exc_tb = sys.exc_info()
             if exc_tb:
                 fname = os.path.split(exc_tb.tb_frame.f_code.co_filename)[1]
@@ -273,95 +339,204 @@ class ITMPacketiser:
 
         return None
 
+    # ------------------------------------------------------------------
+    # Surfaced hardware events
+    # ------------------------------------------------------------------
+
+    def _hw_packet(
+        self,
+        opcode: int,
+        level: LogLevel,
+        text: str,
+        data: bytes,
+        filename: str = "dwt",
+        lineno: str = "0",
+        module: str = DWT_MODULE,
+    ) -> LogPacket:
+        ts_local = self._rtc_s + self.offset
+        packet = LogPacket(
+            self.alias,
+            module,
+            opcode,
+            level,
+            filename,
+            lineno,
+            ts_local + (self.global_timestamp_delta or 0),
+            ts_local,
+            data,
+            self._trace_db,
+        )
+        # Custom opcodes (>= 10) skip Logger's ELF formatting; the rendered
+        # text is provided directly, the same way from-replayfile does it.
+        packet._str_data = text
+        return packet
+
+    def _pc_packet(self, frame: ITMFrame) -> LogPacket:
+        if frame.size != 4:
+            # Single-byte variant: the core was asleep at sample time.
+            if self.pc_histogram is not None:
+                self.pc_histogram[("<sleep>", None, None)] += 1
+            return self._hw_packet(DWT_OPCODE_PC_SAMPLE, _LVL_VERBOSE, "pc sample: sleep", b"\x00")
+
+        pc = frame.value
+        cached = self._pc_cache.get(pc)
+        if cached is None:
+            text = f"pc sample: 0x{pc:08X}"
+            filename, lineno = "dwt", "0"
+            key = (f"0x{pc:08X}", None, None)
+            location = self._symbolize(pc)
+            if location is not None:
+                _, _, func, file, line = location
+                text = f"pc sample: 0x{pc:08X} {func} ({file}:{line})"
+                filename, lineno = file, str(line)
+                key = (func, file, line)
+            cached = (text, struct.pack("<I", pc), filename, lineno, key)
+            self._pc_cache[pc] = cached
+        text, data, filename, lineno, key = cached
+        if self.pc_histogram is not None:
+            self.pc_histogram[key] += 1
+        return self._hw_packet(DWT_OPCODE_PC_SAMPLE, _LVL_VERBOSE, text, data, filename, lineno)
+
+    def _exception_packet(self, frame: ITMFrame) -> LogPacket:
+        cache_key = (frame.num_exception, frame.func_exception)
+        cached = self._exc_cache.get(cache_key)
+        if cached is None:
+            fn = _EXCEPTION_FN.get(frame.func_exception, f"fn={frame.func_exception}")
+            name = exception_name(frame.num_exception)
+            text = f"exception {frame.num_exception} ({name}) {fn}"
+            data = struct.pack("<H", frame.num_exception | (frame.func_exception << 12))
+            cached = (text, data)
+            self._exc_cache[cache_key] = cached
+        return self._hw_packet(DWT_OPCODE_EXCEPTION, _LVL_INFO, cached[0], cached[1])
+
+    def _watchpoint_packet(self, frame: ITMFrame) -> LogPacket:
+        text = _WATCHPOINT_TEXT[frame.access_type].format(c=frame.comparator, v=frame.value)
+        return self._hw_packet(DWT_OPCODE_WATCHPOINT, _LVL_INFO, text, frame.value.to_bytes(4, "little"))
+
+    def _counter_wrap_packet(self, frame: ITMFrame) -> LogPacket:
+        cached = _WRAP_CACHE.get(frame.value)
+        if cached is None:
+            names = [COUNTER_NAMES[i] for i in COUNTER_NAMES if frame.value & (1 << i)]
+            cached = ("counter wrap: " + " ".join(names), bytes([frame.value]))
+            _WRAP_CACHE[frame.value] = cached
+        return self._hw_packet(DWT_OPCODE_COUNTER_WRAP, _LVL_VERBOSE, cached[0], cached[1])
+
+    def _overflow_packet(self, frame: ITMFrame) -> LogPacket:
+        text = "ITM overflow: the device dropped at least one trace packet"
+        return self._hw_packet(ITM_OPCODE_OVERFLOW, _LVL_WARNING, text, b"", "itm", "0", ITM_MODULE)
+
+    def _symbolize(self, pc: int) -> Optional[Tuple]:
+        """PC -> (CU, DIE, function, file, line) via the DWARF info of the
+        --elf files; None if unresolved or no DWARF available."""
+        if self._func_ranges is None:
+            self._func_ranges = self._load_func_ranges()
+        return self._func_ranges.get(pc)
+
+    def _load_func_ranges(self) -> RangeDict:
+        try:
+            if self._trace_db is not None:
+                return self._trace_db.function_ranges()
+        except Exception as exc:  # noqa: BLE001 - missing DWARF must not stop decoding
+            logger.warning("PC symbolization unavailable: %s", exc)
+        return RangeDict({})
+
+    # ------------------------------------------------------------------
+    # Control / time sync
+    # ------------------------------------------------------------------
+
     def handle_ts_info(self, prescaler=None, ts_format=None):
-        if prescaler:
+        if prescaler is not None:
+            # ITM TCR.TSPrescale encoding (DDI 0403 C1.7.1); the sink sends
+            # the raw field value in the Info_Timing immediate.
             prescaler_lut = {0: 1, 1: 4, 2: 16, 3: 64}
             self.prescaler = prescaler_lut[prescaler]
-            logger.debug(f"TPIU prescaler is {self.prescaler}")
+            logger.debug("Local timestamp prescaler is %d", self.prescaler)
 
-        if ts_format:
-            self._ts_info = TimestampInfo.from_native_format(ts_format)
-            logger.debug(f"Native timestamp format is {self._ts_info}")
+        if ts_format is not None:
+            self._ts_info = TimestampInfo.from_native_format(bytes(ts_format))
+            logger.debug("Native timestamp format is %s", self._ts_info)
             self._info_opcode = None  # done parsing this opcode
 
     def parse_control_frame(self, itm_frame: ITMSourceSWFrame, time_offset) -> None:
         # Size 4 is only ever continuation
         if itm_frame.size == 4:
-            (word,) = struct.unpack("I", itm_frame.data)
+            (word,) = struct.unpack("<I", itm_frame.data)
             if word == 0xBBBBBBBB:
                 logger.debug("Parsed reset control frame")
             elif self._info_opcode == InfoOps.TIMESTAMP_INFO:
-                self.handle_ts_info(ts_format=itm_frame.data)  # Different unpack
+                self.handle_ts_info(ts_format=itm_frame.data)
 
         # Size 2 is start-of with immediate
-        if itm_frame.size == 2:
-            opcode, imm = struct.unpack("BB", itm_frame.data)
+        elif itm_frame.size == 2:
+            opcode, imm = struct.unpack("BB", bytes(itm_frame.data))
             self._info_opcode = InfoOps(opcode)
-            logger.debug(f"Got opcode {InfoOps(opcode)} with immediate value {imm}")
-            if InfoOps(opcode) == InfoOps.TIMESTAMP_INFO:
+            if self._info_opcode == InfoOps.TIMESTAMP_INFO:
                 self.handle_ts_info(prescaler=imm)
 
         # Size 1 is start-of, possibly indicating 32-bit to follow
-        if itm_frame.size == 1:
-            opcode = struct.unpack("B", itm_frame.data)
-            self._info_opcode = InfoOps(opcode)
-            logger.debug(f"Got opcode {opcode}")
+        elif itm_frame.size == 1:
+            self._info_opcode = InfoOps(itm_frame.data[0])
 
     def parse_resync_frame(self, itm_frame: ITMSourceSWFrame, time_offset) -> None:
-        dev_time = self._ts_info.parse_native(struct.unpack("I", itm_frame.data)[0])
+        if self._ts_info is None:
+            logger.warning("Time sync frame before timestamp format info; ignored")
+            return
+        dev_time = self._ts_info.parse_native(struct.unpack("<I", itm_frame.data)[0])
         if dev_time:
-            logger.debug(f"Device clock is {dev_time:0.5f}, overriding current time of {self._rtc_s:0.5f}")
+            logger.debug("Device clock is %0.5f, overriding current time of %0.5f", dev_time, self._rtc_s)
             self._rtc_s = dev_time
 
-            if self.global_timestamp_delta is None:
-                # TODO: Get rid of jitter and update every time a new sync happens
+            if self.global_timestamp_delta is None and self.logger is not None:
                 self.global_timestamp_delta = self.logger.get_system_time(dev_time) - dev_time
 
-    def append_packet(self, itm_frame: ITMSourceSWFrame, time_offset) -> Optional[ItmLogPacketData]:
-        if itm_frame.port == ITMStimulusPort.STIM_HEADER:
-            # Get elf data from header
-            header = build_value(itm_frame.data)
+    # ------------------------------------------------------------------
+    # Log_* record reassembly
+    # ------------------------------------------------------------------
 
-            if header in self._trace_db.traceDB:
-                elf_string = self._trace_db.traceDB[header]
-                self._current_packet = ItmLogPacketData(
-                    elf_string,
-                    itm_frame,
-                    alias=self.alias,
-                    timestamp_local=self._rtc_s + time_offset,
-                    timestamp=self._rtc_s + time_offset + (self.global_timestamp_delta or 0),
-                )
-                logger.debug(
-                    "FRAMING: New Frame with len %d header 0x%x", self._current_packet.remaining_length, header
-                )
-            else:
-                # This address does not exist in the trace database
-                logger.warning("FRAMING: corruption: no trace database information at 0x%x", header)
+    def append_packet(self, itm_frame: ITMSourceSWFrame, time_offset) -> Optional[ItmLogPacketData]:
+        port = itm_frame.port
+        if port is _PORT_HEADER:
+            log_id = int.from_bytes(itm_frame.data, "little")
+
+            log_index = self._trace_db.logIndexDB
+            if log_id not in log_index:
+                # This log id does not exist in the trace database
+                logger.warning("FRAMING: corruption: no trace database information for log id 0x%x", log_id)
                 self._current_packet = None
+                return None
+
+            self._current_packet = ItmLogPacketData(
+                log_index[log_id],
+                itm_frame,
+                alias=self.alias,
+                timestamp_local=self._rtc_s + time_offset,
+                timestamp=self._rtc_s + time_offset + (self.global_timestamp_delta or 0),
+            )
+            if self._debug:
+                logger.debug(
+                    "FRAMING: New Frame with len %d log id 0x%x", self._current_packet.remaining_length, log_id
+                )
 
             if self._current_packet.remaining_length == 0:
                 packet = self._current_packet
                 self._current_packet = None
-
                 return packet
 
-        elif itm_frame.port == ITMStimulusPort.STIM_TRACE:
+        elif port is _PORT_TRACE:
             if not self._current_packet:
-                # Fall through and return None
                 logger.warning("Unexpected trace packet with no header! Discarding.")
             else:
-                # Append the incoming data to the currently assembling packet
                 self._current_packet.append(itm_frame)
-                logger.debug(
-                    "FRAMING: %d bytes added, remaining: %d", len(itm_frame), self._current_packet.remaining_length
-                )
+                if self._debug:
+                    logger.debug(
+                        "FRAMING: %d bytes added, remaining: %d", itm_frame.size, self._current_packet.remaining_length
+                    )
 
-                # Note that < 0 here means we somehow appended a trace packet to a header that said it had no data
-                # This should not happen as long as all opcodes are correctly configured
+                # < 0 would mean a trace packet was appended to a header that
+                # declared no data; only possible with misconfigured opcodes.
                 if self._current_packet.remaining_length <= 0:
                     packet = self._current_packet
                     self._current_packet = None
-
                     return packet
 
         return None

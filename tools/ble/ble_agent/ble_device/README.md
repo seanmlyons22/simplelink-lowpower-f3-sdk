@@ -116,7 +116,7 @@ python ble_device_sync_scan.py
    
         def register_connection_event(self,
                                       connection_handle=0xFFFD,
-                                      event_type = ConnectionEventNotifyType.CONNECTION_CB_EVENT_ALL,
+                                      event_type = ConnectionEventNotifyType.CONNECTION_EVENT_ALL,
                                       report_frequency=0x0A):
             self.event_notify_enabled = False
             self.cmd = ConnectionCommands.CONNECTION_CMD_REGISTER_CONN_EVENT

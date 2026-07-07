@@ -1,0 +1,25 @@
+[package]
+name = "rftrace-decode"
+version = "0.1.0"
+edition = "2021"
+description = "Logic-analyzer backend for the CC-series RF-core (LRFDTRC) trace sink: samples -> deframe -> packet -> dbgid -> Wireshark/stdout, output identical to the ITM/UART tilogger path."
+
+# Deliberately std-only (zero dependencies) so it builds and tests offline; the .sal
+# reader shells out to `unzip` and meta.json is scanned without serde.
+[dependencies]
+
+[lib]
+name = "rftrace_decode"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tracedecode"
+path = "src/main.rs"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+# The golden end-to-end test deframes a 57M-edge capture; debug-opt0 makes it minutes.
+[profile.dev]
+opt-level = 2

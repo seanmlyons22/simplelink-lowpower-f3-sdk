@@ -47,7 +47,10 @@ setuptools.setup(
         "construct==2.10.70",
         "appdirs==1.4.4",
         "watchdog==6.0.0",
-        "typer==0.16.0",
+        "typer==0.15.1",
+        # typer 0.15.1 calls click's pre-8.2 Parameter.make_metavar() signature;
+        # click>=8.2 made `ctx` required and breaks it. Cap until typer is bumped.
+        "click<8.2",
         "colorama==0.4.6",
         "coloredlogs",
     ],

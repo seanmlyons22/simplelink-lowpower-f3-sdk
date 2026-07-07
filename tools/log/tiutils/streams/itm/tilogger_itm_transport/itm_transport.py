@@ -30,18 +30,14 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 """
 
-from dataclasses import dataclass, field
-from os import name
+from collections import Counter
 from pathlib import Path
 import sys
 import atexit
 import argparse
-import queue
 import threading
-import logging
 
 from typing import Optional, NoReturn, List
-import click
 
 from tilogger.interface import LogPacket, LoggerCliCtx, TransportABC
 from tilogger.logger import Logger
@@ -50,18 +46,35 @@ from tilogger.tracedb import TraceDB
 from .serial_rx import SerialRx
 from .itm_framer import ITMFramer
 from .itm_to_log import ITMPacketiser
+from .pcsample import write_speedscope_profile, open_in_speedscope
 
 import typer
 
 
+class _FrameSink(list):
+    """Framer output: frames appended in order, drained by the same thread.
+
+    The old per-frame queue.Queue paid a lock round trip per frame plus a
+    1 ms blocking get per loop turn; the framer and the packetiser run on
+    the same thread, so a plain list is enough.
+    """
+
+    put = list.append
+
+
 class ITM_Transport(TransportABC):
-    def __init__(self, port: str, baudrate: int, trace_db: TraceDB, alias: str):
+    def __init__(self, port: str, baudrate: int, trace_db: TraceDB, alias: str,
+                 pcsample: Optional[Path] = None, late_attach: bool = False):
         super().__init__()
 
         self._com_port = port
         self._baud_rate = baudrate
         self._trace_db = trace_db
         self._alias = alias
+        self._pcsample = pcsample
+        self._late_attach = late_attach
+        self._packetiser: Optional[ITMPacketiser] = None
+        self._profile_written = False
         self.serial: Optional[SerialRx] = None
         self.stop_event = threading.Event()
 
@@ -71,36 +84,58 @@ class ITM_Transport(TransportABC):
 
     def stop(self):
         self.stop_event.set()
+        self._write_profile()
+
+    def _write_profile(self):
+        """Dump the PC-sample profile and open the viewer, once, on shutdown."""
+        if self._profile_written or self._pcsample is None or self._packetiser is None:
+            return
+        self._profile_written = True
+        histogram = self._packetiser.pc_histogram
+        if not histogram:
+            typer.secho("No DWT PC samples captured; no profile written.", err=True)
+            return
+        out = write_speedscope_profile(histogram, self._pcsample, name=self.alias)
+        typer.secho(f"PC-sample profile written to {out}", err=True)
+        open_in_speedscope(out)
 
     def start(self, logger: Optional[Logger]) -> NoReturn:
         self.serial = SerialRx(self._com_port, self._baud_rate, alias=self._alias)
         atexit.register(self.serial.close)
 
-        frame_queue: queue.Queue = queue.Queue()
-        framer = ITMFramer(frame_queue)
+        frames = _FrameSink()
+        framer = ITMFramer(frames, late_attach=self._late_attach)
 
         # Note we use "Logger == None" as our 'ITM only mode' flag
         if logger:
             packetiser = ITMPacketiser(self._trace_db, logger, self.alias)
+            if self._pcsample is not None:
+                packetiser.pc_histogram = Counter()
+            self._packetiser = packetiser
+            # The transport thread is a daemon: it dies without unwinding on
+            # exit, so the profile dump must also hang off process exit.
+            atexit.register(self._write_profile)
         else:
             packetiser = None
 
         rx_data: bytearray = bytearray()
         while not self.stop_event.is_set():
-            rx_data.extend(self.serial.receive())
+            # Block briefly in the reader when the line is idle; when data is
+            # flowing this returns a full chunk immediately.
+            rx_data.extend(self.serial.receive(timeout=0.001))
             rx_data = framer.parse(rx_data)
-
-            try:
-                result = frame_queue.get(block=True, timeout=0.001)
-            except queue.Empty:
+            if not frames:
                 continue
 
             if logger:
-                packet: Optional[LogPacket] = packetiser.parse(result)
-                if packet:
-                    logger.log(packet)
+                for frame in frames:
+                    packet: Optional[LogPacket] = packetiser.parse(frame)
+                    if packet:
+                        logger.log(packet)
             else:
-                print(result)
+                for frame in frames:
+                    print(frame)
+            frames.clear()
 
     def reset(self):
         pass
@@ -117,6 +152,18 @@ def transport_factory_cli(app: typer.Typer):
         baudrate: int = typer.Argument(..., help="TPIU baudrate"),
         elf: List[Path] = typer.Option([], help="Symbol file path (elf/out file)"),
         alias: Optional[str] = typer.Option(None, help="Alias for this device in the log"),
+        pcsample: Optional[Path] = typer.Option(
+            None,
+            help="Write a speedscope profile of DWT PC samples to this file on "
+            "exit and open the interactive viewer in the default browser",
+        ),
+        late_attach: bool = typer.Option(
+            False,
+            "--late-attach",
+            help="Attach to an already-running target: byte-align on the next ITM "
+            "sync packet instead of waiting for the boot reset token. Requires the "
+            "device to emit sync packets (ITM_enableSyncPackets).",
+        ),
     ):
         """Add ITM transport as input to log.
 
@@ -127,6 +174,11 @@ def transport_factory_cli(app: typer.Typer):
         You also need to specify .out/.elf files that contain symbol information
         needed to parse the log, but this may also be provided globally before
         adding transports.
+
+        DWT hardware events (PC samples, exception trace, watchpoints, counter
+        wraps) appear as module DWT/ITM packets next to the Log_* records. To
+        profile with PC sampling, enable ITM_enablePCSampling on the device and
+        pass --pcsample out.speedscope.json.
         """
 
         state = ctx.ensure_object(LoggerCliCtx)
@@ -139,7 +191,7 @@ def transport_factory_cli(app: typer.Typer):
             sys.exit(1)
 
         db = TraceDB(elves, repickle=False)
-        itm_transport = ITM_Transport(port, baudrate, db, alias or port)
+        itm_transport = ITM_Transport(port, baudrate, db, alias or port, pcsample=pcsample, late_attach=late_attach)
         return itm_transport
 
 

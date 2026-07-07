@@ -1,0 +1,13 @@
+# Coverage config for the host log tooling test suites.
+[run]
+# __main__.py files are `python -m ...` entry shims (argparse + a call into the
+# already-tested library). They are exercised end-to-end, not by unit tests, so
+# they are excluded from the per-module coverage goal rather than faked.
+omit =
+    */__main__.py
+
+[report]
+exclude_also =
+    if __name__ == .__main__.:
+    raise NotImplementedError
+    @abc.abstractmethod

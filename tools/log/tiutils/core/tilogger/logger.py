@@ -1,5 +1,5 @@
 """
-Copyright (C) 2020-2026, Texas Instruments Incorporated
+Copyright (C) 2020-2024, Texas Instruments Incorporated
 
 Redistribution and use in source and binary forms, with or without
 modification, are permitted provided that the following conditions
@@ -50,7 +50,7 @@ from typing import DefaultDict, Dict, List
 from collections import defaultdict
 
 from tilogger.interface import LogOutputABC, LogPacket, LoggerCliCtx, TransportABC, LogFormatterABC, LogSubscriberABC
-from tilogger.tracedb import Opcode, TraceDB, ElfString
+from tilogger.tracedb import Opcode, TraceDB, ElfString, LOG_ID_SIZE, format_c
 from tilogger.helpers import build_value
 
 # Upper value of opcodes used/reserved by Log.h
@@ -64,7 +64,8 @@ class Logger:
         # Locate all transports/formatters/subscribers by entry points
         # Note that any duplicate formatters are resolved to a single formatter last-come-first-served
         self._formatters: Dict[str, LogFormatterABC] = {
-            ep.name: ep.load() for ep in entry_points(group="tilogger.formatter")
+            entry_point.name: entry_point.load()
+            for entry_point in entry_points(group="tilogger.formatter")
         }
 
         self.timebase = None
@@ -72,8 +73,8 @@ class Logger:
         self.subscribers: DefaultDict[str, List[LogSubscriberABC]] = defaultdict(list)
 
         # Subscribers are slightly more difficult, because we need to handle duplicates explicitly
-        for ep in entry_points(group="tilogger.subscriber"):
-            self.subscribers[ep.name].append(ep.load())
+        for entry_point in entry_points(group="tilogger.subscriber"):
+            self.subscribers[entry_point.name].append(entry_point.load())
 
         self.transports: List[TransportABC] = transports
         self.outputs: List[LogOutputABC] = outputs
@@ -138,20 +139,20 @@ class Logger:
                 transport.stop()
 
     def format_dobby_packet(self, packet: LogPacket) -> None:
-        if len(packet.data) < 4:
-            logger.error("Packet with less than 4 bytes of data! \n%s", packet)
+        if len(packet.data) < LOG_ID_SIZE:
+            logger.error("Packet with fewer than %d bytes of data! \n%s", LOG_ID_SIZE, packet)
             return
 
-        address: int = build_value(packet.data[:4])
+        log_id: int = build_value(packet.data[:LOG_ID_SIZE])
 
-        if address not in packet.trace_db.traceDB:
-            logger.error("Packet header points to %d but this address does not map to the .out file!", address)
+        if log_id not in packet.trace_db.logIndexDB:
+            logger.error("Packet log id 0x%x does not map to the .out file!", log_id)
             return
 
-        elf_str: ElfString = packet.trace_db.traceDB[address]
+        elf_str: ElfString = packet.trace_db.logIndexDB[log_id]
 
-        # We have used the first 32-bit word already, so strip it off
-        data = packet.data[4:]
+        # The leading id has been used to resolve the log site, so strip it off
+        data = packet.data[LOG_ID_SIZE:]
 
         if elf_str.opcode == Opcode.FORMATTED_TEXT:
             values = []
@@ -162,8 +163,9 @@ class Logger:
                 data = data[4:]
 
             try:
-                # Convert the list of values into a tuple so it is a valid argument to the % command
-                packet._str_data = elf_str.string % tuple(values)
+                # format_c applies C signedness (%d/%i as int32) the promoted
+                # 32-bit args don't carry, so a negative %d prints as e.g. -38.
+                packet._str_data = format_c(elf_str.string, values)
             except TypeError as exc:
                 logger.error(
                     "Log.h elf string formatting failed: %s\nFormat string: %s, args: %s", exc, elf_str.string, values
@@ -225,11 +227,13 @@ def main():
     for entry_point in entry_points(group="tilogger.transport"):
         subtyper = entry_point.load()
         subtyper(logger_cli)
+        # logger_cli.add_typer(subtyper, name=entry_point.name)
 
     # Plug in outputs that are installed, add them as subcommands
     for entry_point in entry_points(group="tilogger.output"):
         subtyper = entry_point.load()
         subtyper(logger_cli)
+        # logger_cli.add_typer(subtyper, name=entry_point.name)
 
     logger_cli()
 

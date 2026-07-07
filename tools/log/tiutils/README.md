@@ -13,6 +13,7 @@ modules is displayed in the list below.
 
 * itm
 * uart
+* rftrace (RF-core LRFDTRC trace pin, via the native `tracedecode` backend)
 * from-replayfile
 
 #### Output modules
@@ -218,9 +219,11 @@ Arguments:
   BAUDRATE  TPIU baudrate  [required]
 
 Options:
-  --elf PATH    Symbol file path (elf/out file)  [default: ]
-  --alias TEXT  Alias for this device in the log
-  --help        Show this message and exit.
+  --elf PATH       Symbol file path (elf/out file)  [default: ]
+  --alias TEXT     Alias for this device in the log
+  --pcsample PATH  Write a speedscope profile of DWT PC samples to this file
+                   on exit and open the interactive viewer in the browser
+  --help           Show this message and exit.
 ```
 
 #### Examples
@@ -241,6 +244,24 @@ Options:
   > Data Port".
 * `tilogger` will not begin recording until it has seen a reset frame, which is
   only generated on startup.
+
+#### DWT hardware events and PC-sample profiling
+
+DWT hardware trace packets are decoded and shown next to the `Log_*` records
+on the same clock: PC samples (module `DWT`, symbolized to `function
+(file:line)` via the `--elf` files), exception entry/exit/return, watchpoint
+matches, event counter wraps, and ITM overflow warnings (module `ITM`). They
+appear on stdout, in Wireshark (no dissector change) and in replay files.
+
+To profile with the periodic PC sampler, enable it on the device
+(`ITM_enablePCSampling`) and pass `--pcsample out.speedscope.json`; on exit
+(Ctrl+C) an interactive flame view opens in the default browser using a
+bundled, fully offline copy of [speedscope](https://github.com/jlfwong/speedscope).
+The device emits program-counter samples rather than call stacks, so the
+view is a flat per-function histogram.
+
+Design, wire-format facts, and the measured performance decision record are
+in `streams/itm/ARCHITECTURE.md`.
 
 #### Viewing RAW ITM Streams
 
@@ -299,6 +320,98 @@ Options:
   > "Application/User UART".
 * Waiting for a reset frame is not necessary for UART transport, in this case
   `tilogger` can attach to a running data stream.
+
+### RF-core Trace (rftrace) Transport
+
+Decodes the CC-series RF-core (LRFDTRC) trace pin captured by a logic analyzer,
+using the native `tracedecode` backend (`tools/rftrace-decode`). It is a drop-in
+transport: pick a source and any existing output (`stdout`, `wireshark`,
+`to-replayfile`) — the logs appear identically to ITM/UART.
+
+**Setup (two one-time steps):**
+
+1. **`tracedecode` binary on `PATH`** (the Rust decode backend):
+   ```
+   cargo install --path tools/rftrace-decode      # puts `tracedecode` in ~/.cargo/bin
+   ```
+   No `$TRACEDECODE` env or `--tracedecode` flag needed once it's on `PATH`.
+2. **The `rftrace` transport** is installed by `requirements.txt` (with the
+   `[logic2]` extra for the Saleae `--logic2` path). If you set up your venv
+   before that line existed, add it:
+   ```
+   pip install -e streams/rftrace[logic2]         # or drop [logic2] for --sal/--sigrok/--raw only
+   ```
+
+**Metadata**: pass `--elf <app.out>` and all CPU-side logs are resolved straight
+from the binary — no manual `elf2dbgid` step. (The transport reads the ELF's
+dbgid table directly via tilogger's own ELF parser, producing the exact same
+table `elf2dbgid` would.) Add `--dbgid <file>` for modem/LRF traces (pbe/rfe/mce),
+which live in separate headers, not the app ELF. At least one of `--elf`/`--dbgid`
+is required.
+
+```text
+$ tilogger rftrace --help
+  Add the RF-core (LRFDTRC) trace decoder as a log input.
+
+Options:
+  --elf PATH            application .out; CPU-side logs read straight from it
+  --dbgid PATH          extra DBG_DEF header(s) for modem/LRF (pbe/rfe/mce); repeatable
+  --sal PATH            Saleae .sal capture to replay
+  --raw PATH            raw 1 byte/sample file, or - for stdin
+  --sigrok TEXT         sigrok-cli args for live capture, piped into the decoder
+  --logic2              capture via Logic 2 Automation API (Saleae Logic Pro), looped
+  --duration FLOAT      [--logic2] timed capture window, seconds
+  --trigger TEXT        [--logic2] rising|falling|pulse-high|pulse-low
+  --after FLOAT         [--logic2] seconds to capture after the trigger
+  --loop / --count N    [--logic2] rolling windows / exactly N windows
+  --buffer-mb INTEGER   [--logic2] capture RAM buffer bound, MB
+  --channel INTEGER     LA channel of the rfctrc_out pin  [default: 4]
+  --divide-time-by-2    48 MHz tracer / 0.25 us ticks (e.g. CC2745)
+  --alias TEXT          device alias shown in the log
+  --tracedecode PATH    path to the tracedecode binary ($TRACEDECODE or PATH otherwise)
+```
+
+Pick exactly one source: `--sal`, `--raw`, `--sigrok`, or `--logic2`.
+
+`--logic2` drives Logic 2 via its Automation API (the only way to capture from a
+Saleae **Logic Pro** at full rate — sigrok's driver doesn't support the Pro 8 and caps
+at 50 MS/s). It captures a window, saves a temp `.sal`, and decodes it — looped. This is
+**batched, not continuous**: the Automation API only hands data out after each capture
+stops (no mid-capture streaming). Needs `pip install -e streams/rftrace[logic2]` (pulls
+`logic2-automation`) and Logic 2 running with automation enabled (Preferences →
+Automation). Use `--duration <s>` for timed windows or `--trigger rising|falling|
+pulse-high|pulse-low` (with `--trigger-channel`, `--after`) for event capture; add
+`--loop` or `--count N` for rolling windows, `--buffer-mb` to bound RAM.
+
+#### Examples
+
+* Replay a Saleae capture to stdout, metadata from the ELF (no elf2dbgid):
+    * `tilogger rftrace --sal cap.sal --elf app.out --channel 4 --divide-time-by-2 stdout`
+* Add modem/LRF traces on top of the ELF:
+    * `tilogger rftrace --sal cap.sal --elf app.out --dbgid pbe_dbgid.h --channel 4 --divide-time-by-2 stdout`
+* Replay to Wireshark (auto-launch + configure, works on Linux and Windows):
+    * `tilogger rftrace --sal cap.sal --elf app.out --divide-time-by-2 wireshark --start`
+* Logic Pro live-ish via Logic 2 (rolling 2 s windows into Wireshark):
+    * `tilogger rftrace --logic2 --duration 2 --loop --elf app.out --channel 4 --divide-time-by-2 wireshark --start`
+* Logic Pro, capture 5 windows triggered on a rising edge:
+    * `tilogger rftrace --logic2 --trigger rising --trigger-channel 4 --after 1 --count 5 --elf app.out stdout`
+* Live from a sigrok-supported analyzer, e.g. DSLogic (endless streaming):
+    * `tilogger rftrace --sigrok "--driver dreamsourcelab-dslogic --config samplerate=500M -C 4" --elf app.out --channel 0 --divide-time-by-2 stdout`
+* Pre-extracted headers still work (no ELF): `--dbgid app_dbgid.h --dbgid pbe_dbgid.h`.
+
+#### rftrace Transport Considerations
+
+* `--elf` reads the ELF once at startup (via `pyelftools`, already a tilogger
+  dependency); the extracted table is verified byte-identical to `elf2dbgid`'s.
+* `tracedecode` is found on `PATH` (after `cargo install --path
+  tools/rftrace-decode`). To use a specific build instead, pass `--tracedecode
+  <path>` or set `$TRACEDECODE`.
+* `--divide-time-by-2` is needed for 48 MHz tracer variants (0.25 us ticks, e.g.
+  CC2745) so device time matches wall time.
+* Live `--sigrok` capture runs **endlessly** — the decoder streams (chunked, with
+  bounded ~5 MB memory) and emits records live, at >780 MS/s worst-case /
+  >1 GS/s idle on one core, comfortably above the 500 MS/s line rate. Omit
+  sigrok's `--samples`/`--time` to capture continuously.
 
 ### From Replay File Transport
 
@@ -402,16 +515,27 @@ Options:
 
 #### Configure Wireshark
 
-Copy `streams/wireshark/tilog_dissector.lua` to `[Wireshark install
-dir]/plugins/x.y/tilogger_dissector.lua`. This will teach Wireshark to
-understand the TI Logger's packet format.
+Install the dissector so Wireshark understands the TI Logger packet format. Find
+your plugins dir via Help > About Wireshark > Folders > "Personal Lua Plugins".
+
+* **Windows:** copy `streams/wireshark/tilogger_dissector.lua` into
+  `[Wireshark install dir]/plugins/x.y/`, and set `WIRESHARK_EXE_PATH` to the
+  directory holding `Wireshark.exe`.
+* **Linux:** symlink it into the personal Lua plugins dir (Wireshark is found on
+  `PATH`, so no `WIRESHARK_EXE_PATH` needed):
+  ```
+  mkdir -p ~/.local/lib/wireshark/plugins
+  ln -s "$PWD/streams/wireshark/tilogger_dissector.lua" ~/.local/lib/wireshark/plugins/
+  ```
+  Also add your user to the `wireshark` group so Wireshark can run `dumpcap` on
+  the capture pipe, then log out/in (or prefix the run with `sg wireshark -c`):
+  ```
+  sudo usermod -aG wireshark $USER
+  ```
 
 >*Warning*: If you have previously
 used an older version of the TI logger tool, make sure to remove the previous
 `dissector.lua` containing the old TI Logger from Wireshark.
-
-Set an environment variable named `WIRESHARK_EXE_PATH`, setting it to the
-directory path where Wireshark.exe is installed.
 
 To automatically start wireshark when starting the logger, supply `--start` to
 the `wireshark` command. `tilogger` adds columns to the default view for

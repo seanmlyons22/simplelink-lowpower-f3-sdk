@@ -1,5 +1,5 @@
 from __future__ import annotations
-from concurrent.futures import ThreadPoolExecutor
+
 import os
 import queue
 import time
@@ -7,19 +7,15 @@ import threading
 import json
 import logging
 import enum
-import copy
-
 
 from logging.handlers import RotatingFileHandler
 from dataclasses import dataclass
 from construct import (
     Struct,
-    Switch,
     Int16sl,
     Int8ul,
     Int16ul,
     Int32ul,
-    Float32l,
     this,
     Array,
     Byte,
@@ -65,7 +61,6 @@ from ble_device.ble_device_enums import (
     GATTEventType,
     CaServerEventType,
     BondReadTypes,
-    HciBleEventType,
 )
 
 from ble_device.ble_device_exception import *
@@ -855,45 +850,15 @@ class BleDeviceCommon(BleDeviceBasic):
             event_type_class=CommonEventType,
             max_event_list_size=max_event_list_size,
         )
+
         self.ble_device = ble_device
         self.sync_command = sync_command
         self.app_specifier = AppSpecifier.APP_SPECIFIER_COMMON
 
-    def create_hci_complete_event_struct(self):
-        event_cases = {
-            int(HciBleEventType.HCI_BLE_EVENT_PHY_UPDATE): Struct(
-                "status" / Int8ul,
-                "connection_handle" / Int16ul,
-                "tx_phy" / Int8ul,
-                "rx_phy" / Int8ul,
-            ),
-            int(HciBleEventType.HCI_BLE_EVENT_DATA_LENGTH_UPDATE): Struct(
-                "connection_handle" / Int16ul,
-                "max_tx_octets" / Int16ul,
-                "max_tx_time" / Int16ul,
-                "max_rx_octets" / Int16ul,
-                "max_rx_time" / Int16ul,
-            ),
-            int(HciBleEventType.HCI_BLE_EVENT_CHANNEL_MAP_UPDATE): Struct(
-                "connection_handle" / Int16ul,
-                "next_data_chan" / Int16ul,
-                "new_channel_map" / Array(5, Int8ul),
-            ),
-        }
-        return Struct(
-                "event" / Int16ul,
-                "ble_event_code" / Int8ul,
-                "data_len" / Int16ul,
-                "data" / Switch(
-                    lambda ctx: ctx.ble_event_code,
-                    event_cases,
-                    default=Array(this.data_len, Int8ul),
-                ),
-            )
-
     def message_parser(self, msg):
         event_type = msg.payload.event_type
         parsed_data = msg.payload.data
+
         if event_type == CommonEventType.NWP_COMMON_DEVICE_ADDRESS:
             data_struct = Struct(
                 "event" / Int16ul,
@@ -909,7 +874,12 @@ class BleDeviceCommon(BleDeviceBasic):
                 "cmd_opcode" / Int16ul,
             )
         elif event_type == CommonEventType.NWP_COMMON_HCI_COMPLETE_EVENT:
-            data_struct = self.create_hci_complete_event_struct()
+            data_struct = Struct(
+                "event" / Int16ul,
+                "ble_event_code" / Int16ul,
+                "data_len" / Int16ul,
+                "data" / Array(this.data_len, Int8ul),
+            )
         elif event_type == CommonEventType.NWP_COMMON_HCI_LE_EVENT:
             data_struct = Struct(
                 "event" / Int16ul,
@@ -1196,20 +1166,6 @@ class BleDeviceConnection(BleDeviceBasic):
                 "time_stamp" / Int32ul,
                 "event_type" / Enum(Int8ul, ConnectionEventNotifyType),
             )
-        elif event_type in (
-                ConnectionEventType.NWP_LINK_PARAM_UPDATE_EVENT,
-                ConnectionEventType.NWP_LINK_PARAM_UPDATE_REQ_EVENT,
-                ConnectionEventType.NWP_LINK_PARAM_UPDATE_REJECT_EVENT
-            ):
-            data_struct = Struct(
-                "event" / Int16ul,
-                "status" / Int8ul,
-                "opcode" / Int8ul,
-                "connection_handle" / Int16ul,
-                "interval" / Int16ul,
-                "latency" / Int16ul,
-                "timeout" / Int16ul,
-            )
 
             event_report = self.parse_struct(data_struct, msg)
             parsed_data = event_report
@@ -1227,7 +1183,7 @@ class BleDeviceConnection(BleDeviceBasic):
     def register_connection_event(
         self,
         connection_handle=0xFFFD,
-        event_type=ConnectionEventNotifyType.CONNECTION_CB_EVENT_ALL,
+        event_type=ConnectionEventNotifyType.CONNECTION_EVENT_ALL,
         report_frequency=0x0A,
     ):
         """
@@ -1297,97 +1253,6 @@ class BleDeviceConnection(BleDeviceBasic):
                 all_phys=all_phys,
                 tx_phy=tx_phy,
                 rx_phy=rx_phy,
-            )
-        )
-
-    def connection_parameter_update(
-        self,
-        connection_handle=0x00,
-        interval_min=0x50,
-        interval_max=0xA0,
-        conn_latency=0x00,
-        conn_timeout=0x3E8,
-        signal_identifier=0x00,
-    ):
-        """
-        @brief Update connection parameters for a connection.
-        @param connection_handle: Connection handle to send connection parameter update.
-        @param interval_min: Minimum connection interval.
-        @param interval_max: Maximum connection interval.
-        @param conn_latency: Connection latency.
-        @param conn_timeout: Connection timeout.
-        @param signal_identifier: L2CAP Signal Identifier (0 for LL update).
-        """
-        self.cmd = ConnectionCommands.CONNECTION_CMD_PARAMETER_UPDATE
-        self.data_struct = Struct(
-            "connection_handle" / Int16ul,
-            "interval_min" / Int16ul,
-            "interval_max" / Int16ul,
-            "conn_latency" / Int16ul,
-            "conn_timeout" / Int16ul,
-            "signal_identifier" / Int8ul,
-        )
-
-        self.send_nwp_cmd(
-            dict(
-                connection_handle=connection_handle,
-                interval_min=interval_min,
-                interval_max=interval_max,
-                conn_latency=conn_latency,
-                conn_timeout=conn_timeout,
-                signal_identifier=signal_identifier,
-            )
-        )
-
-    def channel_map_update(
-        self,
-        connection_handle=0x00,
-            channel_map=None,
-    ):
-        """
-        @brief Update channel map for a connection.
-        @param connection_handle: Connection handle to send connection parameter update.
-        @param channel_map: New channel map.
-        """
-        if channel_map is None:
-            channel_map = [0xFF, 0xFF, 0xFF, 0xFF, 0x00]
-        self.cmd = ConnectionCommands.CONNECTION_CMD_CHANNEL_MAP_UPDATE
-        self.data_struct = Struct(
-            "connection_handle" / Int16ul,
-            "channel_map" / Array(5, Int8ul),
-        )
-
-        self.send_nwp_cmd(
-            dict(
-                connection_handle=connection_handle,
-                channel_map=channel_map,
-            )
-        )
-    
-    def set_data_length(
-        self,
-        connection_handle=0x00,
-        tx_octets=0x1B,
-        tx_time=0x148,
-    ):
-        """
-        @brief Set data length and time for a connection.
-        @param connection_handle: Connection handle to send connection parameter update.
-        @param tx_octets: Maximum number of payload octets.
-        @param tx_time: Maximum time for transmission.
-        """
-        self.cmd = ConnectionCommands.CONNECTION_CMD_SET_DATA_LENGTH
-        self.data_struct = Struct(
-            "connection_handle" / Int16ul,
-            "tx_octets" / Int16ul,
-            "tx_time" / Int16ul,
-        )
-
-        self.send_nwp_cmd(
-            dict(
-                connection_handle=connection_handle,
-                tx_octets=tx_octets,
-                tx_time=tx_time,
             )
         )
 
@@ -1772,8 +1637,6 @@ class BleDeviceCs(BleDeviceBasic):
 
         self.app_specifier = AppSpecifier.APP_SPECIFIER_CS
 
-        # self.threads_pool = ThreadPoolExecutor(1)
-
     def read_local_supported_capabilities(self):
         self.cmd = CsCommands.CS_CMD_READ_LOCAL_CAP
         self.data_struct = None
@@ -2044,57 +1907,37 @@ class BleDeviceCs(BleDeviceBasic):
             data_struct = Struct(
                 "event" / Int16ul,
                 "status" / Int8ul,
-                "conn_handle" / Int16ul,
+                "connHandle" / Int16ul,
                 "distance" / Int32ul,
                 "quality" / Int32ul,
                 "confidence" / Int32ul,
-                "velocity" / Int32ul,
             )
 
         elif event_type == CsEventType.NWP_CS_APP_DISTANCE_EXTENDED_RESULTS:
-            # Mirrors AppExtCtrlCsAppExtendedResultsEvent_t (PACKED_TYPEDEF_STRUCT).
-            # CS_RANGING_MAX_ANT_PATHS = 4.
+            # Assuming CS_MAX_ANT_PATHS = 4, CS_MAX_MODE_ZERO_PER_PROCEDURE = 8, adjust if needed
             data_struct = Struct(
                 "event" / Int16ul,
                 "status" / Int8ul,
-                "conn_handle" / Int16ul,
+                "connHandle" / Int16ul,
                 "distance" / Int32ul,
                 "quality" / Int32ul,
                 "confidence" / Int32ul,
-                "velocity" / Int32ul,
-                "distance_music" / Int32ul,
-                "distance_nn" / Int32ul,
-                "distance_ifft" / Int32ul,
-                "ext_confidence" / Int32ul,
-                "num_mpc" / Int16ul,
-                "quality_paths" / Array(4, Int32ul),
-                "tqi_score" / Array(4, Int32ul),
-                "dcand" / Int32ul,
-                "cf" / Int32ul,
-                "d_var" / Int32ul,
-                "class_label" / Int16ul,
-                "runtime_ms" / Int32ul,
-                "runtime_profile" / Array(10, Int32ul),
-                "peak_bin_ifft" / Int16ul,
-                "peak_count_ifft" / Int16ul,
-                "ifft_valid" / Int16ul,
-            )
-
-        elif event_type == CsEventType.NWP_CS_APP_RAS_SUBEVENT_RESULTS:
-            data_struct = Struct(
-                "event" / Int16ul,
-                "status" / Int8ul,
-                "conn_handle" / Int16ul,
-                "start_acl_connection_event" / Int16ul,
-                "frequency_compensation" / Int16ul,
-                "ranging_done_status" / Int8ul,
-                "subevent_done_status" / Int8ul,
-                "ranging_abort_reason" / Int8ul,
-                "subevent_abort_reason" / Int8ul,
-                "reference_power_level" / Int8sl,
-                "num_steps_reported" / Int8ul,
-                "data_len" / Int32ul,
-                "data" / NiceBytes((Byte[this.data_len]))
+                "numMpc" / Int16ul,
+                "distanceMusic" / Array(4, Int32ul),
+                "distanceNN" / Array(4, Int32ul),
+                "numMpcPaths" / Array(4, Int16ul),
+                "qualityPaths" / Array(4, Int32ul),
+                "confidencePaths" / Array(4, Int32ul),
+                "localRpl" / Array(32, Int8sl),
+                "remoteRpl" / Array(32, Int8sl),
+                "modeZeroStepsInit"
+                / (Byte[96 * 5]),  # 96 elements of 5 bytes each for initiator
+                "modeZeroStepsRef"
+                / (Byte[96 * 3]),  # 96 elements of 3 bytes each for reflector
+                "permutationIndexLocal" / Array(75, Int8ul),
+                "stepsDataLocal" / (Byte[300 * 4]),  # 300 elements of 4 bytes each
+                "permutationIndexRemote" / Array(75, Int8ul),
+                "stepsDataRemote" / (Byte[300 * 4]),  # 300 elements of 4 bytes each
             )
 
         if data_struct is not None:
@@ -2102,23 +1945,11 @@ class BleDeviceCs(BleDeviceBasic):
             self.cs.append(self._last_cs_data)
             parsed_data = self._last_cs_data
 
-        # if event_type == CsEventType.NWP_CS_APP_DISTANCE_RESULTS:
-        #     self.threads_pool.submit(copy.deepcopy(self.print_obj_data), caption=CsEventType(event_type).name, data=parsed_data, port=self.ble_device.device_node.port)
-
         self.events_counter.increment_event(
             event_value=event_type, data_from_event=parsed_data
         )
 
         return parsed_data
-
-    # @staticmethod
-    # def print_obj_data(caption, data, port):
-    #     print(f"{caption}")
-    #     print(f"###################{port}#######################")
-    #     for key, value in data.items():
-    #         print(f"{key}: {value}")
-    #     print("######################################################################")
-
 
 
 class BleDeviceL2CAP(BleDeviceBasic):
@@ -2472,16 +2303,6 @@ class BleDeviceRREQ(BleDeviceBasic):
         self.cmd = RREQCommands.RREQ_CMD_ABORT
         self.data_struct = Struct("conn_handle" / Int16ul)
         self.send_nwp_cmd(dict(conn_handle=conn_handle))
-
-    def configure_char_registration(self, conn_handle=0x00, uuid = 0x0, subscribe_mode = 0x1):
-        self.cmd = RREQCommands.RREQ_CMD_CONFIGURE_CHAR
-        self.data_struct = Struct("conn_handle" / Int16ul, "uuid" / Int16ul, "subscribe_mode" / Int8ul)
-        self.send_nwp_cmd(dict(conn_handle=conn_handle, uuid=uuid, subscribe_mode=subscribe_mode))
-
-    def cs_procedure_started(self, conn_handle, procedure_counter):
-        self.cmd = RREQCommands.RREQ_CMD_CS_PROCEDURE_STARTED
-        self.data_struct = Struct("conn_handle" / Int16ul, "procedure_counter" / Int16ul)
-        self.send_nwp_cmd(dict(conn_handle=conn_handle, procedure_counter=procedure_counter))
 
     def message_parser(self, msg):
         event_type = msg.payload.event_type
