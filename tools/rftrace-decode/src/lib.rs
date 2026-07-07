@@ -22,6 +22,7 @@ pub mod deframe;
 pub mod output;
 pub mod packet;
 pub mod record;
+pub mod rft1;
 pub mod sample;
 pub mod synth;
 pub mod timestamp;

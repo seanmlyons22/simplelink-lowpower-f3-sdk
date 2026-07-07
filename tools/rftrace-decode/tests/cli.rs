@@ -126,6 +126,68 @@ fn decode_flags_alias_channel_and_stdin() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+// ------------------------------------------------------- decode --words (RFT1) ----
+
+/// Wrap tracer words as an RFT1 byte stream (magic + LE u16 Trace frames), as the Pico emits.
+fn rft1_stream(words: &[rftrace_decode::types::Word]) -> Vec<u8> {
+    let mut out = Vec::from(rftrace_decode::rft1::MAGIC);
+    for w in words {
+        out.extend_from_slice(&rftrace_decode::rft1::Frame::Trace(w.0).to_bytes());
+    }
+    out
+}
+
+#[test]
+fn decode_words_rft1_from_stdin_resyncs_and_reports_overflow() {
+    use rftrace_decode::rft1::Frame;
+    use rftrace_decode::synth::{args_to_params16, encode_packet};
+    use std::io::Write;
+    let (dir, dbgid) = setup("words");
+    // A packet for dbgid 5 / ch1 / one 32-bit arg (matches DBGID_LINE "val %08X").
+    let words = encode_packet(1, 5, &args_to_params16(&[0x1000], true), None, 0);
+    // Junk (incl a lone 'R') before the magic must be skipped; a trailing overflow bumps health.
+    let mut stream = vec![0xAA, b'R', 0x00];
+    stream.extend_from_slice(&rft1_stream(&words));
+    stream.extend_from_slice(&Frame::Overflow(3).to_bytes());
+
+    let mut child = Command::new(bin())
+        .args(["decode", "--words", "-", "--dbgid", dbgid.to_str().unwrap(), "stdout"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(&stream).unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let recs = stdout_records(&out);
+    assert_eq!(recs.len(), 1, "{recs:?}");
+    assert!(recs[0].contains("val 00001000"), "{}", recs[0]);
+    assert!(recs[0].contains("DBGCH1"), "{}", recs[0]);
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("overflow=3"),
+        "overflow not reported: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn decode_words_rft1_from_file() {
+    use rftrace_decode::synth::{args_to_params16, encode_packet};
+    let (dir, dbgid) = setup("wordsfile");
+    let words = encode_packet(1, 5, &args_to_params16(&[0x2000], true), None, 0);
+    let f = dir.join("cap.rft1");
+    std::fs::write(&f, rft1_stream(&words)).unwrap();
+    let out = run_ok(&[
+        "decode", "--words", f.to_str().unwrap(), "--dbgid", dbgid.to_str().unwrap(), "stdout",
+    ]);
+    let recs = stdout_records(&out);
+    assert_eq!(recs.len(), 1, "{recs:?}");
+    assert!(recs[0].contains("val 00002000"), "{}", recs[0]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn decode_divide_time_by_2_halves_timestamps() {
     let (dir, dbgid) = setup("div2");

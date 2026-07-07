@@ -25,6 +25,7 @@ use std::process::ExitCode;
 struct Cli {
     subcommand: String,
     input: Option<String>, // .sal path (replay/tail/retain) or raw path (decode)
+    words: Option<String>, // decode: RFT1 word stream (file|-), from the rftrace-pico Pico
     dbgid_paths: Vec<String>,
     channel: u8,
     alias: String,
@@ -56,6 +57,7 @@ fn parse_cli() -> Result<Cli, String> {
     let mut cli = Cli {
         subcommand,
         input: None,
+        words: None,
         dbgid_paths: Vec::new(),
         channel: 4,
         alias: "rftrc".to_string(),
@@ -88,6 +90,7 @@ fn parse_cli() -> Result<Cli, String> {
             "--alias" => cli.alias = next(&args, &mut i)?,
             "--out" => cli.out = Some(next(&args, &mut i)?),
             "--raw" => cli.input = Some(next(&args, &mut i)?),
+            "--words" => cli.words = Some(next(&args, &mut i)?),
             "--sal" => cli.input = Some(next(&args, &mut i)?),
             "--samplerate" => {
                 cli.samplerate = Some(next(&args, &mut i)?.parse().map_err(|_| "bad --samplerate")?)
@@ -308,6 +311,48 @@ fn stream_decode(
     Ok(())
 }
 
+/// Streaming decode of an RFT1 word stream (the rftrace-pico Pico's USB CDC output). The Pico
+/// already deframed the tracer line, so there is no sample deframing here: sync on the `RFT1`
+/// magic, then feed each `Trace` word through the same pipeline samples use; `Overflow` frames
+/// bump the health counter. Timeouts/interrupts are treated as "keep waiting" so a live, mostly
+/// idle serial pipe streams indefinitely; EOF or a hard error stops it.
+fn stream_words(
+    mut reader: impl std::io::Read,
+    db: &DbgIdDb,
+    alias: &str,
+    divide_time_by_2: bool,
+    outs: &mut [Box<dyn Output>],
+) -> std::io::Result<()> {
+    use rftrace_decode::rft1::{Decoder, Frame};
+    use std::io::ErrorKind;
+
+    let mut dec = Decoder::new();
+    let mut run = Run::new(db, alias, divide_time_by_2);
+    let mut buf = [0u8; 4096];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                for &b in &buf[..n] {
+                    match dec.push(b) {
+                        Some(Frame::Trace(w)) => run.feed(Word::new(w), outs),
+                        Some(Frame::Overflow(dropped)) => {
+                            run.health.overflow_words += u64::from(dropped)
+                        }
+                        None => {}
+                    }
+                }
+            }
+            Err(e) if matches!(e.kind(), ErrorKind::TimedOut | ErrorKind::Interrupted | ErrorKind::WouldBlock) => {
+                continue
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    run.finish(outs);
+    Ok(())
+}
+
 fn deframe_sal(runs: &SalRuns, cfg: &DeframeCfg) -> (Vec<Word>, u64) {
     deframe_edges(runs.initial_level, &runs.edges, runs.total, cfg)
 }
@@ -482,6 +527,19 @@ fn main() -> ExitCode {
         }
         "retain" => retain(&cli),
         "wireshark" => extcap(&cli),
+        "decode" if cli.words.is_some() => (|| {
+            // RFT1 word stream from the Pico (already deframed): no sample deframing.
+            let wpath = cli.words.clone().unwrap();
+            let db = load_db(&cli)?;
+            let mut outs = build_outputs(&cli)?;
+            let reader: Box<dyn std::io::Read> = if wpath == "-" {
+                Box::new(std::io::stdin().lock())
+            } else {
+                Box::new(std::fs::File::open(&wpath).map_err(|e| format!("opening {wpath}: {e}"))?)
+            };
+            stream_words(reader, &db, &cli.alias, cli.divide_time_by_2, &mut outs)
+                .map_err(|e| format!("decode --words: {e}"))
+        })(),
         "decode" => (|| {
             let path = cli.input.clone().unwrap_or_else(|| "-".to_string());
             let cfg = build_cfg(&cli, 500_000_000.0);
