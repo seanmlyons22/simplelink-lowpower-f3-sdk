@@ -140,6 +140,16 @@ class TestCommonArgs:
         assert "--divide-time-by-2" not in args
         assert args[args.index("--alias") + 1] == "rftrc"
 
+    def test_words_common_omits_sample_knobs(self):
+        # decode --words is fed already-deframed words: no channel/samplerate/baud.
+        t = make_transport(
+            port="/dev/ttyACM0", channel=7, samplerate=1e8, baud=1e7,
+            divide_time_by_2=True, dbgid=["a.h"], alias="brd",
+        )
+        args = t._words_common()
+        assert args == ["--alias", "brd", "--dbgid", "a.h", "--divide-time-by-2"]
+        assert "--channel" not in args and "--samplerate" not in args and "--baud" not in args
+
 
 class RecordingPopen:
     calls = []
@@ -183,6 +193,48 @@ class TestSpawn:
         assert sig[-2:] == ["-O", "binary"]
         assert dec[1:4] == ["/bin/td", "decode", "--raw"][1:4] or dec[:3] == ["/bin/td", "decode", "--raw"]
 
+    def test_rft1_spawns_words_decode(self):
+        make_transport(rft1="cap.rft1", dbgid=["d.h"])._spawn()
+        (cmd,) = RecordingPopen.calls
+        assert cmd[1:4] == ["decode", "--words", "cap.rft1"]
+        assert cmd[-3:] == ["pcap", "--out", "-"]
+        assert "--channel" not in cmd  # words mode: no sample knobs
+
+    def test_port_spawns_words_decode_over_a_pump(self, monkeypatch):
+        # Fake pyserial + a non-running pump thread so we can inspect the tracedecode command.
+        class FakeSerial:
+            def __init__(self, port, baud, timeout=None, dsrdtr=None):
+                self.dtr = True
+
+            def reset_input_buffer(self):
+                pass
+
+            def read(self, n):
+                return b""
+
+            def close(self):
+                pass
+
+        fake_serial = types.ModuleType("serial")
+        fake_serial.Serial = FakeSerial
+        monkeypatch.setitem(sys.modules, "serial", fake_serial)
+
+        class FakeThread:
+            def __init__(self, target=None, name=None, daemon=None):
+                pass
+
+            def start(self):
+                pass
+
+        import threading
+        monkeypatch.setattr(threading, "Thread", FakeThread)
+
+        make_transport(port="/dev/ttyACM0", dbgid=["d.h"], divide_time_by_2=True)._spawn()
+        (cmd,) = RecordingPopen.calls
+        assert cmd[1:4] == ["decode", "--words", "-"]
+        assert "--divide-time-by-2" in cmd
+        assert "--channel" not in cmd
+
     def test_no_source_raises(self):
         with pytest.raises(SystemExit):
             make_transport()._spawn()
@@ -225,6 +277,8 @@ class TestCli:
         assert r.exit_code == 2
         r, _ = invoke(cli, ["--sal", "a.sal", "--logic2", "--dbgid", "d.h"])
         assert r.exit_code == 2
+        r, _ = invoke(cli, ["--port", "/dev/ttyACM0", "--sal", "a.sal", "--dbgid", "d.h"])
+        assert r.exit_code == 2
 
     def test_requires_metadata(self, cli):
         r, _ = invoke(cli, ["--sal", "a.sal"])
@@ -235,6 +289,8 @@ class TestCli:
             (["--sal", "a.sal"], "sal", Path("a.sal")),
             (["--raw", "-"], "raw", Path("-")),
             (["--sigrok", "-C D4"], "sigrok", "-C D4"),
+            (["--port", "/dev/ttyACM0"], "port", "/dev/ttyACM0"),
+            (["--rft1", "cap.rft1"], "rft1", "cap.rft1"),
         ]:
             r, captured = invoke(cli, args + ["--dbgid", "d.h"])
             assert r.exit_code == 0, r.output

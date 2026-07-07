@@ -42,7 +42,9 @@ setuptools.setup(
             "rftrace = tilogger_rftrace.rftrace_transport:transport_factory_cli",
         ],
     },
-    install_requires=["typer==0.15.1", "colorama==0.4.6"],
+    # pyserial: read the rftrace-pico Raspberry Pi Pico receiver's RFT1 stream over USB CDC
+    # (--port). The same dependency the itm/uart streams use.
+    install_requires=["typer==0.15.1", "colorama==0.4.6", "pyserial>=3.5"],
     # --logic2 (drive Logic 2 to capture from a Saleae Logic Pro) is optional:
     #   pip install -e streams/rftrace[logic2]
     extras_require={"logic2": ["logic2-automation>=1.0.0"]},

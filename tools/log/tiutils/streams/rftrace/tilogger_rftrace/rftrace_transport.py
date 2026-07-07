@@ -152,7 +152,8 @@ def _build_command(td, common, sal, raw):
 class RFTrace_Transport(_TransportBase):
     """tilogger transport that fronts the native `tracedecode` backend."""
 
-    def __init__(self, *, tracedecode, sal, raw, sigrok, channel, samplerate, baud,
+    def __init__(self, *, tracedecode, sal, raw, sigrok, port=None, rft1=None,
+                 channel, samplerate, baud,
                  divide_time_by_2, dbgid, elf, alias,
                  logic2=False, duration=None, trigger=None, trigger_channel=None,
                  after=None, buffer_mb=None, loop=False, count=None,
@@ -162,6 +163,11 @@ class RFTrace_Transport(_TransportBase):
         self._sal = sal
         self._raw = raw
         self._sigrok = sigrok
+        # Pico (RFT1 word stream) sources: a live serial port, or a captured .rft1 byte file.
+        self._port = port
+        self._rft1 = rft1
+        self._serial = None
+        self._pump = None
         self._channel = channel
         self._samplerate = samplerate
         self._baud = baud
@@ -204,8 +210,79 @@ class RFTrace_Transport(_TransportBase):
             args += ["--divide-time-by-2"]
         return args
 
+    def _words_common(self):
+        # `decode --words` ignores the sample-capture knobs (channel/samplerate/baud); pass only
+        # what applies to an already-deframed word stream.
+        args = ["--alias", self._alias]
+        for d in self._dbgid:
+            args += ["--dbgid", str(d)]
+        if self._divide:
+            args += ["--divide-time-by-2"]
+        return args
+
+    def _spawn_port(self):
+        """Open the Pico's USB CDC port and pump its RFT1 bytes into `tracedecode decode --words`.
+
+        The firmware sends the RFT1 magic once per host connection, so toggle DTR low->high to
+        force it to re-announce (the decoder needs the magic to sync). 115200 is arbitrary for a
+        CDC port but must not be 1200 - that value is the firmware's reboot-to-bootloader touch.
+        """
+        try:
+            import serial
+        except ImportError:
+            raise SystemExit("rftrace --port needs pyserial (pip install pyserial)")
+        import threading
+
+        ser = serial.Serial(self._port, 115200, timeout=0.2, dsrdtr=False)
+        ser.dtr = False
+        time.sleep(0.3)
+        ser.reset_input_buffer()
+        ser.dtr = True  # low->high => firmware re-announces the RFT1 magic
+
+        dec = subprocess.Popen(
+            [self._td, "decode", "--words", "-", *self._words_common(), "pcap", "--out", "-"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+        )
+
+        # ponytail: one portable pump thread (serial -> decoder stdin) instead of platform fd
+        # passing - pyserial's fileno() isn't usable as a child's stdin on Windows.
+        def pump():
+            try:
+                while not self._stopping:
+                    b = ser.read(4096)
+                    if b:
+                        dec.stdin.write(b)
+                        dec.stdin.flush()
+            except Exception:
+                pass
+            finally:
+                try:
+                    dec.stdin.close()
+                except Exception:
+                    pass
+
+        t = threading.Thread(target=pump, name="rftrace-serial-pump", daemon=True)
+        t.start()
+        self._serial = ser
+        self._pump = t
+        self._procs = [dec]
+        return dec.stdout
+
     def _spawn(self):
         """Start the decoder (and sigrok, if live) and return its pcap stdout stream."""
+        # Pico word-stream sources: no sample deframing, so tracedecode runs `decode --words`.
+        if self._rft1 is not None:
+            dec = subprocess.Popen(
+                [self._td, "decode", "--words", str(self._rft1),
+                 *self._words_common(), "pcap", "--out", "-"],
+                stdout=subprocess.PIPE,
+            )
+            self._procs = [dec]
+            return dec.stdout
+        if self._port is not None:
+            return self._spawn_port()
+
         common = self._common_args()
         if self._sigrok is not None:
             sig = subprocess.Popen(
@@ -386,6 +463,11 @@ class RFTrace_Transport(_TransportBase):
 
     def stop(self):
         self._stopping = True
+        if self._serial is not None:
+            try:
+                self._serial.close()  # unblocks the pump thread's read
+            except Exception:
+                pass
         for p in self._procs:
             try:
                 p.terminate()
@@ -412,7 +494,9 @@ def transport_factory_cli(app):
         dbgid: List[Path] = typer.Option([], "--dbgid", help="extra DBG_DEF header(s) for modem/LRF (pbe/rfe/mce); repeatable"),
         sal: Optional[Path] = typer.Option(None, "--sal", help="Saleae .sal capture to replay"),
         raw: Optional[Path] = typer.Option(None, "--raw", help="raw 1 byte/sample file, or - for stdin"),
-        sigrok: Optional[str] = typer.Option(None, "--sigrok", help="sigrok-cli args for live capture, piped into the decoder"),
+        sigrok: Optional[str] = typer.Option(None, "--sigrok", help="(legacy; prefer --port or --logic2) sigrok-cli args for live capture, piped into the decoder"),
+        port: Optional[str] = typer.Option(None, "--port", help="live rftrace-pico Raspberry Pi Pico receiver on this USB CDC port (e.g. /dev/ttyACM0)"),
+        rft1: Optional[str] = typer.Option(None, "--rft1", help="replay a captured RFT1 byte stream (the Pico's output), or - for stdin"),
         logic2: bool = typer.Option(False, "--logic2", help="capture via the Logic 2 Automation API (Saleae Logic Pro), looped"),
         duration: Optional[float] = typer.Option(None, "--duration", help="[--logic2] timed capture window, seconds"),
         trigger: Optional[str] = typer.Option(None, "--trigger", help="[--logic2] digital trigger: rising|falling|pulse-high|pulse-low"),
@@ -443,7 +527,13 @@ def transport_factory_cli(app):
         binary (no manual elf2dbgid step). Add `--dbgid <file>` for modem/LRF traces
         (pbe/rfe/mce), which aren't in the app ELF. At least one of --elf / --dbgid is required.
 
-        Sources (exactly one): --sal <file>, --raw <file|->, --sigrok "<args>", or
+        Sources (exactly one). Raspberry Pi Pico receiver (rftrace-pico): --port <dev>
+        for a live Pico on a USB CDC port, or --rft1 <file|-> to replay its captured byte
+        stream, e.g.
+
+            tilogger rftrace --port /dev/ttyACM0 --elf app.out --divide-time-by-2 stdout
+
+        Saleae / logic-analyzer: --sal <file>, --raw <file|->, --sigrok "<args>", or
         --logic2 (drive Logic 2's Automation API to capture from a Saleae Logic Pro;
         needs `pip install logic2-automation` and Logic 2 running with automation
         enabled). With --logic2 set --duration <s> or --trigger <edge>; add --loop or
@@ -455,9 +545,9 @@ def transport_factory_cli(app):
                 --count 5 --elf app.out stdout
         """
         ctx.ensure_object(LoggerCliCtx)
-        nsources = sum(x is not None for x in (sal, raw, sigrok)) + (1 if logic2 else 0)
+        nsources = sum(x is not None for x in (sal, raw, sigrok, port, rft1)) + (1 if logic2 else 0)
         if nsources != 1:
-            typer.secho("rftrace: specify exactly one source: --sal, --raw, --sigrok, or --logic2", fg=typer.colors.BRIGHT_RED, err=True)
+            typer.secho("rftrace: specify exactly one source: --port (Pico), --rft1, --sal, --raw, --sigrok, or --logic2", fg=typer.colors.BRIGHT_RED, err=True)
             raise typer.Exit(2)
         if logic2:
             if trigger is None and duration is None:
@@ -470,7 +560,8 @@ def transport_factory_cli(app):
             typer.secho("rftrace: need --elf <app.out> and/or --dbgid <file>", fg=typer.colors.BRIGHT_RED, err=True)
             raise typer.Exit(2)
         return RFTrace_Transport(
-            tracedecode=tracedecode, sal=sal, raw=raw, sigrok=sigrok, channel=channel,
+            tracedecode=tracedecode, sal=sal, raw=raw, sigrok=sigrok, port=port, rft1=rft1,
+            channel=channel,
             samplerate=samplerate, baud=baud, divide_time_by_2=divide_time_by_2,
             dbgid=dbgid, elf=elf, alias=alias,
             logic2=logic2, duration=duration, trigger=trigger, trigger_channel=trigger_channel,
