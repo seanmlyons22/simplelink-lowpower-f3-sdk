@@ -49,9 +49,9 @@
  *  @endcode
  *
  *  This module implements two functions that are required by the Log API:
- *   - printf(const Log_Module *handle, Log_Level level, uint32_t headerPtr,
+ *   - printf(const Log_Module *handle, uint32_t headerPtr,
  *     uint32_t numArgs, ...);
- *   - buf(const Log_Module *handle, Log_Level level, uint32_t headerPtr,
+ *   - buf(const Log_Module *handle, uint32_t headerPtr,
  *     uint8_t *data, size_t size);
  *
  *  Whenever a log statement that uses LogSinkUART as its sink is called, the
@@ -135,8 +135,13 @@
  *  The LogSinkUART implementation is based on the following architecture.
  *
  *  ## Packet Transmission Format
- *  All log packets begin with a 32-bit metadata pointer followed by a 32-bit
- *  timestamp. The next fields depend on the type of log statement:
+ *  All log packets begin with a one-byte frame header followed by a 16-bit log
+ *  id and a 32-bit timestamp. The frame header holds a fixed sync pattern in the
+ *  high nibble and a record code in the low nibble (the argument count for a
+ *  printf, or a reserved code for a buffer or overflow record). The log id is
+ *  the low 16 bits of the .log_ptr slot; the host recovers the full slot, and
+ *  thus the format string, from the .out file. The next fields depend on the
+ *  type of log statement:
  *      - Log_printf: Variable number of 32-bit arguments that range from 0 to
  *        8.
  *      - Log_buf: 32-bit field with the size of the buffer being sent followed
@@ -158,27 +163,28 @@
  *  scale 1 as 50 pixels
  *
  *  @LP
- *  0 is Metadata_Pointer #FFCC99: 0:31
- *  +4 is Timestamp #CC99FF: 32:63
+ *  0 is Frame_Header #FFCC99: 0:7
+ *  +1 is Log_Id #FFCC99: 8:23
+ *  +2 is Timestamp #CC99FF: 24:55
  *  +4 is VA_Arg_0 #99CCFF: 64:95
  *  +4 is {-} #99CCFF: ...
  *  +1 is VA_Arg_n #99CCFF: 32-bits
  *  +4 is {-}
  *
  *  @LB
- *  0 is Metadata_Pointer #FFCC99: 0:31
- *  +4 is Timestamp #CC99FF: 32:63
- *  +4 is Buffer_Size #97D077: 64:95
+ *  0 is Frame_Header #FFCC99: 0:7
+ *  +1 is Log_Id #FFCC99: 8:23
+ *  +2 is Timestamp #CC99FF: 24:55
+ *  +4 is Buffer_Size #97D077: 32-bits
  *  +4 is Buffer_Data #99CCFF
  *  +5 is {-}
  *  @enduml
  *
- *  If a packet would overflow the ring buffer, a 32-bit overflow packet is
- *  placed instead. It is the original metadata pointer modified to be
- *  identified as an overflow packet. The host-side tool decodes it and displays
- *  an overflow message, indicating that at least that message would have
- *  overflowed. When this is observed, it is recommended to either resize the
- *  ring buffer or disable some log statements.
+ *  If a packet would overflow the ring buffer, a short overflow packet is placed
+ *  instead: the frame header with the overflow code, followed by the log id. The
+ *  host-side tool decodes it and displays an overflow message, indicating that
+ *  at least that message would have overflowed. When this is observed, it is
+ *  recommended to either resize the ring buffer or disable some log statements.
  *  @note If the intermediate ring buffer is full, no new overflow or log
  *  packets will be stored.
  *
@@ -186,19 +192,18 @@
  *
  *  Log statement type | Log statement size (bytes)  |
  *  ------------------ | --------------------------- |
- *  Log_printf         | 8 + 4 * number_of_arguments |
- *  Log_buf            | 12 + buffer_size            |
- *  Overflow           | 4                           |
+ *  Log_printf         | 7 + 4 * number_of_arguments |
+ *  Log_buf            | 11 + buffer_size            |
+ *  Overflow           | 3                           |
  *
  *  ## Packet Framing
  *  The host-side must receive and properly handle a continuous stream of packets.
- *  It is able to decode and synchronize packets. If the first 32 bits is not a
- *  valid metadata-pointer address, it will left-shift byte-by-byte until it detects
- *  a valid one. Once a metadata-pointer address is verified, the host-side tool
- *  knows that it is followed by a timestamp. The number of arguments for each
- *  frame is extracted from the .out file. This determines the length of the
- *  current packet and when the metadata-pointer address from the next packet is
- *  expected.
+ *  Each record begins with a frame header byte: a fixed sync pattern in the high
+ *  nibble and a record code in the low nibble. The host resynchronizes by
+ *  discarding bytes until a header with a valid sync pattern and a known log id
+ *  is found. The record code gives the packet length directly (the argument
+ *  count for a printf, a fixed length for an overflow, or a size field for a
+ *  buffer), which determines where the next record begins.
  *
  *  ## Flushing the data
  *  A hook function installed in the Idle-loop/task is run when no other tasks
@@ -358,7 +363,7 @@ extern "C" {
 /*!
  * @brief LogSinkUART version
  */
-#define Log_TI_LOG_SINK_UART_VERSION 0.1.0
+#define Log_TI_LOG_SINK_UART_VERSION 0.2.0
 
 /*!
  *  @brief      LogSinkUART Hardware attributes
@@ -485,7 +490,6 @@ extern void LogSinkUART_finalize(uint_least8_t index);
  *
  *  @param[in]  handle     LogSinkUART sink handle
  *
- *  @param[in]  header     Metadata pointer
  *
  *  @param[in]  headerPtr  Pointer to metadata pointer
  *
@@ -499,13 +503,22 @@ extern void LogSinkUART_printfSingleton(const Log_Module *handle,
                                         uint32_t numArgs,
                                         ...);
 
-extern void LogSinkUART_printfSingleton0(const Log_Module *handle, Log_Level level, uint32_t headerPtr, ...);
+extern void LogSinkUART_printfSingleton0(const Log_Module *handle, Log_Level level, uint32_t headerPtr);
 
-extern void LogSinkUART_printfSingleton1(const Log_Module *handle, Log_Level level, uint32_t headerPtr, ...);
+extern void LogSinkUART_printfSingleton1(const Log_Module *handle, Log_Level level, uint32_t headerPtr, uintptr_t a0);
 
-extern void LogSinkUART_printfSingleton2(const Log_Module *handle, Log_Level level, uint32_t headerPtr, ...);
+extern void LogSinkUART_printfSingleton2(const Log_Module *handle,
+                                         Log_Level level,
+                                         uint32_t headerPtr,
+                                         uintptr_t a0,
+                                         uintptr_t a1);
 
-extern void LogSinkUART_printfSingleton3(const Log_Module *handle, Log_Level level, uint32_t headerPtr, ...);
+extern void LogSinkUART_printfSingleton3(const Log_Module *handle,
+                                         Log_Level level,
+                                         uint32_t headerPtr,
+                                         uintptr_t a0,
+                                         uintptr_t a1,
+                                         uintptr_t a2);
 /*! @endcond NODOC */
 
 /*!
@@ -526,7 +539,6 @@ extern void LogSinkUART_printfSingleton3(const Log_Module *handle, Log_Level lev
  *
  *  @param[in]  handle     LogSinkUART sink handle
  *
- *  @param[in]  header     Metadata pointer
  *
  *  @param[in]  headerPtr  Pointer to metadata pointer
  *
@@ -540,13 +552,25 @@ extern void LogSinkUART_printfDepInjection(const Log_Module *handle,
                                            uint32_t numArgs,
                                            ...);
 
-extern void LogSinkUART_printfDepInjection0(const Log_Module *handle, Log_Level level, uint32_t headerPtr, ...);
+extern void LogSinkUART_printfDepInjection0(const Log_Module *handle, Log_Level level, uint32_t headerPtr);
 
-extern void LogSinkUART_printfDepInjection1(const Log_Module *handle, Log_Level level, uint32_t headerPtr, ...);
+extern void LogSinkUART_printfDepInjection1(const Log_Module *handle,
+                                            Log_Level level,
+                                            uint32_t headerPtr,
+                                            uintptr_t a0);
 
-extern void LogSinkUART_printfDepInjection2(const Log_Module *handle, Log_Level level, uint32_t headerPtr, ...);
+extern void LogSinkUART_printfDepInjection2(const Log_Module *handle,
+                                            Log_Level level,
+                                            uint32_t headerPtr,
+                                            uintptr_t a0,
+                                            uintptr_t a1);
 
-extern void LogSinkUART_printfDepInjection3(const Log_Module *handle, Log_Level level, uint32_t headerPtr, ...);
+extern void LogSinkUART_printfDepInjection3(const Log_Module *handle,
+                                            Log_Level level,
+                                            uint32_t headerPtr,
+                                            uintptr_t a0,
+                                            uintptr_t a1,
+                                            uintptr_t a2);
 /*! @endcond NODOC */
 
 /*!
@@ -566,7 +590,6 @@ extern void LogSinkUART_printfDepInjection3(const Log_Module *handle, Log_Level 
  *
  *  @param[in]  handle     LogSinkUART sink handle
  *
- *  @param[in]  header     Unused metadata pointer
  *
  *  @param[in]  headerPtr  Pointer to metadata pointer
  *

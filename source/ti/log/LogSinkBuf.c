@@ -32,90 +32,227 @@
 
 /*
  *  ======== LogSinkBuf.c ========
+ *
+ *  Records are packed into a circular byte buffer as COBS frames and streamed out
+ *  by a host over the debug port. The heavy lifting - mapping the 16-bit id back
+ *  to a format string, decoding arguments, and turning timestamp deltas into
+ *  absolute time - all happens on the host from the .out file, so the target only
+ *  ever writes a couple of bytes of id, a delta, and the raw arguments. See the
+ *  record layout in LogSinkBuf.h.
  */
 
 #include <stdint.h>
-#include <stdio.h>
+#include <stddef.h>
 #include <stdarg.h>
-#include <string.h>
 
 #include <ti/drivers/dpl/HwiP.h>
 #include <ti/drivers/dpl/TimestampP.h>
 
 #include <ti/log/LogSinkBuf.h>
 
-#define LogSinkBuf_FULL     -1
-#define LogSinkBuf_MAX_ARGS (LogSinkBuf_WORDS_PER_RECORD - 1)
+/* Runtime level filter: emit only when the level is enabled, either through a
+ * module's dynamic (runtime-settable) bitmap or its constant one. */
+#define LogSinkBuf_LEVEL_ENABLED(handle, level) \
+    (((handle->dynamicLevelsPtr != NULL) && (level & *(handle->dynamicLevelsPtr))) || (handle->levels & level))
 
 /* Global LogSinkBuf instance reference for use with singleton implementations
  * of printf.
  */
 Log_SINK_BUF_USE(CONFIG_ti_log_LogSinkBuf_0);
 
-static void findNextRecord(LogSinkBuf_Handle inst, LogSinkBuf_Rec **rec)
+/*
+ *  ======== LogSinkBuf_uleb ========
+ *  ULEB128-encode a 32-bit value into out (at most 5 bytes). Returns the number
+ *  of bytes written.
+ */
+static uint32_t LogSinkBuf_uleb(uint32_t value, uint8_t *out)
 {
-    /* compute next available record */
-    *rec = inst->curEntry;
-    if (*rec == inst->endEntry)
+    uint32_t n = 0;
+    while (value >= 0x80)
     {
-        if (inst->advance == LogSinkBuf_Type_CIRCULAR)
-        {
-            inst->curEntry = inst->buffer;
-        }
-        else
-        {
-            inst->advance = LogSinkBuf_FULL;
-        }
+        out[n++] = (uint8_t)(value | 0x80);
+        value >>= 7;
     }
-    else
-    {
-        inst->curEntry = (LogSinkBuf_Rec *)((char *)*rec + sizeof(LogSinkBuf_Rec));
-    }
+    out[n++] = (uint8_t)value;
+    return n;
 }
 
 /*
- *  ======== LogSinkBuf_printf ========
+ *  ======== LogSinkBuf_ulebLen ========
+ *  Number of bytes LogSinkBuf_uleb() would write for value. Used to size the
+ *  reservation before encoding.
  */
-void LogSinkBuf_printf(LogSinkBuf_Handle inst, Log_Level level, uint32_t headerPtr, uint32_t numArgs, va_list argptr)
+static uint32_t LogSinkBuf_ulebLen(uint32_t value)
 {
-    uintptr_t key;
-    uint32_t serial;
-    LogSinkBuf_Rec *rec;
-    uint32_t argsToCopy = numArgs;
+    uint32_t n = 1;
+    while (value >= 0x80)
+    {
+        value >>= 7;
+        n++;
+    }
+    return n;
+}
 
-    /* disable interrupts */
+/*
+ *  ======== COBS streaming encoder ========
+ *
+ *  Consistent Overhead Byte Stuffing writes a frame that contains no 0x00 byte,
+ *  then a single 0x00 delimiter, so the host can find frame boundaries in the raw
+ *  buffer without any length field. This encoder writes straight into the
+ *  circular buffer (wrapping at the physical end) so a large Log_buf payload never
+ *  needs a matching stack buffer. The code byte at the head of each block is
+ *  back-patched once the block length is known.
+ */
+typedef struct
+{
+    uint8_t *buf;
+    uint32_t size;
+    uint32_t wr;      /* ring index of the next output byte */
+    uint32_t codeIdx; /* ring index of the pending (not yet written) code byte */
+    uint8_t  code;    /* number of bytes in the current block, plus one */
+    uint32_t count;   /* total bytes written to the ring so far */
+} LogSinkBuf_Cobs;
+
+static void LogSinkBuf_cobsPut(LogSinkBuf_Cobs *c, uint8_t b)
+{
+    c->buf[c->wr] = b;
+    if (++c->wr == c->size)
+    {
+        c->wr = 0;
+    }
+    c->count++;
+}
+
+static void LogSinkBuf_cobsInit(LogSinkBuf_Cobs *c, LogSinkBuf_Handle inst, uint32_t off)
+{
+    c->buf     = inst->buffer;
+    c->size    = inst->size;
+    c->codeIdx = off % inst->size; /* first code byte, back-patched by the first block */
+    c->wr      = c->codeIdx;
+    if (++c->wr == c->size) /* reserve the code slot */
+    {
+        c->wr = 0;
+    }
+    c->code  = 1;
+    c->count = 1; /* the reserved code slot counts toward the frame length */
+}
+
+static void LogSinkBuf_cobsFeed(LogSinkBuf_Cobs *c, const uint8_t *in, uint32_t len)
+{
+    uint32_t i;
+    for (i = 0; i < len; i++)
+    {
+        if (in[i] != 0)
+        {
+            LogSinkBuf_cobsPut(c, in[i]);
+            if (++c->code != 0xFF)
+            {
+                continue;
+            }
+        }
+        /* A zero byte, or a full 254-byte run: close the block and open a new
+         * one. The zero itself is represented by the code byte, not emitted. */
+        c->buf[c->codeIdx] = c->code;
+        c->codeIdx         = c->wr;
+        if (++c->wr == c->size)
+        {
+            c->wr = 0;
+        }
+        c->count++;
+        c->code = 1;
+    }
+}
+
+static void LogSinkBuf_cobsFinish(LogSinkBuf_Cobs *c)
+{
+    c->buf[c->codeIdx] = c->code; /* back-patch the final block (slot already counted) */
+    LogSinkBuf_cobsPut(c, 0x00);  /* frame delimiter */
+}
+
+/*
+ *  ======== LogSinkBuf_printfArgs ========
+ *  Shared record encoder. Takes the promoted printf arguments as a plain array
+ *  so the fixed-argument-count wrappers can reach it without building a va_list.
+ *  Callers guarantee numArgs <= LogSinkBuf_MAX_ARGS. Level filtering is done by
+ *  the wrappers, so this core is only reached for records that must be emitted.
+ */
+static void LogSinkBuf_printfArgs(LogSinkBuf_Handle inst, uint32_t index, const uintptr_t *args, uint32_t numArgs)
+{
+    uintptr_t       key;
+    uint32_t        now, delta, off, frameLen, i, argLen;
+    uint32_t        deltaLen;
+    uint8_t         idbuf[2];
+    uint8_t         deltabuf[5];
+    uint8_t         argbuf[5]; /* one arg's worst-case ULEB, reused per arg */
+    uint32_t        argsLen = 0;
+    LogSinkBuf_Cobs cobs;
+
+    /* Read the timestamp outside the critical section; only the delta bookkeeping
+     * and the reservation below must be atomic. */
+    now = TimestampP_getNative32();
+
+    /* Measure the encoded argument length without storing it, so the reservation
+     * can be exact. The encode pass below re-walks the same args, so they go
+     * straight into the ring through a 5-byte per-arg scratch instead of a
+     * LogSinkBuf_MAX_ARGS * 5 stack buffer. */
+    for (i = 0; i < numArgs; i++)
+    {
+        argsLen += LogSinkBuf_ulebLen((uint32_t)args[i]);
+    }
+
     key = HwiP_disable();
 
-    /* increment serial even when full */
-    serial = ++(inst->serial);
+    /* Delta from the previous record. The clamp keeps records ordered if a
+     * higher-priority context preempted us between the read above and here, and
+     * folds the ~9.5 hour RTC wrap into a single zero delta rather than a huge
+     * one. */
+    if (now >= inst->lastTs)
+    {
+        delta        = now - inst->lastTs;
+        inst->lastTs = now;
+    }
+    else
+    {
+        delta = 0;
+    }
+    deltaLen = LogSinkBuf_ulebLen(delta);
 
-    if (inst->advance == LogSinkBuf_FULL)
+    /* id + delta + args, plus one COBS overhead byte and the 0x00 delimiter. The
+     * COBS overhead is exactly one byte because the payload is well under 254. */
+    frameLen = 2 + deltaLen + argsLen + 2;
+    off      = inst->wrReserve;
+
+    if (frameLen > inst->size)
     {
         HwiP_restore(key);
-        return;
+        return; /* record can never fit */
+    }
+    if (inst->bufType == LogSinkBuf_Type_LINEAR && (off + frameLen) > inst->size)
+    {
+        inst->overflow++;
+        HwiP_restore(key);
+        return; /* linear buffer is full */
     }
 
-    /* compute next available record */
-    findNextRecord(inst, &rec);
+    inst->wrReserve = off + frameLen;
+    inst->recCount++;
 
-    rec->timestampLow = TimestampP_getNative32();
-
-    /* enable interrupts */
     HwiP_restore(key);
 
-    /* write data to record */
-    rec->serial = serial;
-    rec->type   = LogSinkBuf_PRINTF;
+    /* Encode [id][delta][args] as one COBS frame into the reserved bytes. */
+    idbuf[0] = (uint8_t)index;
+    idbuf[1] = (uint8_t)(index >> 8);
+    (void)LogSinkBuf_uleb(delta, deltabuf);
 
-    rec->data[0] = headerPtr;
-
-    uint32_t i;
-    for (i = 0; i < argsToCopy; i++)
+    LogSinkBuf_cobsInit(&cobs, inst, off);
+    LogSinkBuf_cobsFeed(&cobs, idbuf, 2);
+    LogSinkBuf_cobsFeed(&cobs, deltabuf, deltaLen);
+    for (i = 0; i < numArgs; i++)
     {
-        rec->data[1 + i] = va_arg(argptr, uintptr_t);
+        argLen = LogSinkBuf_uleb((uint32_t)args[i], argbuf);
+        LogSinkBuf_cobsFeed(&cobs, argbuf, argLen);
     }
-
-    return;
+    LogSinkBuf_cobsFinish(&cobs);
 }
 
 /*
@@ -127,11 +264,13 @@ void LogSinkBuf_printf(LogSinkBuf_Handle inst, Log_Level level, uint32_t headerP
  *  The implementation will read out the LogSinkBuf_Instance address at runtime
  *  from the handle argument.
  */
-void LogSinkBuf_printfDepInjection(const Log_Module *handle, Log_Level level, uint32_t headerPtr, uint32_t numArgs, ...)
+void LogSinkBuf_printfDepInjection(const Log_Module *handle, Log_Level level, uint32_t index, uint32_t numArgs, ...)
 {
-    if (((handle->dynamicLevelsPtr != NULL) && (level & *(handle->dynamicLevelsPtr))) || (handle->levels & level))
+    if (LogSinkBuf_LEVEL_ENABLED(handle, level))
     {
-        va_list argptr;
+        va_list   argptr;
+        uintptr_t argv[LogSinkBuf_MAX_ARGS];
+        uint32_t  i;
 
         /* Guard against more arguments being passed in than supported */
         if (numArgs > LogSinkBuf_MAX_ARGS)
@@ -139,99 +278,95 @@ void LogSinkBuf_printfDepInjection(const Log_Module *handle, Log_Level level, ui
             numArgs = LogSinkBuf_MAX_ARGS;
         }
 
-        LogSinkBuf_Handle inst = (LogSinkBuf_Handle)handle->sinkConfig;
-
-        /* Get the VA args pointer in the initial wrapper since you cannot pass VA
-         * args to further functions using elipses (...) syntax.
-         *
-         * All va_start() does is get us the pointer to the first VA arg on the
-         * stack. That value will still be valid when passed on further.
-         */
         va_start(argptr, numArgs);
-
-        LogSinkBuf_printf(inst, level, headerPtr, numArgs, argptr);
-
+        for (i = 0; i < numArgs; i++)
+        {
+            argv[i] = va_arg(argptr, uintptr_t);
+        }
         va_end(argptr);
+
+        LogSinkBuf_printfArgs((LogSinkBuf_Handle)handle->sinkConfig, index, argv, numArgs);
     }
 }
+
+/* The fixed-argument-count delegates below are non-variadic (matching the
+ * per-arity Log_printfN_fxn typedefs) so their prologue does not spill the
+ * argument registers the way a variadic function must. Each runs the level
+ * filter and, when it passes, calls the shared encoder with a small argument
+ * array built on the stack.
+ */
 
 /*
  *  ======== LogSinkBuf_printfDepInjection0 ========
  */
-void LogSinkBuf_printfDepInjection0(const Log_Module *handle, Log_Level level, uint32_t headerPtr, ...)
+void LogSinkBuf_printfDepInjection0(const Log_Module *handle, Log_Level level, uint32_t index)
 {
-    if (((handle->dynamicLevelsPtr != NULL) && (level & *(handle->dynamicLevelsPtr))) || (handle->levels & level))
+    if (LogSinkBuf_LEVEL_ENABLED(handle, level))
     {
-        va_list argptr;
-
-        va_start(argptr, headerPtr);
-        LogSinkBuf_printf((LogSinkBuf_Handle)handle->sinkConfig, level, headerPtr, 0, argptr);
-        va_end(argptr);
+        LogSinkBuf_printfArgs((LogSinkBuf_Handle)handle->sinkConfig, index, NULL, 0);
     }
 }
 
 /*
  *  ======== LogSinkBuf_printfDepInjection1 ========
  */
-void LogSinkBuf_printfDepInjection1(const Log_Module *handle, Log_Level level, uint32_t headerPtr, ...)
+void LogSinkBuf_printfDepInjection1(const Log_Module *handle, Log_Level level, uint32_t index, uintptr_t a0)
 {
-    if (((handle->dynamicLevelsPtr != NULL) && (level & *(handle->dynamicLevelsPtr))) || (handle->levels & level))
+    if (LogSinkBuf_LEVEL_ENABLED(handle, level))
     {
-        va_list argptr;
-
-        va_start(argptr, headerPtr);
-        LogSinkBuf_printf((LogSinkBuf_Handle)handle->sinkConfig, level, headerPtr, 1, argptr);
-        va_end(argptr);
+        LogSinkBuf_printfArgs((LogSinkBuf_Handle)handle->sinkConfig, index, &a0, 1);
     }
 }
 
 /*
  *  ======== LogSinkBuf_printfDepInjection2 ========
  */
-void LogSinkBuf_printfDepInjection2(const Log_Module *handle, Log_Level level, uint32_t headerPtr, ...)
+void LogSinkBuf_printfDepInjection2(const Log_Module *handle, Log_Level level, uint32_t index, uintptr_t a0, uintptr_t a1)
 {
-    if (((handle->dynamicLevelsPtr != NULL) && (level & *(handle->dynamicLevelsPtr))) || (handle->levels & level))
+    if (LogSinkBuf_LEVEL_ENABLED(handle, level))
     {
-        va_list argptr;
-
-        va_start(argptr, headerPtr);
-        LogSinkBuf_printf((LogSinkBuf_Handle)handle->sinkConfig, level, headerPtr, 2, argptr);
-        va_end(argptr);
+        uintptr_t argv[2] = {a0, a1};
+        LogSinkBuf_printfArgs((LogSinkBuf_Handle)handle->sinkConfig, index, argv, 2);
     }
 }
 
 /*
  *  ======== LogSinkBuf_printfDepInjection3 ========
  */
-void LogSinkBuf_printfDepInjection3(const Log_Module *handle, Log_Level level, uint32_t headerPtr, ...)
+void LogSinkBuf_printfDepInjection3(const Log_Module *handle,
+                                    Log_Level level,
+                                    uint32_t index,
+                                    uintptr_t a0,
+                                    uintptr_t a1,
+                                    uintptr_t a2)
 {
-    if (((handle->dynamicLevelsPtr != NULL) && (level & *(handle->dynamicLevelsPtr))) || (handle->levels & level))
+    if (LogSinkBuf_LEVEL_ENABLED(handle, level))
     {
-        va_list argptr;
-
-        va_start(argptr, headerPtr);
-        LogSinkBuf_printf((LogSinkBuf_Handle)handle->sinkConfig, level, headerPtr, 3, argptr);
-        va_end(argptr);
+        uintptr_t argv[3] = {a0, a1, a2};
+        LogSinkBuf_printfArgs((LogSinkBuf_Handle)handle->sinkConfig, index, argv, 3);
     }
 }
 
 /*
  *  ======== LogSinkBuf_printfSingleton ========
  *
- *  This implementation purposefully does not use the handle argument but
- *  instead references a single, global LogSinkBuf_Instance structure. When LTO
- *  is enabled, this allows the compiler to avoid loading the handle at the
- *  call site, saving on flash.
+ *  This implementation purposefully does not use the handle argument for the
+ *  sink config but instead references a single, global LogSinkBuf_Instance
+ *  structure. When LTO is enabled, this allows the compiler to avoid loading the
+ *  handle at the call site, saving on flash. The handle is still used for the
+ *  level filter.
  *
  *  Use of this printf implementation has the limitation that only one
  *  LogSinkBuf instance may be used and it will be assigned the
  *  LogsinkBuf_Instance name LogSinkBuf_CONFIG_ti_log_LogSinkBuf_0_config
  */
-void LogSinkBuf_printfSingleton(const Log_Module *handle, Log_Level level, uint32_t headerPtr, uint32_t numArgs, ...)
+void LogSinkBuf_printfSingleton(const Log_Module *handle, Log_Level level, uint32_t index, uint32_t numArgs, ...)
 {
-    if (((handle->dynamicLevelsPtr != NULL) && (level & *(handle->dynamicLevelsPtr))) || (handle->levels & level))
+    if (LogSinkBuf_LEVEL_ENABLED(handle, level))
     {
-        va_list argptr;
+        va_list   argptr;
+        uintptr_t argv[LogSinkBuf_MAX_ARGS];
+        uint32_t  i;
 
         /* Guard against more arguments being passed in than supported */
         if (numArgs > LogSinkBuf_MAX_ARGS)
@@ -239,138 +374,139 @@ void LogSinkBuf_printfSingleton(const Log_Module *handle, Log_Level level, uint3
             numArgs = LogSinkBuf_MAX_ARGS;
         }
 
-        /* Get the VA args pointer in the initial wrapper since you cannot pass VA
-         * args to further functions using elipses (...) syntax.
-         *
-         * All va_start() does is get us the pointer to the first VA arg on the
-         * stack. That value will still be valid when passed on further.
-         */
         va_start(argptr, numArgs);
-        LogSinkBuf_printf(&LogSinkBuf_CONFIG_ti_log_LogSinkBuf_0_config, level, headerPtr, numArgs, argptr);
+        for (i = 0; i < numArgs; i++)
+        {
+            argv[i] = va_arg(argptr, uintptr_t);
+        }
         va_end(argptr);
+
+        LogSinkBuf_printfArgs(&LogSinkBuf_CONFIG_ti_log_LogSinkBuf_0_config, index, argv, numArgs);
     }
 }
 
 /*
  *  ======== LogSinkBuf_printfSingleton0 ========
  */
-void LogSinkBuf_printfSingleton0(const Log_Module *handle, Log_Level level, uint32_t headerPtr, ...)
+void LogSinkBuf_printfSingleton0(const Log_Module *handle, Log_Level level, uint32_t index)
 {
-    if (((handle->dynamicLevelsPtr != NULL) && (level & *(handle->dynamicLevelsPtr))) || (handle->levels & level))
+    if (LogSinkBuf_LEVEL_ENABLED(handle, level))
     {
-        va_list argptr;
-
-        va_start(argptr, headerPtr);
-        LogSinkBuf_printf(&LogSinkBuf_CONFIG_ti_log_LogSinkBuf_0_config, level, headerPtr, 0, argptr);
-        va_end(argptr);
+        LogSinkBuf_printfArgs(&LogSinkBuf_CONFIG_ti_log_LogSinkBuf_0_config, index, NULL, 0);
     }
 }
 
 /*
  *  ======== LogSinkBuf_printfSingleton1 ========
  */
-void LogSinkBuf_printfSingleton1(const Log_Module *handle, Log_Level level, uint32_t headerPtr, ...)
+void LogSinkBuf_printfSingleton1(const Log_Module *handle, Log_Level level, uint32_t index, uintptr_t a0)
 {
-    if (((handle->dynamicLevelsPtr != NULL) && (level & *(handle->dynamicLevelsPtr))) || (handle->levels & level))
+    if (LogSinkBuf_LEVEL_ENABLED(handle, level))
     {
-        va_list argptr;
-
-        va_start(argptr, headerPtr);
-        LogSinkBuf_printf(&LogSinkBuf_CONFIG_ti_log_LogSinkBuf_0_config, level, headerPtr, 1, argptr);
-        va_end(argptr);
+        LogSinkBuf_printfArgs(&LogSinkBuf_CONFIG_ti_log_LogSinkBuf_0_config, index, &a0, 1);
     }
 }
 
 /*
  *  ======== LogSinkBuf_printfSingleton2 ========
  */
-void LogSinkBuf_printfSingleton2(const Log_Module *handle, Log_Level level, uint32_t headerPtr, ...)
+void LogSinkBuf_printfSingleton2(const Log_Module *handle, Log_Level level, uint32_t index, uintptr_t a0, uintptr_t a1)
 {
-    if (((handle->dynamicLevelsPtr != NULL) && (level & *(handle->dynamicLevelsPtr))) || (handle->levels & level))
+    if (LogSinkBuf_LEVEL_ENABLED(handle, level))
     {
-        va_list argptr;
-
-        va_start(argptr, headerPtr);
-        LogSinkBuf_printf(&LogSinkBuf_CONFIG_ti_log_LogSinkBuf_0_config, level, headerPtr, 2, argptr);
-        va_end(argptr);
+        uintptr_t argv[2] = {a0, a1};
+        LogSinkBuf_printfArgs(&LogSinkBuf_CONFIG_ti_log_LogSinkBuf_0_config, index, argv, 2);
     }
 }
 
 /*
  *  ======== LogSinkBuf_printfSingleton3 ========
  */
-void LogSinkBuf_printfSingleton3(const Log_Module *handle, Log_Level level, uint32_t headerPtr, ...)
+void LogSinkBuf_printfSingleton3(const Log_Module *handle,
+                                 Log_Level level,
+                                 uint32_t index,
+                                 uintptr_t a0,
+                                 uintptr_t a1,
+                                 uintptr_t a2)
 {
-    if (((handle->dynamicLevelsPtr != NULL) && (level & *(handle->dynamicLevelsPtr))) || (handle->levels & level))
+    if (LogSinkBuf_LEVEL_ENABLED(handle, level))
     {
-        va_list argptr;
-
-        va_start(argptr, headerPtr);
-        LogSinkBuf_printf(&LogSinkBuf_CONFIG_ti_log_LogSinkBuf_0_config, level, headerPtr, 3, argptr);
-        va_end(argptr);
+        uintptr_t argv[3] = {a0, a1, a2};
+        LogSinkBuf_printfArgs(&LogSinkBuf_CONFIG_ti_log_LogSinkBuf_0_config, index, argv, 3);
     }
 }
 
 /*
- *  ======== LogSinkBuf_buf ========
+ *  ======== LogSinkBuf_bufDepInjection ========
  */
-void LogSinkBuf_bufDepInjection(const Log_Module *handle,
-                                Log_Level level,
-                                uint32_t headerPtr,
-                                uint8_t *data,
-                                size_t size)
+void LogSinkBuf_bufDepInjection(const Log_Module *handle, Log_Level level, uint32_t index, uint8_t *data, size_t size)
 {
-    if (((handle->dynamicLevelsPtr != NULL) && (level & *(handle->dynamicLevelsPtr))) || (handle->levels & level))
+    if (LogSinkBuf_LEVEL_ENABLED(handle, level))
     {
-        uintptr_t key;
-        uint32_t serial;
-        LogSinkBuf_Rec *rec;
-        uint32_t numRecords = ((size) / LogSinkBuf_SIZEOF_RECORD) + ((size % LogSinkBuf_SIZEOF_RECORD) != 0);
-        numRecords += 1;
-        uint32_t i;
+        uintptr_t       key;
+        uint32_t        now, delta, off, payloadLen, worst;
+        uint32_t        deltaLen, lenLen;
+        uint8_t         hdr[2 + 5 + 5]; /* id + delta + length */
+        uint32_t        hdrLen = 0;
+        LogSinkBuf_Cobs cobs;
 
         LogSinkBuf_Handle inst = (LogSinkBuf_Handle)handle->sinkConfig;
 
-        /* disable interrupts */
+        now = TimestampP_getNative32();
+
         key = HwiP_disable();
 
-        /* Here we acquire records as contiguous memory.
-         * This approach leads to long critical sections for large buffers
-         * and can be improved in the future once all hosts support fragmentation
-         * of packets
-         */
-        for (i = 0; i < numRecords; i++)
+        if (now >= inst->lastTs)
         {
-            /* increment serial even when full */
-            serial = ++(inst->serial);
+            delta        = now - inst->lastTs;
+            inst->lastTs = now;
+        }
+        else
+        {
+            delta = 0;
+        }
+        deltaLen = LogSinkBuf_ulebLen(delta);
+        lenLen   = LogSinkBuf_ulebLen((uint32_t)size);
 
-            if (inst->advance == LogSinkBuf_FULL)
-            {
-                HwiP_restore(key);
-                return;
-            }
+        /* The payload can exceed 254 bytes, so reserve the COBS worst case (one
+         * overhead byte per 254-byte block) and pad any slack with delimiters. */
+        payloadLen = 2 + deltaLen + lenLen + (uint32_t)size;
+        worst      = payloadLen + payloadLen / 254 + 2;
+        off        = inst->wrReserve;
 
-            /* compute next available record */
-            findNextRecord(inst, &rec);
-
-            rec->timestampLow = TimestampP_getNative32();
-
-            /* write data to record */
-            rec->serial = serial;
-            if (i == 0)
-            {
-                rec->type    = LogSinkBuf_BUFFER_START;
-                rec->data[0] = headerPtr;
-                rec->data[1] = size;
-            }
-            else
-            {
-                rec->type = LogSinkBuf_BUFFER_CONTINUED;
-                memcpy(rec->data, &data[(i - 1) * LogSinkBuf_SIZEOF_RECORD], LogSinkBuf_SIZEOF_RECORD);
-            }
+        if (worst > inst->size)
+        {
+            HwiP_restore(key);
+            return; /* record can never fit */
+        }
+        if (inst->bufType == LogSinkBuf_Type_LINEAR && (off + worst) > inst->size)
+        {
+            inst->overflow++;
+            HwiP_restore(key);
+            return; /* linear buffer is full */
         }
 
-        /* enable interrupts */
+        inst->wrReserve = off + worst;
+        inst->recCount++;
+
         HwiP_restore(key);
+
+        /* [id][delta][len] followed by the raw payload, all one COBS frame. */
+        hdr[hdrLen++] = (uint8_t)index;
+        hdr[hdrLen++] = (uint8_t)(index >> 8);
+        hdrLen += LogSinkBuf_uleb(delta, &hdr[hdrLen]);
+        hdrLen += LogSinkBuf_uleb((uint32_t)size, &hdr[hdrLen]);
+
+        LogSinkBuf_cobsInit(&cobs, inst, off);
+        LogSinkBuf_cobsFeed(&cobs, hdr, hdrLen);
+        LogSinkBuf_cobsFeed(&cobs, data, (uint32_t)size);
+        LogSinkBuf_cobsFinish(&cobs);
+
+        /* Pad the reserved-but-unused tail with delimiters (empty frames the host
+         * skips) so the write frontier lines up with the reservation. */
+        while (cobs.count < worst)
+        {
+            LogSinkBuf_cobsPut(&cobs, 0x00);
+        }
     }
 }

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024-2026 Texas Instruments Incorporated - http://www.ti.com
+ * Copyright (c) 2024 Texas Instruments Incorporated - http://www.ti.com
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -45,7 +45,6 @@
 #include <ti/drivers/dpl/HwiP.h>
 #include <ti/devices/DeviceFamily.h>
 #include DeviceFamily_constructPath(inc/hw_lrfdtrc.h)
-#include DeviceFamily_constructPath(inc/hw_lrfddbell.h)
 #include DeviceFamily_constructPath(inc/hw_memmap.h)
 #include DeviceFamily_constructPath(driverlib/hapi.h)
 
@@ -75,6 +74,11 @@
 #define MAX_ARG_COUNT     4
 #define CHANNEL_FIELD_MAX 4
 
+/* Runtime level filter: emit only when the level is enabled, either through a
+ * module's dynamic (runtime-settable) bitmap or its constant one. */
+#define LogSinkTraceLPF3_LEVEL_ENABLED(handle, level) \
+    (((handle->dynamicLevelsPtr != NULL) && (level & *(handle->dynamicLevelsPtr))) || (handle->levels & level))
+
 /* Look up table to get comnbined length of arguments
  * 1 and 2 arguments have double length */
 static const uint8_t nArgLut[MAX_ARG_COUNT + 1] = {0, 2, 4, 3, 4};
@@ -84,16 +88,7 @@ static const uint8_t channelLut[CHANNEL_FIELD_MAX + 1] = {0, 0, 1, 2, 0};
 
 static Power_NotifyObj LogSinkTraceLPF3_powerAwakeStandbyObj;
 
-/* Variable to ensure initialization is only done once. */
-static volatile bool LogSinkTraceLPF3_isInitialized = false;
-
-/* Variable to ensure it is not attempted to use the tracer before it is
- * enabled.
- */
-static volatile bool LogSinkTraceLPF3_isEnabled = false;
-
-/* Callback function for power notifications. */
-static int_fast16_t LogSinkTraceLPF3_powerNotify(uint_fast16_t eventType, uintptr_t eventArg, uintptr_t clientArg);
+static int_fast16_t LogSinkTraceLPF3_postNotify(uint_fast16_t eventType, uintptr_t eventArg, uintptr_t clientArg);
 
 void LogSinkTraceLPF3_enable(void)
 {
@@ -109,32 +104,17 @@ void LogSinkTraceLPF3_enable(void)
 
     /* Give enough time for FPGA tracer to lock on to signal */
     HapiWaitUs(5);
-
-    /* Mark tracer as enabled. */
-    LogSinkTraceLPF3_isEnabled = true;
 }
 
 void LogSinkTraceLPF3_init(void)
 {
-
-    /* Only perform initialization once. */
-    uintptr_t key = HwiP_disable();
-    if (LogSinkTraceLPF3_isInitialized == true)
-    {
-        HwiP_restore(key);
-        return;
-    }
-
-    LogSinkTraceLPF3_isInitialized = true;
-    HwiP_restore(key);
-
     /* Enable tracer clock */
-    Power_setDependency(PowerLPF3_PERIPH_LRFD_TRC);
+    Power_setDependency(PowerLPF3_PERIPH_LFRD_TRC);
 
-    /* Register for standby entry and wakeup event */
+    /* Register for wakeup event */
     Power_registerNotify(&LogSinkTraceLPF3_powerAwakeStandbyObj,
-                         PowerLPF3_ENTERING_STANDBY | PowerLPF3_AWAKE_STANDBY,
-                         (Power_NotifyFxn)LogSinkTraceLPF3_powerNotify,
+                         PowerLPF3_AWAKE_STANDBY,
+                         (Power_NotifyFxn)LogSinkTraceLPF3_postNotify,
                          (uintptr_t)NULL);
 
     GPIO_setConfigAndMux(LogSinkTraceLPF3_config.tracerPin, GPIO_CFG_NO_DIR, LogSinkTraceLPF3_config.tracerPinMux);
@@ -143,26 +123,18 @@ void LogSinkTraceLPF3_init(void)
 }
 
 /*
- *  ======== LogSinkTraceLPF3_printf ========
+ *  ======== LogSinkTraceLPF3_send ========
+ *  Shared emit path. The tracer hardware takes at most two 32-bit parameter
+ *  words per packet, so callers pass the arguments already packed into
+ *  arg01/arg23 and this helper only has to program the channel registers.
+ *  Callers guarantee numArgs <= MAX_ARG_COUNT.
  */
-void LogSinkTraceLPF3_printf(const Log_Module *handle,
-                             Log_Level level,
-                             uint32_t headerPtr,
-                             uint32_t numArgs,
-                             va_list argptr)
+static void LogSinkTraceLPF3_send(uint32_t headerPtr, uint32_t numArgs, uint32_t arg01, uint32_t arg23)
 {
-    uint32_t arg01;
-    uint32_t arg23;
     uint32_t tracerCommand;
     int32_t channelField;
     int32_t channelIndex;
     uint32_t key;
-
-    if (LogSinkTraceLPF3_isEnabled == false)
-    {
-        /* Not enabled. Can't do any logs. Just return. */
-        return;
-    }
 
     /* Check the channel field to see which channel to send the log to */
     channelField = ((headerPtr & LogSinkTraceLPF3_CHANNEL_M) >> LogSinkTraceLPF3_CHANNEL_S);
@@ -174,12 +146,6 @@ void LogSinkTraceLPF3_printf(const Log_Module *handle,
 
     /* Convert channel field to the correct index */
     channelIndex = channelLut[channelField];
-
-    /* Prevent out of bounds access to nArgLut */
-    if (numArgs > MAX_ARG_COUNT)
-    {
-        numArgs = MAX_ARG_COUNT;
-    }
 
     /* Extract the 8-bit ID, which gives 256 log statements for each channel.
      * IDs 1 and 2 are reserved for legacy purposes in the tracer GUI and may
@@ -204,44 +170,13 @@ void LogSinkTraceLPF3_printf(const Log_Module *handle,
             LRFDTRC_CH1CMD_PKTHDR_M) != 0)
     {}
 
-    switch (numArgs)
+    if (numArgs >= 1)
     {
-        case 0:
-            break;
-
-        case 1:
-            arg01 = va_arg(argptr, uintptr_t);
-
-            HWREG_WRITE_LRF(LRFDTRC_BASE + LRFDTRC_O_CH1PAR01 + sizeof(uint32_t) * channelIndex) = arg01;
-            break;
-
-        case 2:
-            arg01 = va_arg(argptr, uintptr_t);
-            arg23 = va_arg(argptr, uintptr_t);
-
-            HWREG_WRITE_LRF(LRFDTRC_BASE + LRFDTRC_O_CH1PAR01 + sizeof(uint32_t) * channelIndex) = arg01;
-            HWREG_WRITE_LRF(LRFDTRC_BASE + LRFDTRC_O_CH1PAR23 + sizeof(uint32_t) * channelIndex) = arg23;
-            break;
-
-        case 3:
-            arg01 = va_arg(argptr, uintptr_t) & 0xFFFFU;
-            arg01 |= va_arg(argptr, uintptr_t) << 16;
-            arg23 = va_arg(argptr, uintptr_t) & 0xFFFFU;
-
-            HWREG_WRITE_LRF(LRFDTRC_BASE + LRFDTRC_O_CH1PAR01 + sizeof(uint32_t) * channelIndex) = arg01;
-            HWREG_WRITE_LRF(LRFDTRC_BASE + LRFDTRC_O_CH1PAR23 + sizeof(uint32_t) * channelIndex) = arg23;
-            break;
-
-        case 4:
-        default:
-            arg01 = va_arg(argptr, uintptr_t) & 0xFFFFU;
-            arg01 |= va_arg(argptr, uintptr_t) << 16;
-            arg23 = va_arg(argptr, uintptr_t) & 0xFFFFU;
-            arg23 |= va_arg(argptr, uintptr_t) << 16;
-
-            HWREG_WRITE_LRF(LRFDTRC_BASE + LRFDTRC_O_CH1PAR01 + sizeof(uint32_t) * channelIndex) = arg01;
-            HWREG_WRITE_LRF(LRFDTRC_BASE + LRFDTRC_O_CH1PAR23 + sizeof(uint32_t) * channelIndex) = arg23;
-            break;
+        HWREG_WRITE_LRF(LRFDTRC_BASE + LRFDTRC_O_CH1PAR01 + sizeof(uint32_t) * channelIndex) = arg01;
+    }
+    if (numArgs >= 2)
+    {
+        HWREG_WRITE_LRF(LRFDTRC_BASE + LRFDTRC_O_CH1PAR23 + sizeof(uint32_t) * channelIndex) = arg23;
     }
 
     /* Channel ready, transmit packet */
@@ -252,62 +187,115 @@ void LogSinkTraceLPF3_printf(const Log_Module *handle,
 }
 
 /*
+ *  ======== LogSinkTraceLPF3_printf ========
+ */
+void LogSinkTraceLPF3_printf(const Log_Module *handle,
+                             uint32_t headerPtr,
+                             uint32_t numArgs,
+                             va_list argptr)
+{
+    uint32_t arg01 = 0;
+    uint32_t arg23 = 0;
+
+    /* Prevent out of bounds access to nArgLut */
+    if (numArgs > MAX_ARG_COUNT)
+    {
+        numArgs = MAX_ARG_COUNT;
+    }
+
+    /* Pack the arguments the way the tracer hardware consumes them: full
+     * 32-bit words for up to two arguments, 16-bit halves for three or four
+     * (see nArgLut). */
+    switch (numArgs)
+    {
+        case 0:
+            break;
+
+        case 1:
+            arg01 = va_arg(argptr, uintptr_t);
+            break;
+
+        case 2:
+            arg01 = va_arg(argptr, uintptr_t);
+            arg23 = va_arg(argptr, uintptr_t);
+            break;
+
+        case 3:
+            arg01 = va_arg(argptr, uintptr_t) & 0xFFFFU;
+            arg01 |= va_arg(argptr, uintptr_t) << 16;
+            arg23 = va_arg(argptr, uintptr_t) & 0xFFFFU;
+            break;
+
+        case 4:
+        default:
+            arg01 = va_arg(argptr, uintptr_t) & 0xFFFFU;
+            arg01 |= va_arg(argptr, uintptr_t) << 16;
+            arg23 = va_arg(argptr, uintptr_t) & 0xFFFFU;
+            arg23 |= va_arg(argptr, uintptr_t) << 16;
+            break;
+    }
+
+    LogSinkTraceLPF3_send(headerPtr, numArgs, arg01, arg23);
+}
+
+/* The fixed-argument-count delegates below are non-variadic (matching the
+ * per-arity Log_printfN_fxn typedefs) so their prologue does not spill the
+ * argument registers the way a variadic function must. Each runs the level
+ * filter and, when it passes, packs its arguments the way the tracer hardware
+ * consumes them and calls the shared emit path.
+ */
+
+/*
  *  ======== LogSinkTraceLPF3_printfSingleton0 ========
  */
-void LogSinkTraceLPF3_printfSingleton0(const Log_Module *handle, Log_Level level, uint32_t headerPtr, ...)
+void LogSinkTraceLPF3_printfSingleton0(const Log_Module *handle, Log_Level level, uint32_t headerPtr)
 {
-    if (((handle->dynamicLevelsPtr != NULL) && (level & *(handle->dynamicLevelsPtr))) || (handle->levels & level))
+    if (LogSinkTraceLPF3_LEVEL_ENABLED(handle, level))
     {
-        va_list argptr;
-
-        va_start(argptr, headerPtr);
-        LogSinkTraceLPF3_printf(handle, level, headerPtr, 0, argptr);
-        va_end(argptr);
+        LogSinkTraceLPF3_send(headerPtr, 0, 0, 0);
     }
 }
 
 /*
  *  ======== LogSinkTraceLPF3_printfSingleton1 ========
  */
-void LogSinkTraceLPF3_printfSingleton1(const Log_Module *handle, Log_Level level, uint32_t headerPtr, ...)
+void LogSinkTraceLPF3_printfSingleton1(const Log_Module *handle, Log_Level level, uint32_t headerPtr, uintptr_t a0)
 {
-    if (((handle->dynamicLevelsPtr != NULL) && (level & *(handle->dynamicLevelsPtr))) || (handle->levels & level))
+    if (LogSinkTraceLPF3_LEVEL_ENABLED(handle, level))
     {
-        va_list argptr;
-
-        va_start(argptr, headerPtr);
-        LogSinkTraceLPF3_printf(handle, level, headerPtr, 1, argptr);
-        va_end(argptr);
+        LogSinkTraceLPF3_send(headerPtr, 1, a0, 0);
     }
 }
 
 /*
  *  ======== LogSinkTraceLPF3_printfSingleton2 ========
  */
-void LogSinkTraceLPF3_printfSingleton2(const Log_Module *handle, Log_Level level, uint32_t headerPtr, ...)
+void LogSinkTraceLPF3_printfSingleton2(const Log_Module *handle,
+                                       Log_Level level,
+                                       uint32_t headerPtr,
+                                       uintptr_t a0,
+                                       uintptr_t a1)
 {
-    if (((handle->dynamicLevelsPtr != NULL) && (level & *(handle->dynamicLevelsPtr))) || (handle->levels & level))
+    if (LogSinkTraceLPF3_LEVEL_ENABLED(handle, level))
     {
-        va_list argptr;
-
-        va_start(argptr, headerPtr);
-        LogSinkTraceLPF3_printf(handle, level, headerPtr, 2, argptr);
-        va_end(argptr);
+        LogSinkTraceLPF3_send(headerPtr, 2, a0, a1);
     }
 }
 
 /*
  *  ======== LogSinkTraceLPF3_printfSingleton3 ========
  */
-void LogSinkTraceLPF3_printfSingleton3(const Log_Module *handle, Log_Level level, uint32_t headerPtr, ...)
+void LogSinkTraceLPF3_printfSingleton3(const Log_Module *handle,
+                                       Log_Level level,
+                                       uint32_t headerPtr,
+                                       uintptr_t a0,
+                                       uintptr_t a1,
+                                       uintptr_t a2)
 {
-    if (((handle->dynamicLevelsPtr != NULL) && (level & *(handle->dynamicLevelsPtr))) || (handle->levels & level))
+    if (LogSinkTraceLPF3_LEVEL_ENABLED(handle, level))
     {
-        va_list argptr;
-
-        va_start(argptr, headerPtr);
-        LogSinkTraceLPF3_printf(handle, level, headerPtr, 3, argptr);
-        va_end(argptr);
+        /* Three arguments travel as 16-bit halves (see nArgLut) */
+        LogSinkTraceLPF3_send(headerPtr, 3, (a0 & 0xFFFFU) | (a1 << 16), a2 & 0xFFFFU);
     }
 }
 
@@ -320,12 +308,12 @@ void LogSinkTraceLPF3_printfSingleton(const Log_Module *handle,
                                       uint32_t numArgs,
                                       ...)
 {
-    if (((handle->dynamicLevelsPtr != NULL) && (level & *(handle->dynamicLevelsPtr))) || (handle->levels & level))
+    if (LogSinkTraceLPF3_LEVEL_ENABLED(handle, level))
     {
         va_list argptr;
 
         va_start(argptr, numArgs);
-        LogSinkTraceLPF3_printf(handle, level, headerPtr, numArgs, argptr);
+        LogSinkTraceLPF3_printf(handle, headerPtr, numArgs, argptr);
         va_end(argptr);
     }
 }
@@ -345,17 +333,12 @@ void LogSinkTraceLPF3_bufSingleton(const Log_Module *handle,
 /*
  *  ======== LogSinkTraceLPF3_postNotify ========
  */
-static int_fast16_t LogSinkTraceLPF3_powerNotify(uint_fast16_t eventType, uintptr_t eventArg, uintptr_t clientArg)
+static int_fast16_t LogSinkTraceLPF3_postNotify(uint_fast16_t eventType, uintptr_t eventArg, uintptr_t clientArg)
 {
-    if (eventType == PowerLPF3_AWAKE_STANDBY)
+    /* Reconfigure the hardware if returning from sleep */
+    if (eventType == (uint32_t)PowerLPF3_AWAKE_STANDBY)
     {
-        /* Reconfigure the hardware if returning from standby */
         LogSinkTraceLPF3_enable();
-    }
-    else if (eventType == PowerLPF3_ENTERING_STANDBY)
-    {
-        /* Mark tracer as disabled until it is re-enabled after standby. */
-        LogSinkTraceLPF3_isEnabled = false;
     }
 
     return Power_NOTIFYDONE;

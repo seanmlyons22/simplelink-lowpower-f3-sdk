@@ -48,6 +48,14 @@
 
 #define LogSinkITM_RESET_FRAME (0xBBBBBBBB)
 
+/* Most printf arguments one record can carry (matches _Log_NUMARGS in Log.h). */
+#define LogSinkITM_MAX_ARGS (8)
+
+/* Runtime level filter: emit only when the level is enabled, either through a
+ * module's dynamic (runtime-settable) bitmap or its constant one. */
+#define LogSinkITM_LEVEL_ENABLED(handle, level) \
+    (((handle->dynamicLevelsPtr != NULL) && (level & *(handle->dynamicLevelsPtr))) || (handle->levels & level))
+
 /*
  *  ======== LogSinkITM_sendTimeSync ========
  */
@@ -88,86 +96,90 @@ void LogSinkITM_init(void)
 }
 
 /*
- *  ======== LogSinkITM_printf ========
+ *  ======== LogSinkITM_emit ========
+ *  Shared emit path. Takes the promoted printf arguments as a plain array so the
+ *  fixed-argument-count wrappers can reach it without building a va_list. Level
+ *  filtering is done by the wrappers.
  */
-void LogSinkITM_printf(const Log_Module *handle, Log_Level level, uint32_t headerPtr, uint32_t numArgs, va_list argptr)
+static void LogSinkITM_emit(uint32_t headerPtr, const uintptr_t *args, uint32_t numArgs)
 {
     uint32_t key;
 
     /* disable interrupts */
     key = HwiP_disable();
 
-    /* Send header */
-    ITM_send32Polling(LogSinkITM_STIM_HEADER, headerPtr);
+    /*
+     * The log site is named by its .log_ptr slot. The host recovers the full
+     * slot from the .out file, so only the low 16 bits are needed to identify
+     * it. Send a halfword to keep the header transfer short.
+     */
+    ITM_send16Polling(LogSinkITM_STIM_HEADER, (uint16_t)headerPtr);
 
     uint32_t i;
     for (i = 0; i < numArgs; ++i)
     {
-        uintptr_t arg = va_arg(argptr, uintptr_t);
-        ITM_send32Polling(LogSinkITM_STIM_TRACE, arg);
+        ITM_send32Polling(LogSinkITM_STIM_TRACE, args[i]);
     }
 
     /* enable interrupts */
     HwiP_restore(key);
 }
 
+/* The fixed-argument-count delegates below are non-variadic (matching the
+ * per-arity Log_printfN_fxn typedefs) so their prologue does not spill the
+ * argument registers the way a variadic function must. Each runs the level
+ * filter and, when it passes, calls the shared emit path with a small argument
+ * array built on the stack.
+ */
+
 /*
  *  ======== LogSinkITM_printfSingleton0 ========
  */
-void LogSinkITM_printfSingleton0(const Log_Module *handle, Log_Level level, uint32_t headerPtr, ...)
+void LogSinkITM_printfSingleton0(const Log_Module *handle, Log_Level level, uint32_t headerPtr)
 {
-    if (((handle->dynamicLevelsPtr != NULL) && (level & *(handle->dynamicLevelsPtr))) || (handle->levels & level))
+    if (LogSinkITM_LEVEL_ENABLED(handle, level))
     {
-        va_list argptr;
-
-        va_start(argptr, headerPtr);
-        LogSinkITM_printf(handle, level, headerPtr, 0, argptr);
-        va_end(argptr);
+        LogSinkITM_emit(headerPtr, NULL, 0);
     }
 }
 
 /*
  *  ======== LogSinkITM_printfSingleton1 ========
  */
-void LogSinkITM_printfSingleton1(const Log_Module *handle, Log_Level level, uint32_t headerPtr, ...)
+void LogSinkITM_printfSingleton1(const Log_Module *handle, Log_Level level, uint32_t headerPtr, uintptr_t a0)
 {
-    if (((handle->dynamicLevelsPtr != NULL) && (level & *(handle->dynamicLevelsPtr))) || (handle->levels & level))
+    if (LogSinkITM_LEVEL_ENABLED(handle, level))
     {
-        va_list argptr;
-
-        va_start(argptr, headerPtr);
-        LogSinkITM_printf(handle, level, headerPtr, 1, argptr);
-        va_end(argptr);
+        LogSinkITM_emit(headerPtr, &a0, 1);
     }
 }
 
 /*
  *  ======== LogSinkITM_printfSingleton2 ========
  */
-void LogSinkITM_printfSingleton2(const Log_Module *handle, Log_Level level, uint32_t headerPtr, ...)
+void LogSinkITM_printfSingleton2(const Log_Module *handle, Log_Level level, uint32_t headerPtr, uintptr_t a0, uintptr_t a1)
 {
-    if (((handle->dynamicLevelsPtr != NULL) && (level & *(handle->dynamicLevelsPtr))) || (handle->levels & level))
+    if (LogSinkITM_LEVEL_ENABLED(handle, level))
     {
-        va_list argptr;
-
-        va_start(argptr, headerPtr);
-        LogSinkITM_printf(handle, level, headerPtr, 2, argptr);
-        va_end(argptr);
+        uintptr_t argv[2] = {a0, a1};
+        LogSinkITM_emit(headerPtr, argv, 2);
     }
 }
 
 /*
- *  ======== LogSinkITM_printfSingleton1 ========
+ *  ======== LogSinkITM_printfSingleton3 ========
  */
-void LogSinkITM_printfSingleton3(const Log_Module *handle, Log_Level level, uint32_t headerPtr, ...)
+void LogSinkITM_printfSingleton3(const Log_Module *handle,
+                                 Log_Level level,
+                                 uint32_t headerPtr,
+                                 uintptr_t a0,
+                                 uintptr_t a1,
+                                 uintptr_t a2)
 {
-    if (((handle->dynamicLevelsPtr != NULL) && (level & *(handle->dynamicLevelsPtr))) || (handle->levels & level))
+    if (LogSinkITM_LEVEL_ENABLED(handle, level))
     {
-        va_list argptr;
-
-        va_start(argptr, headerPtr);
-        LogSinkITM_printf(handle, level, headerPtr, 3, argptr);
-        va_end(argptr);
+        uintptr_t argv[3] = {a0, a1, a2};
+        LogSinkITM_emit(headerPtr, argv, 3);
     }
 }
 
@@ -176,13 +188,25 @@ void LogSinkITM_printfSingleton3(const Log_Module *handle, Log_Level level, uint
  */
 void LogSinkITM_printfSingleton(const Log_Module *handle, Log_Level level, uint32_t headerPtr, uint32_t numArgs, ...)
 {
-    if (((handle->dynamicLevelsPtr != NULL) && (level & *(handle->dynamicLevelsPtr))) || (handle->levels & level))
+    if (LogSinkITM_LEVEL_ENABLED(handle, level))
     {
-        va_list argptr;
+        va_list   argptr;
+        uintptr_t argv[LogSinkITM_MAX_ARGS];
+        uint32_t  i;
+
+        if (numArgs > LogSinkITM_MAX_ARGS)
+        {
+            numArgs = LogSinkITM_MAX_ARGS;
+        }
 
         va_start(argptr, numArgs);
-        LogSinkITM_printf(handle, level, headerPtr, numArgs, argptr);
+        for (i = 0; i < numArgs; i++)
+        {
+            argv[i] = va_arg(argptr, uintptr_t);
+        }
         va_end(argptr);
+
+        LogSinkITM_emit(headerPtr, argv, numArgs);
     }
 }
 
@@ -191,15 +215,15 @@ void LogSinkITM_printfSingleton(const Log_Module *handle, Log_Level level, uint3
  */
 void LogSinkITM_bufSingleton(const Log_Module *handle, Log_Level level, uint32_t headerPtr, uint8_t *data, size_t size)
 {
-    if (((handle->dynamicLevelsPtr != NULL) && (level & *(handle->dynamicLevelsPtr))) || (handle->levels & level))
+    if (LogSinkITM_LEVEL_ENABLED(handle, level))
     {
         uint32_t key;
 
         /* disable interrupts */
         key = HwiP_disable();
 
-        /* Send header */
-        ITM_send32Polling(LogSinkITM_STIM_HEADER, headerPtr);
+        /* Low 16 bits of the .log_ptr slot are enough to name the log site (see printf) */
+        ITM_send16Polling(LogSinkITM_STIM_HEADER, (uint16_t)headerPtr);
         /* We always send the size of the expected buffer */
         ITM_send32Polling(LogSinkITM_STIM_TRACE, size);
         /* Send out the actual data */
