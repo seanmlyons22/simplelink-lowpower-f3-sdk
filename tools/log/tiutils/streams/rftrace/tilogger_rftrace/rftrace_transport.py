@@ -300,7 +300,7 @@ class RFTrace_Transport(_TransportBase):
 
         cmd = _build_command(self._td, common, self._sal, self._raw)
         if cmd is None:
-            raise SystemExit("rftrace: need one of --sal, --raw, or --sigrok")
+            raise SystemExit("rftrace: need one of --port, --rft1, --sal, --raw, or --sigrok")
         dec = subprocess.Popen(cmd, stdout=subprocess.PIPE)
         self._procs = [dec]
         return dec.stdout
