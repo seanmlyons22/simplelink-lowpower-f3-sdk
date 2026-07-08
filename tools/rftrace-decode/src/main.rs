@@ -314,7 +314,9 @@ fn stream_decode(
 /// Streaming decode of an RFT1 word stream (the rftrace-pico Pico's USB CDC output). The Pico
 /// already deframed the tracer line, so there is no sample deframing here: sync on the `RFT1`
 /// magic, then feed each `Trace` word through the same pipeline samples use; `Overflow` frames
-/// bump the health counter. Timeouts/interrupts are treated as "keep waiting" so a live, mostly
+/// bump the health counter; `Status` frames (measured tracer rate / lock, like the FPGA
+/// capture card's rfcore_freq readout) surface on stderr on lock transitions and rate changes,
+/// and are not log records. Timeouts/interrupts are treated as "keep waiting" so a live, mostly
 /// idle serial pipe streams indefinitely; EOF or a hard error stops it.
 fn stream_words(
     mut reader: impl std::io::Read,
@@ -329,6 +331,7 @@ fn stream_words(
     let mut dec = Decoder::new();
     let mut run = Run::new(db, alias, divide_time_by_2);
     let mut buf = [0u8; 4096];
+    let mut last_rate: Option<u32> = None; // measured Hz of the last surfaced status
     loop {
         match reader.read(&mut buf) {
             Ok(0) => break,
@@ -338,6 +341,29 @@ fn stream_words(
                         Some(Frame::Trace(w)) => run.feed(Word::new(w), outs),
                         Some(Frame::Overflow(dropped)) => {
                             run.health.overflow_words += u64::from(dropped)
+                        }
+                        Some(f @ Frame::Status(_)) => {
+                            let hz = f.status_hz().unwrap_or(0);
+                            // Surface transitions, not the ~1 Hz refresh: lock flips always,
+                            // rate movement only when it strays >0.1% from the last print.
+                            let report = match last_rate {
+                                None => true,
+                                Some(prev) => {
+                                    (prev == 0) != (hz == 0)
+                                        || prev.abs_diff(hz) > prev / 1000
+                                }
+                            };
+                            if report {
+                                if hz == 0 {
+                                    eprintln!("[status] tracer lock LOST (line idle)");
+                                } else {
+                                    eprintln!(
+                                        "[status] tracer locked, rfcore trace rate {:.3} MHz",
+                                        f64::from(hz) / 1e6
+                                    );
+                                }
+                                last_rate = Some(hz);
+                            }
                         }
                         None => {}
                     }
