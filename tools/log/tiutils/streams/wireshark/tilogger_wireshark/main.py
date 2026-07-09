@@ -200,9 +200,15 @@ class WiresharkOutput(LogOutputABC):
 
     def _create_fifo(self):
         # A unique FIFO path Wireshark reads with `-i`. Windows uses a named pipe instead.
+        import atexit
+        import shutil
         import tempfile
 
         fifo_dir = tempfile.mkdtemp(prefix="tilogger-ws-")
+        # Teardown usually just exits the process, so remove the temp dir at exit
+        # instead of relying on _close being called - otherwise every run leaks a
+        # /tmp/tilogger-ws-* dir.
+        atexit.register(shutil.rmtree, fifo_dir, ignore_errors=True)
         self.ws_pipe = os.path.join(fifo_dir, "tilogger-wireshark.pcap")
         os.mkfifo(self.ws_pipe)
         logger.info("Wireshark FIFO: %s", self.ws_pipe)
