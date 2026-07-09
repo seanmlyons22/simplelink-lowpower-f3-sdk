@@ -54,6 +54,11 @@ UART_CODE_MASK = 0x0F
 UART_CODE_OVERFLOW = 0x0E
 UART_CODE_BUFFER = 0x0F
 UART_MAX_ARGS = 8
+# Upper bound on a buffer record's declared payload. The id is validated first, but a
+# bit-flip in the size field of an otherwise valid buffer header would still make the
+# framer wait forever for bytes that never arrive. Real Log_buf payloads are far smaller
+# than this, so a larger size means corruption: treat it as a false sync and resync.
+UART_MAX_BUFFER_PAYLOAD = 0x10000
 
 _FRAME_HEADER_SIZE = 1
 _TIMESTAMP_SIZE = 4
@@ -209,6 +214,18 @@ class UARTFramer:
                 buf.pop(0)
                 continue
 
+            # Validate the log id against the database before trusting any
+            # length field further into the record. An unknown id means we
+            # locked onto a byte that only looked like a frame header, so
+            # resync. Checking before the length math matters for buffer
+            # records: a false header carrying a garbage size field would
+            # otherwise leave the framer waiting forever for bytes that never
+            # arrive, swallowing every record that follows.
+            log_id = build_value(buf[_FRAME_HEADER_SIZE : _FRAME_HEADER_SIZE + LOG_ID_SIZE])
+            if log_id not in self._trace_db.logIndexDB:
+                buf.pop(0)
+                continue
+
             code = buf[0] & UART_CODE_MASK
 
             if code <= UART_MAX_ARGS:
@@ -224,6 +241,11 @@ class UARTFramer:
                     return buf
                 size_offset = _ID_HEADER_SIZE + _TIMESTAMP_SIZE
                 payload_size = build_value(buf[size_offset : size_offset + _SIZE_FIELD_SIZE])
+                if payload_size > UART_MAX_BUFFER_PAYLOAD:
+                    # A corrupt size field would stall the stream waiting on bytes that
+                    # never come; treat it as a false lock and resync one byte.
+                    buf.pop(0)
+                    continue
                 record_length = _ID_HEADER_SIZE + _TIMESTAMP_SIZE + _SIZE_FIELD_SIZE + payload_size
                 is_buffer = True
             else:
@@ -233,13 +255,6 @@ class UARTFramer:
 
             if len(buf) < record_length:
                 return buf
-
-            # Validate the log id against the database. An unknown id means we
-            # locked onto a byte that only looked like a frame header, so resync.
-            log_id = build_value(buf[_FRAME_HEADER_SIZE : _FRAME_HEADER_SIZE + LOG_ID_SIZE])
-            if log_id not in self._trace_db.logIndexDB:
-                buf.pop(0)
-                continue
 
             try:
                 if code == UART_CODE_OVERFLOW:
