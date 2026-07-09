@@ -148,7 +148,7 @@ fn build_outputs(cli: &Cli) -> Result<Vec<Box<dyn Output>>, String> {
     let mut outs: Vec<Box<dyn Output>> = Vec::new();
     for name in &cli.outputs {
         match name.as_str() {
-            "stdout" => outs.push(Box::new(StdoutSink)),
+            "stdout" => outs.push(Box::new(StdoutSink::new())),
             "pcap" => {
                 let path = cli.out.clone().ok_or("pcap/wireshark output needs --out <file> (use - for stdout)")?;
                 if path == "-" {
@@ -162,7 +162,7 @@ fn build_outputs(cli: &Cli) -> Result<Vec<Box<dyn Output>>, String> {
         }
     }
     if outs.is_empty() {
-        outs.push(Box::new(StdoutSink));
+        outs.push(Box::new(StdoutSink::new()));
     }
     Ok(outs)
 }

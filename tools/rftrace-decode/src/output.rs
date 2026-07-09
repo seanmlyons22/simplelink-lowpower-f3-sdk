@@ -4,7 +4,7 @@
 //! dissector and every tilogger output work unchanged on RF-tracer logs.
 
 use crate::types::{Health, LogRecord};
-use std::io::{self, Write};
+use std::io::{self, BufWriter, IsTerminal, Stdout, Write};
 
 pub trait Output {
     fn on_record(&mut self, r: &LogRecord);
@@ -42,18 +42,50 @@ pub fn stdout_line(r: &LogRecord) -> String {
     )
 }
 
-/// stdout sink.
-pub struct StdoutSink;
+/// stdout sink. Buffers when stdout is redirected (a file/pipe: bulk decode of a big
+/// capture), and flushes every line when it is a terminal (a human watching live). Rust's
+/// stdout is line-buffered by default, so an unbuffered `println!` per record is a syscall
+/// per line and dominates the cost of decoding a multi-million-record capture.
+pub struct StdoutSink {
+    w: BufWriter<Stdout>,
+    flush_each: bool,
+}
+
+impl StdoutSink {
+    #[must_use]
+    pub fn new() -> Self {
+        let stdout = io::stdout();
+        let flush_each = stdout.is_terminal();
+        StdoutSink {
+            w: BufWriter::new(stdout),
+            flush_each,
+        }
+    }
+}
+
+impl Default for StdoutSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Output for StdoutSink {
     fn on_record(&mut self, r: &LogRecord) {
-        println!("{}", stdout_line(r));
+        let _ = writeln!(self.w, "{}", stdout_line(r));
+        if self.flush_each {
+            let _ = self.w.flush();
+        }
     }
     fn on_health(&mut self, h: &Health) {
+        // Get buffered records out before the summary line (which goes to stderr).
+        let _ = self.w.flush();
         eprintln!(
             "[health] framing={} crc={} overflow={} unknown_dbgid={} arg_mismatch={} dropped_seq={}",
             h.framing_errors, h.crc_errors, h.overflow_words, h.unknown_dbgid, h.arg_mismatch, h.dropped_seq
         );
+    }
+    fn finish(&mut self) {
+        let _ = self.w.flush();
     }
 }
 
