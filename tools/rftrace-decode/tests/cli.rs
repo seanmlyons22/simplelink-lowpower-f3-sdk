@@ -535,3 +535,54 @@ fn pydecode_matches_rust_on_golden_sal() {
         String::from_utf8_lossy(&py.stdout)
     );
 }
+
+// ---------------------------------------------------------- diagnostics ----
+
+#[test]
+fn decode_unknown_dbgid_is_surfaced_as_placeholder() {
+    // A CRC-good packet whose (channel, dbgid) is in no loaded DB must not vanish:
+    // it is emitted as a visible placeholder and counted in health.unknown_dbgid.
+    // Decoding with no --dbgid at all makes every packet unknown.
+    let (dir, dbgid) = setup("unknown");
+    let raw = dir.join("u.raw");
+    synth_raw(&dbgid, &raw, &["--channel", "4"]);
+    let out = run_ok(&["decode", "--raw", raw.to_str().unwrap(), "--channel", "4", "stdout"]);
+    let recs = stdout_records(&out);
+    assert!(
+        recs.iter().any(|l| l.contains("<no dbgid:") && l.contains("id=0x05")),
+        "expected a placeholder record for the unknown dbgid, got: {recs:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unknown_dbgid=") && !stderr.contains("unknown_dbgid=0"),
+        "health should count the unknown dbgid: {stderr}"
+    );
+}
+
+#[test]
+fn decode_arg_count_mismatch_is_annotated() {
+    // The def IS found, but the wire carried a different number of param words than
+    // the def declares (expected_par_cnt): render best-effort, annotate the text,
+    // and count health.arg_mismatch. The setup dbgid declares one 32-bit arg (two
+    // wire words); decode with a def for the same (ch1, dbgid 5) that expects one
+    // 16-bit word instead.
+    let (dir, dbgid) = setup("argmm");
+    let raw = dir.join("m.raw");
+    synth_raw(&dbgid, &raw, &["--channel", "4"]);
+    let wrong = dir.join("wrong_dbgid.h");
+    std::fs::write(&wrong, b"DBG_DEF(X, 5, DBGCH1, 1, \"n=%d\", \"t.c\", 42)\n").unwrap();
+    let out = run_ok(&[
+        "decode", "--raw", raw.to_str().unwrap(), "--channel", "4",
+        "--dbgid", wrong.to_str().unwrap(), "stdout",
+    ]);
+    let recs = stdout_records(&out);
+    assert!(
+        recs.iter().any(|l| l.contains("arg mismatch")),
+        "expected an arg-mismatch annotation, got: {recs:?}"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("arg_mismatch=") && !stderr.contains("arg_mismatch=0"),
+        "health should count the arg mismatch: {stderr}"
+    );
+}
