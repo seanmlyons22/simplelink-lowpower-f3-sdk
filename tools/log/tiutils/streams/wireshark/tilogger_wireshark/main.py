@@ -53,6 +53,7 @@ import click
 import subprocess
 import os
 import sys
+import threading
 import time
 
 from typing import DefaultDict, Dict, List
@@ -93,6 +94,8 @@ class WiresharkOutput(LogOutputABC):
         self._is_windows = platform.system() == "Windows"
         self._launch_ws = ws_pipe is not None  # --start passed a pipe name; else don't auto-launch
         self._fifo = None  # Linux/macOS FIFO handle
+        self._ws_proc = None  # the Wireshark we launched, so we can watch/tear it down
+        self.shutdown_requested = False  # the logger's run loop polls this to stop cleanly
         if self._is_windows:
             self._create_try_connect_pipe()
         else:
@@ -101,7 +104,8 @@ class WiresharkOutput(LogOutputABC):
     def start(self):
         if not self._is_windows:
             if self._launch_ws:
-                start_wireshark(self.ws_pipe)
+                self._ws_proc = start_wireshark(self.ws_pipe)
+                self._watch_child()
             else:
                 logger.warning("Wireshark not auto-started; open it on this FIFO: %s", self.ws_pipe)
             # Opening the FIFO for write blocks until Wireshark opens it for read.
@@ -113,7 +117,8 @@ class WiresharkOutput(LogOutputABC):
             self._pipe_backlog = []
             self._pipe_inited = True
             return
-        start_wireshark(self.ws_pipe)
+        self._ws_proc = start_wireshark(self.ws_pipe)
+        self._watch_child()
         # Try flushing backlog until Pipe is initialized
         while not self._pipe_inited:
             self._try_connect_backlog()
@@ -169,8 +174,13 @@ class WiresharkOutput(LogOutputABC):
             if not self._pipe_inited or self._fifo is None:
                 self._pipe_backlog.append(data)
             else:
-                self._fifo.write(data)
-                self._fifo.flush()
+                try:
+                    self._fifo.write(data)
+                    self._fifo.flush()
+                except BrokenPipeError:
+                    # dumpcap/Wireshark closed the read end (Stop pressed or window
+                    # closed): stop cleanly instead of crashing the transport thread.
+                    self._trigger_shutdown()
             return
 
         if not self._pipe_inited:
@@ -240,19 +250,44 @@ class WiresharkOutput(LogOutputABC):
         elif self._fifo is not None:
             self._fifo.close()
 
+    def _watch_child(self):
+        # When the user closes Wireshark, stop the logger too, so one action tears
+        # down the whole pipeline instead of leaving the reader firehosing a dead GUI.
+        if self._ws_proc is None:
+            return
+
+        def _wait():
+            self._ws_proc.wait()
+            logger.info("Wireshark exited; stopping logger")
+            self._trigger_shutdown()
+
+        threading.Thread(target=_wait, daemon=True, name="ws-watch").start()
+
+    def _trigger_shutdown(self):
+        # Ask the logger to stop by setting a flag its run loop polls. Portable: no
+        # signals, so it behaves the same on Windows/macOS/Linux and whether the logger
+        # runs in the foreground or the background. Already-decoded logs are flushed to
+        # the FIFO per packet, so nothing shown is lost - we just stop the source.
+        self.shutdown_requested = True
+
 
 def find_wireshark():
-    # On Linux/macOS Wireshark is normally on PATH.
+    # On Linux Wireshark is normally on PATH; Windows and macOS usually aren't.
     import shutil
 
     which = shutil.which("wireshark")
     if which:
         return which
 
-    alternatives = [
-        Path(os.getenv("%PROGRAMFILES(x86)%", "")) / "Wireshark/Wireshark.exe",
-        Path(os.getenv("ProgramFiles", "")) / "Wireshark/Wireshark.exe",
-    ]
+    alternatives = []
+    # Windows default install locations (env var names are "ProgramFiles" /
+    # "ProgramFiles(x86)", not "%...%" - os.getenv takes the bare name).
+    for env in ("ProgramFiles", "ProgramFiles(x86)"):
+        base = os.getenv(env)
+        if base:
+            alternatives.append(Path(base) / "Wireshark" / "Wireshark.exe")
+    # macOS: the .app bundle isn't on PATH by default.
+    alternatives.append(Path("/Applications/Wireshark.app/Contents/MacOS/Wireshark"))
 
     for path in alternatives:
         if path.exists():
@@ -276,7 +311,7 @@ def find_wireshark():
 
 def start_wireshark(ws_pipe):
     if ws_pipe is None:
-        return
+        return None
 
     ws_exec = [
         find_wireshark(),
@@ -296,7 +331,7 @@ def start_wireshark(ws_pipe):
         'gui.column.format:"No.", "%m", "Device alias", "%Cus:tilogger.alias:0:R", "Time", "%t", "Device Time", "%Cus:tilogger.ts_local:0:R", "Level", "%Cus:tilogger.level:0:R", "Module", "%Cus:tilogger.module:0:R", "File", "%Cus:tilogger.file:0:R", "Line", "%Cus:tilogger.line:0:R", "String", "%Cus:tilogger.string:0:R"',
     ]
 
-    subprocess.Popen(ws_exec)
+    return subprocess.Popen(ws_exec)
 
 
 # Function that adds a command to a typer instance via decorator

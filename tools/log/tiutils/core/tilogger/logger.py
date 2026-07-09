@@ -42,6 +42,7 @@ import typer
 import click
 import subprocess
 import os
+import signal
 import sys
 import threading
 import time
@@ -129,10 +130,29 @@ class Logger:
                 subscriber.notify_packet(packet)
 
     def wait_threads(self):
+        # Turn Ctrl-C (SIGINT) and `kill` (SIGTERM) into a clean stop that runs the
+        # finally block below (stops the transports). SIGTERM matters because a
+        # backgrounded launch inherits SIGINT as SIG_IGN, and the Wireshark output
+        # asks us to stop via SIGTERM when its window is closed. Runs in the main
+        # thread, which is required to install signal handlers.
+        def _request_stop(signum, frame):
+            raise KeyboardInterrupt
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                signal.signal(sig, _request_stop)
+            except (ValueError, OSError):
+                pass  # not the main thread, or unsupported on this platform
+
         try:
             while threading.active_count() > 1:
+                # Portable stop path (no signals): an output can ask us to shut down,
+                # e.g. the Wireshark output when its window is closed or its pipe breaks.
+                if any(getattr(o, "shutdown_requested", False) for o in self.outputs):
+                    break
                 time.sleep(0.1)
-                pass
+        except KeyboardInterrupt:
+            pass
         finally:
             typer.echo("Exiting, hoping all threads exit too")
             for transport in self.transports:
