@@ -8,6 +8,11 @@
 use crate::crc5::Crc5;
 use crate::types::{eop_top3, sop_byte, DecodedPacket, Health, Word, WordKind};
 
+/// Cap param bytes buffered per packet. A real packet is a handful of 16-bit params; an SOP that
+/// never gets its EOP (corrupt/stuck line) would otherwise grow this Vec without bound. Excess
+/// bytes are still fed to the CRC, so an oversized run is rejected as a CRC error anyway.
+const MAX_PACKET_DATA: usize = 1024;
+
 /// Classify a 10-bit word `w` by masks:
 ///
 /// | kind      | detect                                     |
@@ -158,7 +163,11 @@ impl PacketAssembler {
                         st.dbgid = byte;
                         st.expect = Field::Data;
                     }
-                    Field::Data => st.data.push(byte),
+                    Field::Data => {
+                        if st.data.len() < MAX_PACKET_DATA {
+                            st.data.push(byte);
+                        }
+                    }
                 }
                 None
             }

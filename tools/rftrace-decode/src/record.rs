@@ -1,7 +1,7 @@
 //! DecodedPacket + dbgid DB -> LogRecord, including C-`printf` substitution.
 
 use crate::timestamp::{ticks_to_us, TsState};
-use crate::types::{DbgDef, DbgIdDb, DecodedPacket, LogRecord};
+use crate::types::{DbgDef, DbgIdDb, DecodedPacket, Health, LogRecord};
 
 /// Reconstruct 32-bit args from the 16-bit wire params using the def's arg width (sign).
 pub fn args_from_params(def: &DbgDef, params: &[u16]) -> Vec<u32> {
@@ -16,21 +16,40 @@ pub fn args_from_params(def: &DbgDef, params: &[u16]) -> Vec<u32> {
     }
 }
 
-/// Resolve a packet to a display record. `None` if the `(channel, dbgid)` is unknown.
+/// Reconstruct device-time ticks for a packet, advancing the rollover state.
+fn ticks_for(pkt: &DecodedPacket, ts: &mut TsState) -> u64 {
+    match pkt.ts_delta {
+        Some(d) => ts.reconstruct(d),
+        None => ts.hold(),
+    }
+}
+
+/// Resolve a packet to a display record. `None` if the `(channel, dbgid)` is unknown
+/// (the caller surfaces those via [`unknown_record`] so the traffic stays visible).
+///
+/// When the def is found but the wire carried a different number of param words than the
+/// def declares (`expected_par_cnt`), the record is still rendered best-effort, but the text
+/// is annotated and `health.arg_mismatch` is bumped - it points at a stale ELF/dbgid.
 pub fn resolve(
     pkt: &DecodedPacket,
     db: &DbgIdDb,
     alias: &str,
     ts: &mut TsState,
     divide_time_by_2: bool,
+    health: &mut Health,
 ) -> Option<LogRecord> {
     let def = db.get(pkt.channel, pkt.dbgid)?;
     let args = args_from_params(def, &pkt.params);
-    let text = format_c(&def.fmt, &args);
-    let ticks = match pkt.ts_delta {
-        Some(d) => ts.reconstruct(d),
-        None => ts.hold(),
-    };
+    let mut text = format_c(&def.fmt, &args);
+    if pkt.params.len() != def.expected_par_cnt() {
+        health.arg_mismatch += 1;
+        text.push_str(&format!(
+            "  [!dbgid arg mismatch: wire={} par words, def expects {} - stale ELF/dbgid?]",
+            pkt.params.len(),
+            def.expected_par_cnt()
+        ));
+    }
+    let ticks = ticks_for(pkt, ts);
     Some(LogRecord {
         alias: alias.to_string(),
         channel: pkt.channel,
@@ -44,6 +63,43 @@ pub fn resolve(
         text,
     })
 }
+
+/// Build a placeholder record for a packet whose `(channel, dbgid)` isn't in any loaded DB, so
+/// the traffic is visible in the log/Wireshark instead of vanishing. Shows the raw fields and
+/// which dbgid files to add. Advances the timestamp state like a resolved packet would.
+pub fn unknown_record(
+    pkt: &DecodedPacket,
+    alias: &str,
+    ts: &mut TsState,
+    divide_time_by_2: bool,
+) -> LogRecord {
+    let params: Vec<String> = pkt.params.iter().map(|w| format!("0x{w:04X}")).collect();
+    let text = format!(
+        "<no dbgid: ch{} id=0x{:02X} seq={} par=[{}]> add --dbgid (pbe/rfe/mce)",
+        pkt.channel,
+        pkt.dbgid,
+        pkt.seq,
+        params.join(", ")
+    );
+    let ticks = ticks_for(pkt, ts);
+    LogRecord {
+        alias: alias.to_string(),
+        channel: pkt.channel,
+        dbgid: pkt.dbgid,
+        seq: pkt.seq,
+        ts_ticks: ticks,
+        ts_us: ticks_to_us(ticks, divide_time_by_2),
+        file: "<unknown dbgid>".to_string(),
+        line: 0,
+        level: "WARN",
+        text,
+    }
+}
+
+/// Cap printf field width/precision. A malformed dbgid (`%999999999d`) would otherwise drive a
+/// multi-GB `" ".repeat(width)` and could overflow `usize` while parsing the digits. Real
+/// embedded format strings never approach this, so clamping is invisible in practice.
+const MAX_FIELD_WIDTH: usize = 4096;
 
 /// Minimal C-`printf` engine covering the specifiers seen in dbgid strings
 /// (`%d %i %u %x %X %o %c %p %s %%`, with flags `- 0`, width, precision, length mods ignored).
@@ -88,7 +144,7 @@ pub fn format_c(fmt: &str, args: &[u32]) -> String {
         let mut width = 0usize;
         let mut has_w = false;
         while i < b.len() && b[i].is_ascii_digit() {
-            width = width * 10 + (b[i] - b'0') as usize;
+            width = (width * 10 + (b[i] - b'0') as usize).min(MAX_FIELD_WIDTH);
             has_w = true;
             i += 1;
         }
@@ -98,7 +154,7 @@ pub fn format_c(fmt: &str, args: &[u32]) -> String {
             i += 1;
             let mut p = 0usize;
             while i < b.len() && b[i].is_ascii_digit() {
-                p = p * 10 + (b[i] - b'0') as usize;
+                p = (p * 10 + (b[i] - b'0') as usize).min(MAX_FIELD_WIDTH);
                 i += 1;
             }
             prec = Some(p);
@@ -287,15 +343,66 @@ mod tests {
             params: vec![0x5678, 0x1234],
             crc_ok: true,
         };
-        let r = resolve(&pkt, &db, "rftrc", &mut ts, false).unwrap();
+        let mut health = Health::default();
+        let r = resolve(&pkt, &db, "rftrc", &mut ts, false, &mut health).unwrap();
         assert_eq!(r.text, "v=12345678");
         assert_eq!(r.file, "t.c"); // basename only
         assert_eq!(r.ts_ticks, 4);
         assert_eq!(r.ts_us, 2.0);
         assert_eq!(r.level, "INFO"); // dbgids carry no level
+        assert_eq!(health.arg_mismatch, 0); // 2 par words == expected for a -1 (32-bit) def
 
         let unknown = DecodedPacket { dbgid: 99, ..pkt.clone() };
-        assert!(resolve(&unknown, &db, "rftrc", &mut ts, false).is_none());
+        assert!(resolve(&unknown, &db, "rftrc", &mut ts, false, &mut health).is_none());
+    }
+
+    #[test]
+    fn resolve_flags_arg_count_mismatch() {
+        // def declares one 32-bit arg (expected_par_cnt == 2); the wire carried only one word.
+        let mut db = DbgIdDb::default();
+        db.by_key.insert((1, 5), def(-1, "v=%08X"));
+        let mut ts = crate::timestamp::TsState::new();
+        let mut health = Health::default();
+        let pkt = DecodedPacket {
+            channel: 1,
+            dbgid: 5,
+            seq: 0,
+            ts_delta: Some(4),
+            params: vec![0x5678], // one word, def expects two
+            crc_ok: true,
+        };
+        let r = resolve(&pkt, &db, "rftrc", &mut ts, false, &mut health).unwrap();
+        assert_eq!(health.arg_mismatch, 1);
+        assert!(r.text.starts_with("v="), "still rendered best-effort: {}", r.text);
+        assert!(r.text.contains("arg mismatch"), "annotated: {}", r.text);
+    }
+
+    #[test]
+    fn unknown_record_is_visible_and_advances_time() {
+        let mut ts = crate::timestamp::TsState::new();
+        let pkt = DecodedPacket {
+            channel: 2,
+            dbgid: 0x4F,
+            seq: 3,
+            ts_delta: Some(10),
+            params: vec![0x1234, 0x5678],
+            crc_ok: true,
+        };
+        let r = unknown_record(&pkt, "rftrc", &mut ts, false);
+        assert_eq!(r.level, "WARN");
+        assert_eq!(r.ts_ticks, 10); // timestamp reconstructed, not dropped
+        assert!(r.text.contains("ch2"), "{}", r.text);
+        assert!(r.text.contains("0x4F"), "{}", r.text);
+        assert!(r.text.contains("0x1234, 0x5678"), "{}", r.text);
+        assert!(r.text.contains("--dbgid"), "{}", r.text);
+    }
+
+    #[test]
+    fn format_c_caps_absurd_width() {
+        // A malformed dbgid must not drive a giant allocation; width clamps.
+        let out = format_c("%999999999d", &[7]);
+        assert!(out.len() <= MAX_FIELD_WIDTH, "clamped to {}", out.len());
+        assert!(out.trim_start().starts_with('7') || out.ends_with('7'));
     }
 
     #[test]
@@ -317,7 +424,8 @@ mod tests {
             params: vec![],
             crc_ok: true,
         };
-        let r = resolve(&pkt, &db, "rftrc", &mut ts, false).unwrap();
+        let mut health = Health::default();
+        let r = resolve(&pkt, &db, "rftrc", &mut ts, false, &mut health).unwrap();
         assert_eq!(r.ts_ticks, 100);
     }
 }

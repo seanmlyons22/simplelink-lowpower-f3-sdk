@@ -51,8 +51,8 @@ impl Output for StdoutSink {
     }
     fn on_health(&mut self, h: &Health) {
         eprintln!(
-            "[health] framing={} crc={} overflow={} unknown_dbgid={} dropped_seq={}",
-            h.framing_errors, h.crc_errors, h.overflow_words, h.unknown_dbgid, h.dropped_seq
+            "[health] framing={} crc={} overflow={} unknown_dbgid={} arg_mismatch={} dropped_seq={}",
+            h.framing_errors, h.crc_errors, h.overflow_words, h.unknown_dbgid, h.arg_mismatch, h.dropped_seq
         );
     }
 }

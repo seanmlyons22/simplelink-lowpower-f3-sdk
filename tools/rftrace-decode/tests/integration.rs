@@ -255,7 +255,7 @@ fn golden_sal_end_to_end() {
                 crc_bad += 1;
                 continue;
             }
-            if let Some(r) = resolve(&p, &db, "rftrc", &mut ts, cfg.divide_time_by_2) {
+            if let Some(r) = resolve(&p, &db, "rftrc", &mut ts, cfg.divide_time_by_2, &mut health) {
                 assert!(r.ts_ticks >= last_ticks, "timestamps must be monotonic");
                 last_ticks = r.ts_ticks;
                 got.push((r.file.clone(), r.line, norm(&r.text)));

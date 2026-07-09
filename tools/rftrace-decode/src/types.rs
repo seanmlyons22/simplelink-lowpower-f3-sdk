@@ -126,6 +126,9 @@ pub struct Health {
     pub crc_errors: u64,
     pub overflow_words: u64,
     pub unknown_dbgid: u64,
+    /// Packets whose wire param-word count didn't match the dbgid def's `expected_par_cnt`
+    /// (a stale ELF/dbgid vs firmware). Distinct from `unknown_dbgid` (the def was found).
+    pub arg_mismatch: u64,
     pub dropped_seq: u64,
 }
 

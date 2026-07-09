@@ -12,7 +12,7 @@
 use rftrace_decode::deframe::deframe_edges;
 use rftrace_decode::output::{stdout_line, Output, PcapSink, StdoutSink};
 use rftrace_decode::packet::{classify, PacketAssembler};
-use rftrace_decode::record::resolve;
+use rftrace_decode::record::{resolve, unknown_record};
 use rftrace_decode::sample::{read_sal, SalRuns};
 use rftrace_decode::synth;
 use rftrace_decode::timestamp::TsState;
@@ -196,13 +196,25 @@ impl<'a> Run<'a> {
             if !pkt.crc_ok {
                 return;
             }
-            match resolve(&pkt, self.db, self.alias, &mut self.ts, self.divide_time_by_2) {
-                Some(rec) => {
-                    for o in outs.iter_mut() {
-                        o.on_record(&rec);
-                    }
+            let rec = match resolve(
+                &pkt,
+                self.db,
+                self.alias,
+                &mut self.ts,
+                self.divide_time_by_2,
+                &mut self.health,
+            ) {
+                Some(rec) => rec,
+                None => {
+                    // No dbgid for this (channel, dbgid): surface it as a placeholder record
+                    // instead of dropping, so the traffic is visible (e.g. radio ch2/ch3 when
+                    // only the app ELF is loaded) and the user knows to add --dbgid.
+                    self.health.unknown_dbgid += 1;
+                    unknown_record(&pkt, self.alias, &mut self.ts, self.divide_time_by_2)
                 }
-                None => self.health.unknown_dbgid += 1,
+            };
+            for o in outs.iter_mut() {
+                o.on_record(&rec);
             }
         }
     }
