@@ -26,6 +26,14 @@ modules is displayed in the list below.
 > logging tool. Also note that some log sinks (for example, LogSinkBuf) don't
 > require this host-side tool to capture and view log messages.**
 
+> **Stopping tilogger:** Ctrl-C (foreground) or `kill <pid>` stops the logger
+> cleanly on Linux, macOS, and Windows. When Wireshark is launched with
+> `wireshark --start`, closing the Wireshark window (or pressing its Stop button)
+> also stops the logger: tilogger owns the Wireshark it launched and tears the
+> whole pipeline down together, so it never keeps reading the source into a closed
+> GUI. The Wireshark output finds the app via PATH, the Windows `Program Files`
+> install dirs, or the macOS `.app` bundle.
+
 ## Quick Start Guide
 
 This section will briefly explain the steps needed to setup and use the logger

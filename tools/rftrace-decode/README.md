@@ -1,9 +1,20 @@
 # rftrace-decode
 
-Logic-analyzer backend for the CC-series RF-core (LRFDTRC) trace sink
-(`source/ti/log/LogSinkTraceLPF3`). Takes LA samples of the trace pin, deframes
-the 12-bit tracer line, decodes the packet protocol, resolves dbgids, and emits
-logs to Wireshark and stdout identically to the ITM/UART `tilogger` path.
+Decoder backend for the CC-series RF-core (LRFDTRC) trace sink
+(`source/ti/log/LogSinkTraceLPF3`). It has two front ends:
+
+- **Logic-analyzer samples** of the trace pin (Saleae `.sal`, raw, sigrok, Logic 2):
+  `replay` / `decode --raw` deframe the 12-bit tracer line into words.
+- **An already-deframed RFT1 word stream** from a Raspberry Pi Pico receiver
+  (`rftrace-pico`, the low-cost replacement for the Opal Kelly FPGA): `decode --words`
+  reads the Pico's USB byte stream (via `tilogger rftrace --port`/`--rft1`); no sample
+  deframing, so it is the fastest offline path.
+
+Both feed the same back end: classify -> per-channel packet assembly + CRC-5 -> resolve
+dbgids -> emit logs to Wireshark and stdout identically to the ITM/UART `tilogger` path.
+See `ARCHITECTURE` (`tools/log/tiutils/streams/rftrace/ARCHITECTURE.md`) for how this Rust
+decoder and the Python tilogger framework divide the work, and `PERFORMANCE.md` for
+huge-capture behavior.
 
 The self-contained pipeline description (wire format, module map, decision log)
 is `trace-pipeline-architecture.md.mkd` at the repo root. Metadata comes from
@@ -23,6 +34,24 @@ Complete, std-only (zero dependencies), `cargo test` fully green: ~50 module uni
 tests, integration tests including the golden end-to-end gate (`tx_burst_example.sal`
 decodes to the exact app+pbe record sequence of the oracle, zero framing and CRC
 errors), and a CLI suite covering every subcommand and flag of the built binary.
+
+## Diagnostics (dbgid mismatches, health counters)
+
+Every packet is CRC-checked, then resolved against the dbgid DB. Two failure modes are
+surfaced instead of silently dropped, because both point at a dbgid/firmware mismatch:
+
+- **Unknown `(channel, dbgid)`** (e.g. radio ch2/ch3 traffic when only the app ELF is
+  loaded): emitted as a visible placeholder record
+  `<no dbgid: ch2 id=0x4F seq=3 par=[...]> add --dbgid (pbe/rfe/mce)` so the traffic shows
+  up in stdout/Wireshark and the fix is obvious, rather than looking like "no traffic".
+- **Arg-count mismatch**: the def was found, but the wire carried a different number of
+  param words than the def declares (`expected_par_cnt`). The record still renders
+  best-effort, but its text is annotated `[!dbgid arg mismatch: wire=N ... def expects M]` -
+  a stale ELF/dbgid vs the running firmware.
+
+At end of run a `[health]` line goes to stderr:
+`framing= crc= overflow= unknown_dbgid= arg_mismatch= dropped_seq=`. Non-zero
+`unknown_dbgid`/`arg_mismatch` almost always means a missing or stale `--dbgid`.
 
 ## Performance (live capture)
 
@@ -136,12 +165,14 @@ transport, so it swaps in for `itm`/`uart` with the same command shape and reuse
 every tilogger output (`stdout`, `wireshark`, `to-replayfile`) unchanged:
 
 ```
+tilogger rftrace --port /dev/ttyACM0 --elf app.out \
+    --divide-time-by-2 wireshark --start                        # live Pico receiver
+tilogger rftrace --rft1 cap.rft1 --elf app.out --dbgid pbe_dbgid.h \
+    --divide-time-by-2 stdout                                   # replay a Pico byte stream
 tilogger rftrace --sal cap.sal --elf app.out \
-    --channel 4 --divide-time-by-2 stdout                       # metadata from the ELF
-tilogger rftrace --sal cap.sal --elf app.out --dbgid pbe_dbgid.h \
-    --divide-time-by-2 wireshark --start                        # + modem/LRF headers
+    --channel 4 --divide-time-by-2 stdout                       # LA capture, metadata from ELF
 tilogger rftrace --sigrok "--driver saleae-logic-pro-16 --config samplerate=500M \
-    -C D4" --elf app.out --channel 0 --divide-time-by-2 stdout  # endless live
+    -C D4" --elf app.out --channel 0 --divide-time-by-2 stdout  # endless live LA
 tilogger rftrace --logic2 --duration 2 --loop --elf app.out \
     --channel 7 --divide-time-by-2 wireshark --start            # Logic 2 automation
 ```
@@ -161,10 +192,14 @@ automation client - no hardware in CI. One hardware-in-the-loop check exists and
 is gated: `RFTRACE_HIL=1 pytest tests/ -k hil` (needs a Saleae attached, Logic 2
 running with automation enabled, `TRACEDECODE`, and `RFTRACE_DBGID`).
 
-The same change made tilogger's Wireshark output work on Linux
-(`streams/wireshark`): the win32 named-pipe path was guarded and a FIFO path
-added, so `wireshark --start` auto-launches and configures Wireshark on Linux and
-Windows alike.
+tilogger's Wireshark output (`streams/wireshark`) is cross-platform: a win32
+named-pipe path on Windows and a FIFO path on Linux/macOS, and `find_wireshark`
+locates the binary via PATH, the Windows `ProgramFiles` install dirs, or the macOS
+`.app` bundle. Teardown is signal-free and portable: tilogger owns the Wireshark it
+launches, so closing the Wireshark window, pressing Stop (the pipe breaks), or
+`kill`/Ctrl-C on the logger all stop the whole pipeline cleanly - it stops reading the
+source rather than leaving a firehose feeding a dead GUI. Decoded records are flushed
+per packet, so nothing already shown is lost.
 
 ## Standalone use (no tilogger)
 
