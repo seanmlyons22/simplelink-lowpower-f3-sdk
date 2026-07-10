@@ -562,7 +562,35 @@ extern "C" {
  *  You would use this in your application via
  *      `Log_printf(MyCritical, Log_ERROR, "Oops")`
  */
-#define Log_MODULE_DEFINE(name, init) const Log_Module LogMod_ ## name = init
+/* Per-module call-site forwarders. Each Log_printf/Log_buf site emits a direct
+ * bl to one of these instead of loading the module handle and the sink function
+ * pointer itself, moving that dispatch (and the level argument setup) off every
+ * call site and into one shared forwarder per module. The forwarder tail-calls
+ * through the module's own const struct, which the compiler devirtualizes here
+ * because the initializer is visible in this translation unit. Only the common
+ * 0-3 argument printf and buf paths get a forwarder; the rare 4-8 argument path
+ * keeps the variadic struct dispatch. Portable C: no linker script, no asm. */
+#define _Log_STAMP_FWD_ATTR(name, attr)                                                                   \
+    attr void Log_ ## name ## _printf0(Log_Level level, uint32_t id)                                      \
+    { LogMod_ ## name.printf0(&LogMod_ ## name, level, id); }                                             \
+    attr void Log_ ## name ## _printf1(Log_Level level, uint32_t id, uintptr_t a0)                        \
+    { LogMod_ ## name.printf1(&LogMod_ ## name, level, id, a0); }                                         \
+    attr void Log_ ## name ## _printf2(Log_Level level, uint32_t id, uintptr_t a0, uintptr_t a1)          \
+    { LogMod_ ## name.printf2(&LogMod_ ## name, level, id, a0, a1); }                                     \
+    attr void Log_ ## name ## _printf3(Log_Level level, uint32_t id, uintptr_t a0, uintptr_t a1, uintptr_t a2) \
+    { LogMod_ ## name.printf3(&LogMod_ ## name, level, id, a0, a1, a2); }                                 \
+    attr void Log_ ## name ## _buf(Log_Level level, uint32_t id, uint8_t *data, size_t size)              \
+    { LogMod_ ## name.buf(&LogMod_ ## name, level, id, data, size); }
+
+#define _Log_STAMP_FWD(name)      _Log_STAMP_FWD_ATTR(name, )
+#if defined(__IAR_SYSTEMS_ICC__)
+#define _Log_STAMP_FWD_WEAK(name) _Log_STAMP_FWD_ATTR(name, __weak)
+#else
+#define _Log_STAMP_FWD_WEAK(name) _Log_STAMP_FWD_ATTR(name, __attribute__((weak)))
+#endif
+
+#define Log_MODULE_DEFINE(name, init) const Log_Module LogMod_ ## name = init;                                 \
+    _Log_STAMP_FWD(name)
 
 /**
  *  @brief Defines Log module as weak
@@ -592,9 +620,11 @@ extern "C" {
  *  @sa #LogSinkDummy_buf
  */
 #if defined(DOXYGEN) || defined(__IAR_SYSTEMS_ICC__)
-#define Log_MODULE_DEFINE_WEAK(name, init) const __weak Log_Module LogMod_ ## name = init
+#define Log_MODULE_DEFINE_WEAK(name, init) const __weak Log_Module LogMod_ ## name = init; \
+    _Log_STAMP_FWD_WEAK(name)
 #elif defined(__TI_COMPILER_VERSION__) || (defined(__clang__) && defined(__ti_version__)) || defined(__GNUC__)
-#define Log_MODULE_DEFINE_WEAK(name, init) const Log_Module LogMod_ ## name __attribute__((weak)) = init
+#define Log_MODULE_DEFINE_WEAK(name, init) const Log_Module LogMod_ ## name __attribute__((weak)) = init; \
+    _Log_STAMP_FWD_WEAK(name)
 #else
 #error "Incompatible compiler: Logging is currently supported by the following \
 compilers: TI ARM Compiler, TI CLANG Compiler, GCC, IAR. Please migrate to a \
@@ -771,15 +801,14 @@ supported compiler."
  */
 #define _Log_buf_C_1(module, level, format, data, size)                                                 \
     _Log_GUARD_MACRO(                                                                                   \
-        Log_MODULE_USE(module);                                                                         \
         _Log_PLACE_FORMAT_IN_SECTOR(_Log_CONCAT2(LogSymbol, __LINE__),                                  \
                                     LOG_OPCODE_BUFFER,                                                  \
                                     level,                                                              \
                                     LogMod_ ## module,                                                  \
                                     format,                                                             \
                                     0);                                                                 \
-        LogMod_ ## module.buf(&LogMod_ ## module,                                                       \
-                              level,                                                                    \
+        extern void Log_ ## module ## _buf(Log_Level, uint32_t, uint8_t *, size_t);                     \
+        Log_ ## module ## _buf(level,                                                                   \
                               (uint32_t)&_Log_CONCAT3(Ptr, LogSymbol, __LINE__),                        \
                               data,                                                                     \
                               size);                                                                    \
@@ -817,19 +846,19 @@ supported compiler."
  *  LTO is enabled though.
  */
 #define _Log_printf__arg1(module, level, fmt, a0)                              \
-    module.printf1(&module,                                                    \
-                   level,                                                      \
+    extern void Log_ ## module ## _printf1(Log_Level, uint32_t, uintptr_t);    \
+    Log_ ## module ## _printf1(level,                                          \
                    (uint32_t)&_Log_CONCAT3(Ptr, LogSymbol, __LINE__),          \
                    (uintptr_t)a0)
 #define _Log_printf__arg2(module, level, fmt, a0, a1)                          \
-    module.printf2(&module,                                                    \
-                   level,                                                      \
+    extern void Log_ ## module ## _printf2(Log_Level, uint32_t, uintptr_t, uintptr_t); \
+    Log_ ## module ## _printf2(level,                                          \
                    (uint32_t)&_Log_CONCAT3(Ptr, LogSymbol, __LINE__),          \
                    (uintptr_t)a0,                                              \
                    (uintptr_t)a1)
 #define _Log_printf__arg3(module, level, fmt, a0, a1, a2)                      \
-    module.printf3(&module,                                                    \
-                   level,                                                      \
+    extern void Log_ ## module ## _printf3(Log_Level, uint32_t, uintptr_t, uintptr_t, uintptr_t); \
+    Log_ ## module ## _printf3(level,                                          \
                    (uint32_t)&_Log_CONCAT3(Ptr, LogSymbol, __LINE__),          \
                    (uintptr_t)a0,                                              \
                    (uintptr_t)a1,                                              \
@@ -871,15 +900,16 @@ supported compiler."
                                          (uintptr_t)a7)
 
 #define _Log_printf__arg(module, level, ...)                                   \
-    module.printf(&module,                                                     \
+    Log_MODULE_USE(module);                                                    \
+    LogMod_ ## module.printf(&LogMod_ ## module,                               \
                   level,                                                       \
                   (uint32_t)&_Log_CONCAT3(Ptr, LogSymbol, __LINE__),           \
                   _Log_NUMARGS(__VA_ARGS__),                                   \
                   _Log_CDR_ARG(__VA_ARGS__))
 
 #define _Log_printf__noarg(module, level, ...)                                 \
-    module.printf0(&module,                                                    \
-                   level,                                                      \
+    extern void Log_ ## module ## _printf0(Log_Level, uint32_t);               \
+    Log_ ## module ## _printf0(level,                                          \
                    (uint32_t)&_Log_CONCAT3(Ptr, LogSymbol, __LINE__))
 
 /* Empty Log_printf macro to use when a log module is not enabled in the
@@ -892,14 +922,13 @@ supported compiler."
  */
 #define _Log_printf_C_1(opcode, module, level, ...)                             \
     _Log_GUARD_MACRO(                                                           \
-        Log_MODULE_USE(module);                                                 \
         _Log_PLACE_FORMAT_IN_SECTOR(_Log_CONCAT2(LogSymbol, __LINE__),          \
                                     opcode,                                     \
                                     level,                                      \
                                     LogMod_ ## module,                          \
                                     _Log_CAR_ARG(__VA_ARGS__),                  \
                                     _Log_NUMARGS(__VA_ARGS__))                  \
-        _Log_VARIANT(_Log_printf, LogMod_ ## module, level, __VA_ARGS__);       \
+        _Log_VARIANT(_Log_printf, module, level, __VA_ARGS__);       \
     )
 
 /* First level indirection macro for Log_printf that delegates between an empty
