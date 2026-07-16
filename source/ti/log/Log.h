@@ -571,16 +571,16 @@ extern "C" {
  * 0-3 argument printf and buf paths get a forwarder; the rare 4-8 argument path
  * keeps the variadic struct dispatch. Portable C: no linker script, no asm. */
 #define _Log_STAMP_FWD_ATTR(name, attr)                                                                   \
-    attr void Log_ ## name ## _printf0(Log_Level level, uint32_t id)                                      \
-    { LogMod_ ## name.printf0(&LogMod_ ## name, level, id); }                                             \
-    attr void Log_ ## name ## _printf1(Log_Level level, uint32_t id, uintptr_t a0)                        \
-    { LogMod_ ## name.printf1(&LogMod_ ## name, level, id, a0); }                                         \
-    attr void Log_ ## name ## _printf2(Log_Level level, uint32_t id, uintptr_t a0, uintptr_t a1)          \
-    { LogMod_ ## name.printf2(&LogMod_ ## name, level, id, a0, a1); }                                     \
-    attr void Log_ ## name ## _printf3(Log_Level level, uint32_t id, uintptr_t a0, uintptr_t a1, uintptr_t a2) \
-    { LogMod_ ## name.printf3(&LogMod_ ## name, level, id, a0, a1, a2); }                                 \
-    attr void Log_ ## name ## _buf(Log_Level level, uint32_t id, uint8_t *data, size_t size)              \
-    { LogMod_ ## name.buf(&LogMod_ ## name, level, id, data, size); }
+    attr void Log_ ## name ## _printf0(uint32_t pid)                                                      \
+    { LogMod_ ## name.printf0(&LogMod_ ## name, (Log_Level)(pid & 31u), pid & ~31u); }                    \
+    attr void Log_ ## name ## _printf1(uint32_t pid, uintptr_t a0)                                        \
+    { LogMod_ ## name.printf1(&LogMod_ ## name, (Log_Level)(pid & 31u), pid & ~31u, a0); }                \
+    attr void Log_ ## name ## _printf2(uint32_t pid, uintptr_t a0, uintptr_t a1)                          \
+    { LogMod_ ## name.printf2(&LogMod_ ## name, (Log_Level)(pid & 31u), pid & ~31u, a0, a1); }            \
+    attr void Log_ ## name ## _printf3(uint32_t pid, uintptr_t a0, uintptr_t a1, uintptr_t a2)            \
+    { LogMod_ ## name.printf3(&LogMod_ ## name, (Log_Level)(pid & 31u), pid & ~31u, a0, a1, a2); }        \
+    attr void Log_ ## name ## _buf(uint32_t pid, uint8_t *data, size_t size)                              \
+    { LogMod_ ## name.buf(&LogMod_ ## name, (Log_Level)(pid & 31u), pid & ~31u, data, size); }
 
 #define _Log_STAMP_FWD(name)      _Log_STAMP_FWD_ATTR(name, )
 #if defined(__IAR_SYSTEMS_ICC__)
@@ -719,6 +719,7 @@ supported compiler."
                                        module,                                 \
                                        format,                                 \
                                        nargs);                                 \
+           _Pragma("data_alignment=32")                                        \
            __root static const char * const _Log_CONCAT2(Ptr, name) @ _Log_TOKEN2STRING(_Log_CONCAT2(.log_ptr, module)) = name;
 #elif defined(__TI_COMPILER_VERSION__) || (defined(__clang__) && defined(__ti_version__)) || defined(__GNUC__)
 #define _Log_PLACE_FORMAT_IN_SECTOR(name, opcode, level, module, format, nargs)\
@@ -732,11 +733,41 @@ supported compiler."
                                         format,                                \
                                         nargs);                                \
             static const char * const _Log_CONCAT2(Ptr, name)                  \
-            __attribute__((used,section(_Log_TOKEN2STRING(_Log_CONCAT3(.log_ptr, __LINE__, module))))) = name;
+            __attribute__((used,aligned(32),section(_Log_TOKEN2STRING(_Log_CONCAT3(.log_ptr, __LINE__, module))))) = name;
 #else
 #error "Incompatible compiler: Logging is currently supported by the following \
 compilers: TI ARM Compiler, TI CLANG Compiler, GCC, IAR. Please migrate to a \
 supported compiler."
+#endif
+
+/* Combine the metadata pointer and the level into one word passed to the
+ * forwarder, so the call site sets up one argument instead of two. The Ptr slot
+ * is aligned to 32 bytes (see _Log_PLACE_FORMAT_IN_SECTOR), so the low 5 bits of
+ * its address are always zero and carry the 5-bit level mask. The forwarder
+ * splits them apart again. Log levels are single bits (Log_DEBUG..Log_ERROR)
+ * whose mask, and any OR combination up to Log_ALL, fits in 5 bits.
+ *
+ * On Cortex-M3/M4/M33 (Armv7-M and later) a single movw materializes the low 16
+ * bits of the slot address plus the level as a link-time relocation addend, with
+ * no literal-pool word. The address is passed through a C operand so the
+ * relocation targets the real (block-scope, possibly renamed) slot symbol. This
+ * path needs a compile-time-constant level; a runtime level falls back to the
+ * portable form. Cortex-M0+ (Armv6-M) has no movw, and IAR uses the portable
+ * form too; there the compiler folds the level into the address constant. */
+#if !defined(__IAR_SYSTEMS_ICC__) && defined(__ARM_ARCH) && (__ARM_ARCH >= 7) && \
+    (defined(__GNUC__) || defined(__clang__))
+#define _Log_PID(sym, level)                                                   \
+    __builtin_choose_expr(__builtin_constant_p((unsigned)(level)),             \
+        (__extension__({                                                       \
+            uint32_t _lpid;                                                    \
+            __asm__("movw %0, #:lower16:%c1"                                   \
+                    : "=r"(_lpid)                                              \
+                    : "s"((const char *)&(sym) + (unsigned)(level)));          \
+            _lpid;                                                             \
+        })),                                                                   \
+        ((uint32_t)(uintptr_t)&(sym) + (unsigned)(level)))
+#else
+#define _Log_PID(sym, level) ((uint32_t)(uintptr_t)&(sym) + (unsigned)(level))
 #endif
 
 /*
@@ -807,9 +838,8 @@ supported compiler."
                                     LogMod_ ## module,                                                  \
                                     format,                                                             \
                                     0);                                                                 \
-        extern void Log_ ## module ## _buf(Log_Level, uint32_t, uint8_t *, size_t);                     \
-        Log_ ## module ## _buf(level,                                                                   \
-                              (uint32_t)&_Log_CONCAT3(Ptr, LogSymbol, __LINE__),                        \
+        extern void Log_ ## module ## _buf(uint32_t, uint8_t *, size_t);                                \
+        Log_ ## module ## _buf(_Log_PID(_Log_CONCAT3(Ptr, LogSymbol, __LINE__), level),                 \
                               data,                                                                     \
                               size);                                                                    \
     )
@@ -846,20 +876,17 @@ supported compiler."
  *  LTO is enabled though.
  */
 #define _Log_printf__arg1(module, level, fmt, a0)                              \
-    extern void Log_ ## module ## _printf1(Log_Level, uint32_t, uintptr_t);    \
-    Log_ ## module ## _printf1(level,                                          \
-                   (uint32_t)&_Log_CONCAT3(Ptr, LogSymbol, __LINE__),          \
+    extern void Log_ ## module ## _printf1(uint32_t, uintptr_t);               \
+    Log_ ## module ## _printf1(_Log_PID(_Log_CONCAT3(Ptr, LogSymbol, __LINE__), level), \
                    (uintptr_t)a0)
 #define _Log_printf__arg2(module, level, fmt, a0, a1)                          \
-    extern void Log_ ## module ## _printf2(Log_Level, uint32_t, uintptr_t, uintptr_t); \
-    Log_ ## module ## _printf2(level,                                          \
-                   (uint32_t)&_Log_CONCAT3(Ptr, LogSymbol, __LINE__),          \
+    extern void Log_ ## module ## _printf2(uint32_t, uintptr_t, uintptr_t);    \
+    Log_ ## module ## _printf2(_Log_PID(_Log_CONCAT3(Ptr, LogSymbol, __LINE__), level), \
                    (uintptr_t)a0,                                              \
                    (uintptr_t)a1)
 #define _Log_printf__arg3(module, level, fmt, a0, a1, a2)                      \
-    extern void Log_ ## module ## _printf3(Log_Level, uint32_t, uintptr_t, uintptr_t, uintptr_t); \
-    Log_ ## module ## _printf3(level,                                          \
-                   (uint32_t)&_Log_CONCAT3(Ptr, LogSymbol, __LINE__),          \
+    extern void Log_ ## module ## _printf3(uint32_t, uintptr_t, uintptr_t, uintptr_t); \
+    Log_ ## module ## _printf3(_Log_PID(_Log_CONCAT3(Ptr, LogSymbol, __LINE__), level), \
                    (uintptr_t)a0,                                              \
                    (uintptr_t)a1,                                              \
                    (uintptr_t)a2)
@@ -908,9 +935,8 @@ supported compiler."
                   _Log_CDR_ARG(__VA_ARGS__))
 
 #define _Log_printf__noarg(module, level, ...)                                 \
-    extern void Log_ ## module ## _printf0(Log_Level, uint32_t);               \
-    Log_ ## module ## _printf0(level,                                          \
-                   (uint32_t)&_Log_CONCAT3(Ptr, LogSymbol, __LINE__))
+    extern void Log_ ## module ## _printf0(uint32_t);                          \
+    Log_ ## module ## _printf0(_Log_PID(_Log_CONCAT3(Ptr, LogSymbol, __LINE__), level))
 
 /* Empty Log_printf macro to use when a log module is not enabled in the
  * preprocessor during compilation
@@ -1289,24 +1315,51 @@ __attribute__((weak)) void LogSinkDummy_printf(const Log_Module *handle,
  *
  *  @sa #Log_MODULE_DEFINE_WEAK
  */
-__attribute__((weak)) void LogSinkDummy_printfN(const Log_Module *handle,
-                                                Log_Level level,
-                                                uint32_t headerPtr,
-                                                ...)
+/* The Log_Module printf0-3 slots have distinct fixed-argument function pointer
+ * types, so the dummy sink provides one no-op function per arity. A single
+ * variadic function cannot be assigned to a fixed-argument slot without an
+ * incompatible-function-pointer-type error. Each function is weak so it can be
+ * defined (not just declared) in this header without link-time symbol
+ * conflicts, and needs no separate library dependency.
+ */
+__attribute__((weak)) void LogSinkDummy_printf0(const Log_Module *handle, Log_Level level, uint32_t headerPtr)
 {
-    /* The function is defined as weak to allow definition (as opposed to just a
-     * declaration) within this header file without running into symbol
-     * conflicts during linking.
-     * This way we do not need a separate library dependency just for this dummy
-     * log sink.
-     */
-
-    /* Cast all input arguments to void to avoid unused argument warnings. */
     (void)handle;
     (void)level;
     (void)headerPtr;
-
-    /* Do not perform any operations and return immediately. */
+}
+__attribute__((weak)) void LogSinkDummy_printf1(const Log_Module *handle, Log_Level level, uint32_t headerPtr, uintptr_t a0)
+{
+    (void)handle;
+    (void)level;
+    (void)headerPtr;
+    (void)a0;
+}
+__attribute__((weak)) void LogSinkDummy_printf2(const Log_Module *handle,
+                                                Log_Level level,
+                                                uint32_t headerPtr,
+                                                uintptr_t a0,
+                                                uintptr_t a1)
+{
+    (void)handle;
+    (void)level;
+    (void)headerPtr;
+    (void)a0;
+    (void)a1;
+}
+__attribute__((weak)) void LogSinkDummy_printf3(const Log_Module *handle,
+                                                Log_Level level,
+                                                uint32_t headerPtr,
+                                                uintptr_t a0,
+                                                uintptr_t a1,
+                                                uintptr_t a2)
+{
+    (void)handle;
+    (void)level;
+    (void)headerPtr;
+    (void)a0;
+    (void)a1;
+    (void)a2;
 }
 
 /**
@@ -1368,10 +1421,10 @@ __attribute__((weak)) void LogSinkDummy_buf(const Log_Module *handle,
     {                                                                          \
         .sinkConfig = NULL,                                                    \
         .printf = LogSinkDummy_printf,                                         \
-        .printf0 = LogSinkDummy_printfN,                                       \
-        .printf1 = LogSinkDummy_printfN,                                       \
-        .printf2 = LogSinkDummy_printfN,                                       \
-        .printf3 = LogSinkDummy_printfN,                                       \
+        .printf0 = LogSinkDummy_printf0,                                       \
+        .printf1 = LogSinkDummy_printf1,                                       \
+        .printf2 = LogSinkDummy_printf2,                                       \
+        .printf3 = LogSinkDummy_printf3,                                       \
         .buf = LogSinkDummy_buf,                                               \
         .levels = 0,                                                           \
         .dynamicLevelsPtr = NULL,                                              \
