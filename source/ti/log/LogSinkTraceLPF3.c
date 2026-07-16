@@ -109,7 +109,7 @@ void LogSinkTraceLPF3_enable(void)
 void LogSinkTraceLPF3_init(void)
 {
     /* Enable tracer clock */
-    Power_setDependency(PowerLPF3_PERIPH_LFRD_TRC);
+    Power_setDependency(PowerLPF3_PERIPH_LRFD_TRC);
 
     /* Register for wakeup event */
     Power_registerNotify(&LogSinkTraceLPF3_powerAwakeStandbyObj,
