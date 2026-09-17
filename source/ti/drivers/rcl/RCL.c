@@ -46,6 +46,9 @@
 #include <ti/drivers/rcl/RCL_Version.h>
 #include <ti/drivers/rcl/LRF.h>
 #include <ti/drivers/rcl/hal/RCL_Hal.h>
+#if (DeviceFamily_PARENT == DeviceFamily_PARENT_CC27XX)
+#include <ti/drivers/rcl/RCL_Dma.h>
+#endif
 
 #include <ti/drivers/dpl/SemaphoreP.h>
 #include <ti/drivers/dpl/HwiP.h>
@@ -864,6 +867,11 @@ RCL_Handle RCL_open(RCL_Client *c, const LRF_Config *lrfConfig)
         /* Temporary solution: Enable all needed clocks here */
         LRF_rclEnableRadioClocks();
 
+#if (DeviceFamily_PARENT == DeviceFamily_PARENT_CC27XX)
+        /* Set up the FIFO DMA. Needs the radio clocks enabled above */
+        RCL_Dma_open();
+#endif
+
         /* Initialize the RCL GPIOs */
         RCL_GPIO_enable();
 
@@ -912,6 +920,11 @@ void RCL_close(RCL_Handle h)
     {
         /* Disable RCL GPIO pins*/
         RCL_GPIO_disable();
+
+#if (DeviceFamily_PARENT == DeviceFamily_PARENT_CC27XX)
+        /* Tear down the FIFO DMA while the radio clocks are still enabled */
+        RCL_Dma_close();
+#endif
 
         /* Temporary solution: Disable clocks here */
         LRF_rclDisableRadioClocks();

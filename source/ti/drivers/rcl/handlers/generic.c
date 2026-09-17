@@ -49,6 +49,16 @@
 #include <ti/drivers/rcl/hal/RCL_Hal.h>
 #include <ti/drivers/rcl/commands/generic.h>
 
+/* The generic TX and RX data path is run by the LRF DMA on CC27XX. Other
+ * devices keep the CPU copy.
+ */
+#if (DeviceFamily_PARENT == DeviceFamily_PARENT_CC27XX)
+#define RCL_GENERIC_DMA_DATA_PATH 1
+#include <ti/drivers/rcl/RCL_Dma.h>
+#else
+#define RCL_GENERIC_DMA_DATA_PATH 0
+#endif
+
 
 struct
 {
@@ -307,6 +317,13 @@ RCL_Events RCL_Handler_Generic_Tx(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Ev
             /* Initialize RF FIFO */
             genericHandlerState.common.txFifoSize = (uint16_t) LRF_prepareTxFifo();
 
+#if RCL_GENERIC_DMA_DATA_PATH
+            /* The payload is not entered here. The DMA feeds the TX FIFO from
+               the buffer the application submitted with RCL_Dma_putTxBuffer(),
+               paced by the FIFO itself, so the operation may be posted before
+               there is anything to send. */
+            RCL_Dma_armTx();
+#else
             /* Enter payload */
             uint32_t nBuffer = RCL_Handler_Generic_updateTxBuffers(&txCmd->txBuffers, 1U);
             if (nBuffer == 0U)
@@ -315,6 +332,7 @@ RCL_Events RCL_Handler_Generic_Tx(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Ev
                 rclEvents.lastCmdDone = 1U;
             }
             else
+#endif
             {
                 RCL_CommandStatus startTimeStatus = RCL_Scheduler_setStartStopTimeEarliestStart(cmd, earliestStartTime);
                 if (startTimeStatus >= RCL_CommandStatus_Finished)
@@ -347,6 +365,7 @@ RCL_Events RCL_Handler_Generic_Tx(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Ev
         {
             cmd->status = genericHandlerState.common.endStatus;
             rclEvents.lastCmdDone = 1U;
+#if !RCL_GENERIC_DMA_DATA_PATH
             /* Pop transmitted packet */
             RCL_Buffer_TxBuffer *txBuffer;
             txBuffer = RCL_TxBuffer_get(&txCmd->txBuffers);
@@ -354,6 +373,7 @@ RCL_Events RCL_Handler_Generic_Tx(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Ev
             {
                 txBuffer->state = RCL_BufferStateFinished;
             }
+#endif
             RCL_Profiling_eventHook(RCL_ProfilingEvent_PostprocStart);
         }
         else if (lrfEvents.opError != 0U)
@@ -377,6 +397,10 @@ RCL_Events RCL_Handler_Generic_Tx(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Ev
 
     if (rclEvents.lastCmdDone != 0U)
     {
+#if RCL_GENERIC_DMA_DATA_PATH
+        /* Releases the DMA channel and hands the transmitted packet back */
+        RCL_Dma_stop();
+#endif
         LRF_disable();
         RCL_Handler_Generic_setSynthPowerState((bool) txCmd->config.fsOff);
     }
@@ -826,7 +850,15 @@ RCL_Events RCL_Handler_Generic_Rx(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Ev
                 genericHandlerState.common.curBuffer = NULL;
                 if (rxCmd->config.discardRxPackets == 0U)
                 {
+#if RCL_GENERIC_DMA_DATA_PATH
+                    /* The DMA empties the RX FIFO into the buffer the
+                       application submitted with RCL_Dma_putRxBuffer(). Arming
+                       it also bounds the FIFO to the space that buffer has
+                       left, which is what holds the radio back. */
+                    RCL_Dma_armRx();
+#else
                     RCL_Handler_Generic_updateRxCurBufferAndFifo(&rxCmd->rxBuffers);
+#endif
                 }
                 else
                 {
@@ -853,6 +885,30 @@ RCL_Events RCL_Handler_Generic_Rx(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Ev
     {
         if (lrfEvents.rxOk != 0U || lrfEvents.rxNok != 0U || lrfEvents.rxBufFull != 0U)
         {
+#if RCL_GENERIC_DMA_DATA_PATH
+            if (rxCmd->config.discardRxPackets == 0U)
+            {
+                /* The DMA has already moved the packet out of the RX FIFO.
+                   Commit what landed and re-arm for the next one. */
+                if (RCL_Dma_finishRx() > 0U)
+                {
+                    rclEvents.rxEntryAvail = 1;
+                }
+            }
+            else
+            {
+                while (LRF_hasRxWordToRead() == true)
+                {
+                    uint32_t fifoWord = LRF_peekRxFifo(0);
+                    uint32_t wordLength = RCL_Buffer_DataEntry_paddedLen(fifoWord & 0xFFFFU) / 4U;
+                    if (wordLength == 0U)
+                    {
+                        break;
+                    }
+                    LRF_discardRxFifoWords(wordLength);
+                }
+            }
+#else
             /* Copy received packet from LRF FIFO to buffer */
             /* First, check that there is actually a buffer available */
             while (LRF_hasRxWordToRead() == true)
@@ -899,6 +955,7 @@ RCL_Events RCL_Handler_Generic_Rx(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Ev
                     }
                 }
             }
+#endif
             if (genericHandlerState.common.activeUpdate)
             {
                 RCL_Handler_Generic_updateRxStats(rxCmd->stats, rclSchedulerState.actualStartTime);
@@ -937,6 +994,7 @@ RCL_Events RCL_Handler_Generic_Rx(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Ev
         }
     }
 
+#if !RCL_GENERIC_DMA_DATA_PATH
     if (cmd->status == RCL_CommandStatus_Active)
     {
         if (rclEventsIn.rxBufferUpdate != 0U)
@@ -944,9 +1002,14 @@ RCL_Events RCL_Handler_Generic_Rx(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Ev
             RCL_Handler_Generic_updateRxCurBufferAndFifo(&rxCmd->rxBuffers);
         }
     }
+#endif
 
     if (rclEvents.lastCmdDone != 0U)
     {
+#if RCL_GENERIC_DMA_DATA_PATH
+        /* Releases the DMA channel, the posted RX buffer stays posted */
+        RCL_Dma_stop();
+#endif
         LRF_disable();
         RCL_Handler_Generic_setSynthPowerState((bool) rxCmd->config.fsOff);
         RCL_Handler_Generic_updateRxStats(rxCmd->stats, rclSchedulerState.actualStartTime);

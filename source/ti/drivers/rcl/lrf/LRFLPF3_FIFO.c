@@ -308,6 +308,15 @@ void LRF_setRxFifoEffSz(uint32_t maxSz)
 }
 
 /*
+ *  ======== LRF_clearRxFifoDeallocated ========
+ */
+void LRF_clearRxFifoDeallocated(void)
+{
+    /* RP was moved by DMA through the FIFO byte read port, so RX FIFO is not deallocated */
+    rxFifoDeallocated = false;
+}
+
+/*
  *  ======== LRF_peekRxFifoWords ========
  */
 void LRF_peekRxFifoWords(uint32_t *data32, uint32_t wordLength, uint32_t startRp)

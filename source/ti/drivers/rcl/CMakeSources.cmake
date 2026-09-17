@@ -54,10 +54,12 @@ set(SOURCES_CC27XXX10
     ${SOURCES_COMMON}
     ${SOURCES_LPF3}
     handlers/ble_cs.c
+    RCL_Dma.c
 )
 
 set(SOURCES_CC27XXX20
     ${SOURCES_COMMON}
     ${SOURCES_LPF3}
     handlers/ble_cs.c
+    RCL_Dma.c
 )
