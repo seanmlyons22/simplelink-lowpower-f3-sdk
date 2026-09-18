@@ -384,6 +384,16 @@ uint32_t RCL_Dma_finishRx(void)
  */
 void RCL_Dma_stop(void)
 {
+    /* Take the trigger away before the channel is released. The selected FIFO
+     * condition is true again as soon as the radio has drained the FIFO, so the
+     * request would stay asserted with no transfer left to serve, and the uDMA
+     * waits for a request to fall before it arbitrates again. Leaving it
+     * asserted parks the channel in that wait and the next command never gets
+     * its data. */
+    HWREG_WRITE_LRF(LRFDDBELL_BASE + LRFDDBELL_O_DMACFG) = 0U;
+    HWREG_WRITE_LRF(LRFDPBE_BASE + LRFDPBE_O_FCFG5) = LRFDPBE_FCFG5_DMAREQ_NONE |
+                                                      LRFDPBE_FCFG5_DMASREQ_NONE;
+
     uintptr_t key = HwiP_disable();
     UDMALPF3_channelDisable(RCL_dmaChannelMask);
     rclDmaState.txArmed = false;
