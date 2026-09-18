@@ -76,8 +76,7 @@ extern uint32_t RCL_dmaChannelSubscriberId;
  * FIFO holds: the request is asserted while fewer than the arbitration size is
  * buffered, so the FIFO runs at roughly one arbitration of data and is topped
  * up as the radio consumes it. */
-#define RCL_DMA_TX_ARB          UDMA_ARB_32
-#define RCL_DMA_TX_ARB_BYTES    32U
+#define RCL_DMA_TX_CHUNK_DEFAULT 32U
 /* The RX drain must complete in one arbitration, so it arbitrates over the
  * largest transfer the uDMA supports */
 #define RCL_DMA_RX_ARB          UDMA_ARB_1024
@@ -95,6 +94,11 @@ typedef struct {
 } RCL_DmaState;
 
 static RCL_DmaState rclDmaState;
+
+/* How much the TX transfer moves per arbitration, as the uDMA arbitration
+ * field and in bytes. RCL_Dma_setTxChunkSize keeps the two in step. */
+static uint32_t rclDmaTxArb      = UDMA_ARB_32;
+static uint32_t rclDmaTxArbBytes = RCL_DMA_TX_CHUNK_DEFAULT;
 
 /* ============================================================================
  * Forward Declarations
@@ -152,7 +156,7 @@ static void rclDmaStartTx(RCL_Buffer_TxBuffer *txBuffer)
     uint32_t numBytes = RCL_Buffer_DataEntry_paddedLen(txBuffer->length);
 
     uDMASetChannelControl(RCL_dmaControlTableEntry,
-                          UDMA_SRC_INC_8 | UDMA_DST_INC_NONE | UDMA_SIZE_8 | RCL_DMA_TX_ARB);
+                          UDMA_SRC_INC_8 | UDMA_DST_INC_NONE | UDMA_SIZE_8 | rclDmaTxArb);
     uDMASetChannelTransfer(RCL_dmaControlTableEntry,
                            UDMA_MODE_BASIC,
                            (void *) &txBuffer->length,
@@ -213,6 +217,36 @@ static uint32_t rclDmaDrainRx(RCL_MultiBuffer *rxBuffer, uint32_t numBytes)
         LRF_clearRxFifoDeallocated();
     }
     return numBytes;
+}
+
+/*
+ *  ======== RCL_Dma_setTxChunkSize ========
+ */
+int_fast16_t RCL_Dma_setTxChunkSize(uint32_t numBytes)
+{
+    int_fast16_t status = RCL_Dma_Status_Error_Param;
+
+    /* The uDMA encodes the arbitration size as a power of two, and the FIFO
+     * threshold is derived from it, so only those sizes can be set. */
+    if ((numBytes >= 2U) && (numBytes <= (uint32_t) UDMA_XFER_SIZE_MAX) &&
+        ((numBytes & (numBytes - 1U)) == 0U))
+    {
+        uint32_t shift = 0U;
+
+        while ((1U << shift) < numBytes)
+        {
+            shift++;
+        }
+
+        uintptr_t key = HwiP_disable();
+        rclDmaTxArb = shift << UDMA_ARB_S;
+        rclDmaTxArbBytes = numBytes;
+        HwiP_restore(key);
+
+        status = RCL_Dma_Status_Success;
+    }
+
+    return status;
 }
 
 /*
@@ -322,7 +356,7 @@ void RCL_Dma_armTx(void)
     uint32_t fifoSize = HWREG_READ_LRF(LRFDPBE_BASE + LRFDPBE_O_TXFWRITABLE);
 
     rclDmaConfigureTrigger(LRFDPBE_FCFG5_DMAREQ_TXWRBTHR_MET | LRFDPBE_FCFG5_DMASREQ_NONE);
-    HWREG_WRITE_LRF(LRFDPBE_BASE + LRFDPBE_O_TXFWBTHRS) = rclDmaFillThreshold(fifoSize, RCL_DMA_TX_ARB_BYTES);
+    HWREG_WRITE_LRF(LRFDPBE_BASE + LRFDPBE_O_TXFWBTHRS) = rclDmaFillThreshold(fifoSize, rclDmaTxArbBytes);
 
     uintptr_t key = HwiP_disable();
     rclDmaState.txArmed = true;

@@ -79,6 +79,23 @@ int_fast16_t RCL_Dma_putTxBuffer(RCL_Buffer_TxBuffer *txBuffer);
  *  @return %RCL_Dma_Status_Success, or an error status
  */
 int_fast16_t RCL_Dma_putRxBuffer(RCL_MultiBuffer *rxBuffer);
+
+/*!
+ *  @brief  Set how much the TX transfer moves per arbitration
+ *
+ *  This also sets how much data the TX FIFO carries, because the FIFO threshold
+ *  is derived from it: the radio asks for more once fewer than this many bytes
+ *  are left, so the FIFO runs at roughly one chunk and the modulator paces the
+ *  refill. A larger chunk buffers more against DMA latency, a smaller one keeps
+ *  less of the packet in the radio.
+ *
+ *  Takes effect at the next command. The default is 32 bytes.
+ *
+ *  @param  numBytes  Chunk size; a power of two from 2 to 1024
+ *
+ *  @return %RCL_Dma_Status_Success, or %RCL_Dma_Status_Error_Param
+ */
+int_fast16_t RCL_Dma_setTxChunkSize(uint32_t numBytes);
 /** @}
  */
 
