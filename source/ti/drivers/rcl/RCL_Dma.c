@@ -109,6 +109,16 @@ static uint32_t rclDmaFillThreshold(uint32_t fifoSize, uint32_t arbBytes);
 static void rclDmaConfigureTrigger(uint32_t fcfg5);
 static void rclDmaStartTx(RCL_Buffer_TxBuffer *txBuffer);
 static uint32_t rclDmaDrainRx(RCL_MultiBuffer *rxBuffer, uint32_t numBytes);
+static void rclDmaRxAllowSpace(RCL_MultiBuffer *rxBuffer);
+
+/* Physical RX FIFO, read at arm time */
+static uint32_t rclDmaRxFifoSize = 0U;
+
+/* Diagnostic: RX FIFO state as the command ended, taken before anything is
+ * torn down. Read with a debugger. */
+volatile uint32_t rclDmaRxStopState[8];
+volatile uint32_t rclDmaRxRestricted = 0U;
+volatile uint32_t rclDmaRxShortDrain = 0U;
 
 /* ============================================================================
  * Implementations
@@ -167,6 +177,45 @@ static void rclDmaStartTx(RCL_Buffer_TxBuffer *txBuffer)
 }
 
 /*
+ *  ======== rclDmaRxAllowSpace ========
+ */
+/* Hand the PBE the FIFO space the drain has freed.
+ *
+ * Reading through the FIFO data port moves RXFRP but not RXFSRP, so something
+ * has to follow it. As long as the posted buffer can take a whole FIFO, the
+ * hardware does: FCFG0.RXADEAL moves RXFSRP after RXFRP and nothing needs to be
+ * written while a packet is on the air. That is what makes it safe, because
+ * LRF_setRxFifoEffSz() parks the PBE FIFO command register on FSTAT for the
+ * duration of its pointer write, and a FIFO command the PBE issues in that
+ * window is dropped. Called once per packet it eventually drops one, and the
+ * PBE then ends the command with an RX FIFO error on a FIFO that is empty.
+ *
+ * Only a buffer with less room than the FIFO still needs the write, and then
+ * auto deallocate has to come off so that the two do not both move RXFSRP. */
+static void rclDmaRxAllowSpace(RCL_MultiBuffer *rxBuffer)
+{
+    uint32_t space = (rxBuffer != NULL) ? ((uint32_t) rxBuffer->length - rxBuffer->tailIndex) : 0U;
+    uint32_t fcfg0 = HWREG_READ_LRF(LRFDPBE_BASE + LRFDPBE_O_FCFG0);
+
+    if (space >= rclDmaRxFifoSize)
+    {
+        if ((fcfg0 & LRFDPBE_FCFG0_RXADEAL_M) == 0U)
+        {
+            HWREG_WRITE_LRF(LRFDPBE_BASE + LRFDPBE_O_FCFG0) = fcfg0 | LRFDPBE_FCFG0_RXADEAL_M;
+        }
+    }
+    else
+    {
+        if ((fcfg0 & LRFDPBE_FCFG0_RXADEAL_M) != 0U)
+        {
+            HWREG_WRITE_LRF(LRFDPBE_BASE + LRFDPBE_O_FCFG0) = fcfg0 & ~LRFDPBE_FCFG0_RXADEAL_M;
+        }
+        LRF_setRxFifoEffSz(space);
+        rclDmaRxRestricted++;
+    }
+}
+
+/*
  *  ======== rclDmaDrainRx ========
  */
 /* Move everything PBE has committed out of the RX FIFO through the FIFO data
@@ -211,10 +260,12 @@ static uint32_t rclDmaDrainRx(RCL_MultiBuffer *rxBuffer, uint32_t numBytes)
         }
         UDMALPF3_channelDisable(RCL_dmaChannelMask);
 
+        if (uDMAGetChannelSize(RCL_dmaControlTableEntry) != 0U)
+        {
+            rclDmaRxShortDrain++;
+        }
         numBytes -= uDMAGetChannelSize(RCL_dmaControlTableEntry);
         RCL_MultiBuffer_commitBytes(rxBuffer, numBytes);
-        /* RXFRP was moved by the FIFO data port */
-        LRF_clearRxFifoDeallocated();
     }
     return numBytes;
 }
@@ -329,7 +380,7 @@ int_fast16_t RCL_Dma_putRxBuffer(RCL_MultiBuffer *rxBuffer)
             rclDmaState.rxBuffer = rxBuffer;
             if (rclDmaState.rxArmed)
             {
-                LRF_setRxFifoEffSz((uint32_t) rxBuffer->length - rxBuffer->tailIndex);
+                rclDmaRxAllowSpace(rxBuffer);
             }
         }
         HwiP_restore(key);
@@ -372,9 +423,8 @@ void RCL_Dma_armTx(void)
  */
 void RCL_Dma_armRx(void)
 {
-    /* FCFG0 is left as LRF_prepareRxFifo set it. Auto deallocate must stay off:
-     * space is freed by the LRF_setRxFifoEffSz calls below, and letting the
-     * hardware move RXFSRP as well makes those writes move it a full round. */
+    rclDmaRxFifoSize = (HWREG_READ_LRF(LRFDPBE_BASE + LRFDPBE_O_FCFG4) &
+                        LRFDPBE_FCFG4_RXSIZE_M) >> LRFDPBE_FCFG4_RXSIZE_S << 2U;
 
     /* Request while the FIFO holds anything readable */
     rclDmaConfigureTrigger(LRFDPBE_FCFG5_DMAREQ_RXRDBTHR_MET | LRFDPBE_FCFG5_DMASREQ_NONE);
@@ -385,15 +435,12 @@ void RCL_Dma_armRx(void)
     RCL_MultiBuffer *rxBuffer = rclDmaState.rxBuffer;
     HwiP_restore(key);
 
-    /* Hold PBE to what the posted buffer can take */
-    if (rxBuffer != NULL)
-    {
-        LRF_setRxFifoEffSz((uint32_t) rxBuffer->length - rxBuffer->tailIndex);
-    }
-    else
-    {
-        LRF_setRxFifoEffSz(0U);
-    }
+    /* LRF_prepareRxFifo left RXFSRP at 0, so the PBE has no space yet. Give it
+     * what the posted buffer can take here, where the PBE is not running and
+     * the pointer write is safe; rclDmaRxAllowSpace() keeps it open from then
+     * on without writing a pointer again. */
+    LRF_setRxFifoEffSz((rxBuffer != NULL) ? ((uint32_t) rxBuffer->length - rxBuffer->tailIndex) : 0U);
+    rclDmaRxAllowSpace(rxBuffer);
 }
 
 /*
@@ -407,7 +454,7 @@ uint32_t RCL_Dma_finishRx(void)
     if (rclDmaState.rxArmed && (rxBuffer != NULL))
     {
         numBytes = rclDmaDrainRx(rxBuffer, HWREG_READ_LRF(LRFDPBE_BASE + LRFDPBE_O_RXFREADABLE));
-        LRF_setRxFifoEffSz((uint32_t) rxBuffer->length - rxBuffer->tailIndex);
+        rclDmaRxAllowSpace(rxBuffer);
     }
 
     return numBytes;
@@ -427,6 +474,18 @@ void RCL_Dma_stop(void)
     HWREG_WRITE_LRF(LRFDDBELL_BASE + LRFDDBELL_O_DMACFG) = 0U;
     HWREG_WRITE_LRF(LRFDPBE_BASE + LRFDPBE_O_FCFG5) = LRFDPBE_FCFG5_DMAREQ_NONE |
                                                       LRFDPBE_FCFG5_DMASREQ_NONE;
+
+    if (rclDmaState.rxArmed)
+    {
+        rclDmaRxStopState[0] = HWREG_READ_LRF(LRFDPBE_BASE + LRFDPBE_O_RXFREADABLE);
+        rclDmaRxStopState[1] = HWREG_READ_LRF(LRFDPBE_BASE + LRFDPBE_O_RXFWRITABLE);
+        rclDmaRxStopState[2] = HWREG_READ_LRF(LRFDPBE_BASE + LRFDPBE_O_RXFSRP);
+        rclDmaRxStopState[3] = HWREG_READ_LRF(LRFDPBE_BASE + LRFDPBE_O_RXFRP);
+        rclDmaRxStopState[4] = HWREG_READ_LRF(LRFDPBE_BASE + LRFDPBE_O_RXFWP);
+        rclDmaRxStopState[5] = HWREG_READ_LRF(LRFDPBE_BASE + LRFDPBE_O_FSTAT);
+        rclDmaRxStopState[6] = HWREG_READ_LRF(LRFDPBE_BASE + LRFDPBE_O_FCFG0);
+        rclDmaRxStopState[7] = rclDmaRxFifoSize;
+    }
 
     uintptr_t key = HwiP_disable();
     UDMALPF3_channelDisable(RCL_dmaChannelMask);

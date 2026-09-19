@@ -260,7 +260,6 @@ void LRF_readRxFifoWords(uint32_t *data32, uint32_t wordLength);
 uint32_t LRF_peekRxFifo(int32_t offset);
 void LRF_discardRxFifoWords(uint32_t wordLength);
 void LRF_setRxFifoEffSz(uint32_t maxSz);
-void LRF_clearRxFifoDeallocated(void);
 void LRF_peekRxFifoWords(uint32_t *data32, uint32_t wordLength, uint32_t startRp);
 uint32_t LRF_getUncommittedFifoStatus(uint32_t *currentRp);
 void LRF_resetRxFifo(void);
