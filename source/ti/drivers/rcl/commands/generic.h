@@ -655,14 +655,17 @@ struct RCL_STATS_GENERIC_RX_BURST_t {
  *  run an FS command before this one and leave %rfFrequency 0 for the
  *  operations to skip it.
  *
- *  The command stays active until it is stopped or the PBE reports an
- *  operation error. A graceful stop lets an operation in flight finish; a
- *  hard stop ends it. Stop posting before stopping the command: an operation
- *  posted after the stop is requested is not accounted for, and a hard stop
- *  that lands in the first microseconds of an operation, before the RFE has
- *  brought the PA up (about 9 us after the API write), leaves the PBE
- *  waiting in its end routine for an RFE report that never comes, with no
- *  recovery short of resetting the LRF; measured. Prefer the graceful stop.
+ *  The command stays active until it is stopped, through the API or by a
+ *  stop time, or the PBE reports an operation error. A graceful stop lets an
+ *  operation in flight finish; a hard stop ends it. Stop posting before
+ *  stopping the command: an operation posted after the stop is requested is
+ *  not accounted for, and a hard stop that lands in the first microseconds
+ *  of an operation, before the RFE has brought the PA up (about 9 us after
+ *  the API write), leaves the PBE waiting in its end routine for an RFE
+ *  report that never comes, with no recovery short of resetting the LRF;
+ *  measured. Prefer the graceful stop. Leave %config.disableLRF set: a stop
+ *  can leave a second operation done latched in the doorbell, which a
+ *  following command on an LRF left enabled would take for its own.
  *
  *  @note CC27XX only. Other devices end the command with RCL_CommandStatus_Error_Param.
  */
@@ -673,9 +676,9 @@ struct RCL_CMD_GENERIC_TX_STREAM_t {
     uint16_t             packetLength;    /*!< Payload bytes per packet */
     RCL_Command_TxPower  txPower;         /*!< Transmit power */
     struct {
-        uint8_t          fsOff: 1;        /*!< 0: Keep PLL enabled after command. 1: Turn off FS after command. */
+        uint8_t          fsOff: 1;        /*!< 0: keep refsys and the power constraints after the command, for a following command on the locked synthesizer. 1: release them */
         uint8_t          enableLRF: 1;    /*!< 1: call LRF_enable() at command start. 0: assume the LRF is already enabled by a previous command */
-        uint8_t          disableLRF: 1;   /*!< 1: call LRF_disable() at command end. 0: leave the LRF enabled for a following command */
+        uint8_t          disableLRF: 1;   /*!< 1: call LRF_disable() at command end. 0: leave the LRF enabled for a following command; not supported after a stop, see above */
         uint8_t          reserved: 5;     /*!< Reserved, set to 0 */
     } config;
     RCL_StatsGenericTxStream *stats;      /*!< Pointer to statistics structure. NULL: Do not store statistics */
@@ -716,6 +719,35 @@ struct RCL_CMD_GENERIC_TX_STREAM_t {
  *  pointer is written while the operation is on the air. The CPU is not
  *  involved per packet: only the end of the command is serviced.
  *
+ *  The drain is the application's, and it owes the command the following.
+ *  The channel must be one the LRF trigger reaches, 2 or 4, subscribed to
+ *  LRFDTRG; the request is a pulse per committed entry and one request is
+ *  answered with one arbitration, so the transfer must be armed for exactly
+ *  one entry of %entryBytes with an arbitration size, a power of two, that
+ *  covers it, halfwords out of LRFDPBE.RXFHRD, and re-armed for every entry.
+ *  It must be armed before the command starts: an entry nobody takes out
+ *  stays in the FIFO, and once the FIFO is full the operation ends with
+ *  %RCL_CommandStatus_Error_RxFifo. It must have taken an entry out before
+ *  the next packet ends: the PBE issues its commit and discard FIFO commands
+ *  at the end of every packet, and a port access in the cycle one of them
+ *  takes effect drops the command. The trigger is taken away when the
+ *  command ends and the channel is left as it was armed; the RCL's own
+ *  channel may be used only while no burst command is queued, since a burst
+ *  disables it when it ends.
+ *
+ *  The command stays active until it is stopped, through the API or by a
+ *  stop time, or the PBE reports an operation error. The operation turns the
+ *  synthesizer off when it ends, whatever %config.fsOff says: fsOff only
+ *  decides whether refsys and the power constraints are kept for a following
+ *  command, which must then program its frequency again. A hard stop in the
+ *  first microseconds after the command starts, while the RFE is still
+ *  starting the operation, leaves the PBE waiting in its end routine for an
+ *  RFE report that never comes, as it does on the TX stream; prefer the
+ *  graceful stop, which ends promptly in sync search. Leave
+ *  %config.disableLRF set: a stop can leave a second operation done latched
+ *  in the doorbell, which a following command on an LRF left enabled would
+ *  take for its own.
+ *
  *  @note CC27XX only. Other devices end the command with RCL_CommandStatus_Error_Param.
  */
 struct RCL_CMD_GENERIC_RX_STREAM_t {
@@ -726,9 +758,9 @@ struct RCL_CMD_GENERIC_RX_STREAM_t {
     uint16_t                entryBytes;             /*!< Written by the handler at setup: bytes of one entry in the RX FIFO, padded to a word */
     RCL_StatsGenericRxStream *stats;                /*!< Pointer to statistics structure. NULL: Do not store statistics */
     struct {
-        uint8_t             fsOff:     1;           /*!< 0: keep PLL after command. 1: turn off FS after command */
+        uint8_t             fsOff:     1;           /*!< The synthesizer is always off after the command. 0: keep refsys and the power constraints for a following command that programs its frequency. 1: release them */
         uint8_t             enableLRF: 1;           /*!< 1: call LRF_enable() at command start. 0: assume the LRF is already enabled by a previous command */
-        uint8_t             disableLRF:1;           /*!< 1: call LRF_disable() at command end. 0: leave the LRF enabled for a following command */
+        uint8_t             disableLRF:1;           /*!< 1: call LRF_disable() at command end. 0: leave the LRF enabled for a following command; not supported after a stop, see above */
         uint8_t             reserved:  5;           /*!< Reserved, set to 0 */
     } config;
 };
@@ -742,7 +774,7 @@ struct RCL_CMD_GENERIC_RX_STREAM_t {
     .packetLength         = 24U,                                                \
     .entryBytes           = 0U,                                                 \
     .stats                = NULL,                                               \
-    .config = { .fsOff = 0, .enableLRF = 1, .disableLRF = 1, .reserved = 0 },   \
+    .config = { .fsOff = 1, .enableLRF = 1, .disableLRF = 1, .reserved = 0 },   \
 }
 #define RCL_CmdGenericRxStream_DefaultRuntime() \
     (RCL_CmdGenericRxStream) RCL_CmdGenericRxStream_Default()

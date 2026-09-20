@@ -111,6 +111,8 @@ struct
         } nesb;
         struct {
             RCL_StopType        stopType;
+            uint16_t            fifoCfg;        /* RX: FIFOCFG as the settings left it, restored at the end */
+            uint16_t            extraBytes;     /* RX: EXTRABYTES likewise */
         } stream;
     };
 } genericHandlerState;
@@ -2168,6 +2170,29 @@ RCL_Events RCL_Handler_Generic_RxBurst(RCL_Command *cmd, LRF_Events lrfEvents, R
 }
 
 /*
+ *  ======== rclGenericStreamEnableStopTimeIrqs ========
+ *
+ *  A stop time, the command's own or the scheduler's, reaches a stream only
+ *  as an RCL event: the PBE tests the compares itself at the end of a packet,
+ *  but a stream's operation done is masked and there may be no packet, so
+ *  the doorbell interrupts of both compares are enabled when the command
+ *  starts, wherever a stop time is set. RCL programs the times right after
+ *  this, and delivers each as gracefulStop or hardStop to the handler, which
+ *  then writes the stop to the PBE like a stop requested through the API.
+ */
+static void rclGenericStreamEnableStopTimeIrqs(void)
+{
+    if (rclSchedulerState.gracefulStopInfo.cmdStopEnabled || rclSchedulerState.gracefulStopInfo.schedStopEnabled)
+    {
+        RCL_Hal_enableGracefulStopTimeIrq();
+    }
+    if (rclSchedulerState.hardStopInfo.cmdStopEnabled || rclSchedulerState.hardStopInfo.schedStopEnabled)
+    {
+        RCL_Hal_enableHardStopTimeIrq();
+    }
+}
+
+/*
  *  ======== rclGenericStreamRequestStop ========
  *
  *  Turn a stop request into something the PBE answers, whatever it is doing.
@@ -2175,20 +2200,22 @@ RCL_Events RCL_Handler_Generic_RxBurst(RCL_Command *cmd, LRF_Events lrfEvents, R
  *  A stream keeps the operation-done interrupt masked, since an operation ends
  *  with every packet and the CPU is not to be woken for it; only an operation
  *  error is serviced. The end of a stream is therefore announced by nothing
- *  unless the handler asks for it here. RCL has already written the stop to
- *  LRFDPBE.API when this runs. The PBE answers a stop written while it runs an
- *  operation with the operation's end, and a stop written while it is idle
- *  with an immediate operation done that leaves ENDCAUSE untouched, so an
- *  operation done is the answer in either case.
+ *  unless the handler asks for it here. The PBE answers a stop written to
+ *  LRFDPBE.API while it runs an operation with the operation's end, and a
+ *  stop written while it is idle with an immediate operation done that leaves
+ *  ENDCAUSE untouched, so an operation done is the answer in either case.
  *
- *  The dones of every packet sent so far are still latched in the doorbell,
- *  masked, and would be taken for the answer the moment the mask is lifted,
- *  so they are cleared first. That clear may also take the answer to the stop
- *  RCL wrote, which an idle PBE gives within a few cycles, and so the stop is
- *  written a second time after the mask is lifted: an idle PBE answers it
- *  again, and a running one already holds it, the API register keeping the
- *  last value written. At most one answer is left latched at the end of the
- *  command, and RCL clears the doorbell when a command ends.
+ *  A stop requested through the API has already been written to the PBE by
+ *  RCL when this runs; a stop delivered by one of the stop timers has not,
+ *  RCL only posts the event. The dones of every packet sent so far are still
+ *  latched in the doorbell, masked, and would be taken for the answer the
+ *  moment the mask is lifted, so they are cleared first. That clear may also
+ *  take the answer to a stop RCL wrote, which an idle PBE gives within a few
+ *  cycles, and so the stop is written here in every case, after the mask is
+ *  lifted: an idle PBE answers it, again if need be, and a running one holds
+ *  it, the API register keeping the last value written. At most one answer
+ *  is left latched at the end of the command, and RCL clears the doorbell
+ *  when a command ends.
  *
  *  A hard stop supersedes a graceful one.
  */
@@ -2276,7 +2303,6 @@ RCL_Events RCL_Handler_Generic_TxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
         {
             /* Mark as active */
             cmd->status = RCL_CommandStatus_Active;
-            genericHandlerState.common.endStatus = RCL_CommandStatus_Finished;
             genericHandlerState.stream.stopType = RCL_StopType_None;
 
             /* Program the sync word */
@@ -2292,85 +2318,87 @@ RCL_Events RCL_Handler_Generic_TxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
                 cmd->status = RCL_CommandStatus_Error_Param;
                 rclEvents.lastCmdDone = 1U;
             }
-
-            /* One packet per operation, started by the API write itself
-             * rather than by a SysTimer compare, so that the packet leaves a
-             * fixed time after whoever posts it has written the register.
-             * The PLL stays on between operations, and the PBE issues no
-             * FIFO command at the end of a packet: with FCFG0.TXADEAL the
-             * FIFO frees the packet's space as it is modulated, and a FIFO
-             * command from the PBE could land in the same cycle as a data
-             * port push and be lost to it, which is RCL-367 on the transmit
-             * side.
-             *
-             * Every operation runs with the same OPCFG, so a synthesizer
-             * calibration is either in every packet or in none. It is in
-             * none when the synthesizer is already locked (rfFrequency 0,
-             * after an FS command), which is what a stream wants: measured,
-             * the calibration is most of the time from the API write to the
-             * first bit. */
-            uint16_t opcfg = PBE_GENERIC_RAM_OPCFG_SINGLE_EN
-                           | PBE_GENERIC_RAM_OPCFG_START_M
-                           | PBE_GENERIC_RAM_OPCFG_FS_KEEPON_YES
-                           | PBE_GENERIC_RAM_OPCFG_TXFCMD_NONE
-                           | PBE_GENERIC_RAM_OPCFG_NEXTOP_SAME;
-            if (txCmd->rfFrequency != 0U)
-            {
-                opcfg |= PBE_GENERIC_RAM_OPCFG_FS_NOCAL_CAL;
-            }
             else
             {
-                opcfg |= PBE_GENERIC_RAM_OPCFG_FS_NOCAL_NOCAL;
-            }
-            HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_OPCFG) = opcfg;
+                /* One packet per operation, started by the API write itself
+                 * rather than by a SysTimer compare, so that the packet leaves a
+                 * fixed time after whoever posts it has written the register.
+                 * The PLL stays on between operations, and the PBE issues no
+                 * FIFO command at the end of a packet: with FCFG0.TXADEAL the
+                 * FIFO frees the packet's space as it is modulated, and a FIFO
+                 * command from the PBE could land in the same cycle as a data
+                 * port push and be lost to it, which is RCL-367 on the transmit
+                 * side.
+                 *
+                 * Every operation runs with the same OPCFG, so a synthesizer
+                 * calibration is either in every packet or in none. It is in
+                 * none when the synthesizer is already locked (rfFrequency 0,
+                 * after an FS command), which is what a stream wants: measured,
+                 * the calibration is most of the time from the API write to the
+                 * first bit. */
+                uint16_t opcfg = PBE_GENERIC_RAM_OPCFG_SINGLE_EN
+                               | PBE_GENERIC_RAM_OPCFG_START_M
+                               | PBE_GENERIC_RAM_OPCFG_FS_KEEPON_YES
+                               | PBE_GENERIC_RAM_OPCFG_TXFCMD_NONE
+                               | PBE_GENERIC_RAM_OPCFG_NEXTOP_SAME;
+                if (txCmd->rfFrequency != 0U)
+                {
+                    opcfg |= PBE_GENERIC_RAM_OPCFG_FS_NOCAL_CAL;
+                }
+                else
+                {
+                    opcfg |= PBE_GENERIC_RAM_OPCFG_FS_NOCAL_NOCAL;
+                }
+                HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_OPCFG) = opcfg;
 
-            /* Program fixed packet length */
-            HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_MAXLEN) = txCmd->packetLength;
+                /* Program fixed packet length */
+                HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_MAXLEN) = txCmd->packetLength;
 
-            /* Program frequency word */
-            if (txCmd->rfFrequency != 0U)
-            {
-                LRF_programFrequency(txCmd->rfFrequency, true);
-            }
+                /* Program frequency word */
+                if (txCmd->rfFrequency != 0U)
+                {
+                    LRF_programFrequency(txCmd->rfFrequency, true);
+                }
 
-            /* Enable radio */
-            if (txCmd->config.enableLRF != 0U)
-            {
-                LRF_enable();
-            }
+                /* Enable radio */
+                if (txCmd->config.enableLRF != 0U)
+                {
+                    LRF_enable();
+                }
 
-            /* Reset the FIFO, the one FIFO command of the command's life,
-             * written with the PBE idle. LRF_prepareTxFifo leaves auto
-             * deallocate off because the CPU path retries the FIFO to repeat
-             * a packet; nothing is repeated here, and without it the space of
-             * a sent packet would never come back. */
-            genericHandlerState.common.txFifoSize = (uint16_t) LRF_prepareTxFifo();
-            HWREG_WRITE_LRF(LRFDPBE_BASE + LRFDPBE_O_FCFG0) =
-                HWREG_READ_LRF(LRFDPBE_BASE + LRFDPBE_O_FCFG0) | LRFDPBE_FCFG0_TXADEAL_M;
+                /* Reset the FIFO, the one FIFO command of the command's life,
+                 * written with the PBE idle. LRF_prepareTxFifo leaves auto
+                 * deallocate off because the CPU path retries the FIFO to repeat
+                 * a packet; nothing is repeated here, and without it the space of
+                 * a sent packet would never come back. */
+                genericHandlerState.common.txFifoSize = (uint16_t) LRF_prepareTxFifo();
+                HWREG_WRITE_LRF(LRFDPBE_BASE + LRFDPBE_O_FCFG0) =
+                    HWREG_READ_LRF(LRFDPBE_BASE + LRFDPBE_O_FCFG0) | LRFDPBE_FCFG0_TXADEAL_M;
 
-            /* Reset the transmitted-packet counter, reported through %stats.
-             * The PBE does not clear it between operations. NTXTARGET is
-             * zeroed as well: this PBE image ends an operation when the count
-             * reaches it, the word lies outside the settings image, and a
-             * stream is not to end on a count. */
-            LRF_Interface_Generic_setNumOfTxPackets(0U);
-            HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NTXTARGET) = 0U;
+                /* Reset the transmitted-packet counter, reported through %stats.
+                 * The PBE does not clear it between operations. NTXTARGET is
+                 * zeroed as well: this PBE image ends an operation when the count
+                 * reaches it, the word lies outside the settings image, and a
+                 * stream is not to end on a count. */
+                LRF_Interface_Generic_setNumOfTxPackets(0U);
+                HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NTXTARGET) = 0U;
 
-            RCL_CommandStatus startTimeStatus = RCL_Scheduler_setStartStopTimeEarliestStart(cmd, earliestStartTime);
-            if (startTimeStatus >= RCL_CommandStatus_Finished)
-            {
-                cmd->status = startTimeStatus;
-                rclEvents.lastCmdDone = 1U;
-            }
-            else
-            {
-                /* An operation ends with every packet; only an error is of
-                 * interest. Nothing is posted here: the application posts
-                 * every operation. */
-                LRF_enableHwInterrupt(LRF_EventOpError.value);
-                Log_printf(LogModule_RCL, Log_INFO, "RCL_Handler_Generic_TxStream: Radio up (%u Hz)", txCmd->rfFrequency);
-                LRF_waitForTopsmReady();
-                RCL_Profiling_eventHook(RCL_ProfilingEvent_PreprocStop);
+                RCL_CommandStatus startTimeStatus = RCL_Scheduler_setStartStopTimeEarliestStart(cmd, earliestStartTime);
+                if (startTimeStatus >= RCL_CommandStatus_Finished)
+                {
+                    cmd->status = startTimeStatus;
+                    rclEvents.lastCmdDone = 1U;
+                }
+                else
+                {
+                    /* An operation ends with every packet; only an error is of
+                     * interest. Nothing is posted here: the application posts
+                     * every operation. */
+                    LRF_enableHwInterrupt(LRF_EventOpError.value);
+                    Log_printf(LogModule_RCL, Log_INFO, "RCL_Handler_Generic_TxStream: Radio up (%u Hz)", txCmd->rfFrequency);
+                    LRF_waitForTopsmReady();
+                    RCL_Profiling_eventHook(RCL_ProfilingEvent_PreprocStop);
+                }
             }
         }
     }
@@ -2386,6 +2414,7 @@ RCL_Events RCL_Handler_Generic_TxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
              * end with ERR_STOP unless it is cleared here. This is why an
              * operation may only be posted once the command has started. */
             HWREGH_WRITE_LRF(LRFDPBE_BASE + LRFDPBE_O_EVTCLR0) = LRFDPBE_EVTCLR0_SYSTCMP0_M;
+            rclGenericStreamEnableStopTimeIrqs();
             rclEvents.cmdStarted = 1U;
         }
 
@@ -2462,7 +2491,6 @@ RCL_Events RCL_Handler_Generic_RxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
         {
             /* Mark as active */
             cmd->status = RCL_CommandStatus_Active;
-            genericHandlerState.common.endStatus = RCL_CommandStatus_Finished;
             genericHandlerState.stream.stopType = RCL_StopType_None;
 
             /* Program the sync word */
@@ -2474,22 +2502,28 @@ RCL_Events RCL_Handler_Generic_RxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
              * by this, so the PBE issues no TX FIFO command at the end of a
              * packet.
              *
-             * The operation always turns the synthesizer off when it ends,
-             * whatever config.fsOff says about the power state afterwards.
-             * There is only one operation, so nothing is kept on for; and a
-             * stop in sync search relies on it: the PBE's end routine waits
-             * for the RFE to report, the RFE reports its RX command only
-             * once told to stop, and it is told to stop only when the
-             * synthesizer is not kept on. With it kept on, a stop that lands
-             * in sync search leaves the PBE waiting forever; measured. */
+             * The operation always turns the synthesizer off when it ends;
+             * config.fsOff only decides below whether refsys and the power
+             * constraints are kept for a following command. There is only
+             * one operation, so nothing is kept on for; and a stop in sync
+             * search relies on it: the PBE's end routine waits for the RFE
+             * to report, the RFE reports its RX command only once told to
+             * stop, and it is told to stop only when the synthesizer is not
+             * kept on. With it kept on, a stop that lands in sync search
+             * leaves the PBE waiting forever; measured. */
             LRF_Interface_Generic_configOpRx(1U, rxCmd->rfFrequency, 1U, rxCmd->packetLength);
             HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_SEQSTAT0) = PBE_GENERIC_RAM_SEQSTAT0_STOPAUTO_NEVER;
 
             /* Nothing is appended to an entry. The RF settings append status,
              * RSSI and timestamp bytes; with them off an entry is the length
              * field, the pad and the payload, which is what the application
-             * arms one transfer for. */
+             * arms one transfer for. The settings' values are kept and put
+             * back when the command ends: they are only reloaded when the
+             * radio is set up again, and the next RX command on the same
+             * configuration counts on them. */
             uint16_t fifoCfg = (uint16_t) HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_FIFOCFG);
+            genericHandlerState.stream.fifoCfg = fifoCfg;
+            genericHandlerState.stream.extraBytes = (uint16_t) HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_EXTRABYTES);
             fifoCfg &= (uint16_t) ~(PBE_GENERIC_RAM_FIFOCFG_APPENDCRC_M |
                                     PBE_GENERIC_RAM_FIFOCFG_APPENDSTATUS_M |
                                     PBE_GENERIC_RAM_FIFOCFG_APPENDLQI_M |
@@ -2576,6 +2610,7 @@ RCL_Events RCL_Handler_Generic_RxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
     {
         if (rclEventsIn.timerStart != 0U)
         {
+            rclGenericStreamEnableStopTimeIrqs();
             rclEvents.cmdStarted = 1U;
         }
 
@@ -2602,6 +2637,11 @@ RCL_Events RCL_Handler_Generic_RxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
          * asserted with nothing to serve. The channel is the
          * application's and is left alone. */
         RCL_Dma_disableTrigger();
+
+        /* The entry envelope as the settings define it, for the commands
+         * that follow */
+        HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_FIFOCFG) = genericHandlerState.stream.fifoCfg;
+        HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_EXTRABYTES) = genericHandlerState.stream.extraBytes;
 
         if (rxCmd->stats != NULL)
         {
