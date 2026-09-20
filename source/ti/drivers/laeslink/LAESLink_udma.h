@@ -58,14 +58,12 @@
 extern "C" {
 #endif
 
-/* Address increment per item */
-#define LAESLINK_INC_BYTE   (0U)
+/* Address increment per item (byte increment, 0, is not used) */
 #define LAESLINK_INC_HALF   (1U)
 #define LAESLINK_INC_WORD   (2U)
 #define LAESLINK_INC_NONE   (3U)
 
 /* Item size. Source and destination size are always equal on the PL230 */
-#define LAESLINK_SIZE_BYTE  (0U)
 #define LAESLINK_SIZE_HALF  (1U)
 #define LAESLINK_SIZE_WORD  (2U)
 
@@ -193,6 +191,28 @@ static inline LAESLink_Task LAESLink_sgPrimary(uint32_t lastTaskSpare, uint32_t 
 static inline uint32_t LAESLink_taskSpareAddr(const volatile LAESLink_Task *t)
 {
     return (uint32_t)&t->spare;
+}
+
+/* A task as a four-word image in DMA-visible memory, the form a list copies
+ * into a control table entry, and back.
+ */
+static inline void LAESLink_setImage(volatile uint32_t *dst, LAESLink_Task t)
+{
+    dst[0] = t.srcEnd;
+    dst[1] = t.dstEnd;
+    dst[2] = t.control;
+    dst[3] = t.spare;
+}
+
+static inline LAESLink_Task LAESLink_imageTask(const volatile uint32_t *src)
+{
+    LAESLink_Task t;
+
+    t.srcEnd  = src[0];
+    t.dstEnd  = src[1];
+    t.control = src[2];
+    t.spare   = src[3];
+    return t;
 }
 
 /* Program a control table entry from a task image. The control word goes

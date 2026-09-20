@@ -53,6 +53,7 @@
 #include DeviceFamily_constructPath(driverlib/udma.h)
 
 #include <ti/drivers/laeslink/LAESLink.h>
+#include <ti/drivers/laeslink/LAESLink_ccm.h>
 #include <ti/drivers/laeslink/LAESLink_udma.h>
 
 #ifdef __cplusplus
@@ -130,7 +131,6 @@ _Static_assert(LAESLINK_CFG_MAC == 0x03000034U, "CFG_MAC");
 #define LAESLINK_RXO_WORDS      (8U)
 
 /* Layout of one received FIFO entry (7 words) */
-#define LAESLINK_RXI_LEN        (0U)
 #define LAESLINK_RXI_HDR        (1U)
 #define LAESLINK_RXI_CT         (2U)
 #define LAESLINK_RXI_MIC        (6U)
@@ -198,6 +198,18 @@ LAESLink_Task LAESLink_halfwords(uint32_t src, uint32_t dst);   /* Two halfwords
 static inline uint32_t LAESLink_addr(const volatile uint32_t *w)
 {
     return (uint32_t)w;
+}
+
+/* Write a 16-byte block into four DMA-visible words */
+static inline void LAESLink_setBlock(volatile uint32_t *dst, const uint8_t block[16])
+{
+    uint32_t w[4];
+
+    LAESLink_blockToWords(block, w);
+    for (uint32_t i = 0U; i < 4U; i++)
+    {
+        dst[i] = w[i];
+    }
 }
 
 /* Build the transmit list for slot. Returns the number of entries. */

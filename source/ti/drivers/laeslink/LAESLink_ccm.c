@@ -66,16 +66,6 @@ void LAESLink_ccmSetCounter(LAESLink_CcmBlocks *blocks, uint32_t counter)
 }
 
 /*
- *  ======== LAESLink_ccmCounter ========
- */
-uint32_t LAESLink_ccmCounter(const LAESLink_CcmBlocks *blocks)
-{
-    const uint8_t *h = &blocks->a0[LAESLINK_CCM_COUNTER_WORD * 4U];
-
-    return ((uint32_t)h[0] << 24) | ((uint32_t)h[1] << 16) | ((uint32_t)h[2] << 8) | (uint32_t)h[3];
-}
-
-/*
  *  ======== LAESLink_ccmBlocks ========
  */
 void LAESLink_ccmBlocks(LAESLink_CcmBlocks *blocks, const uint8_t sid[3], const uint8_t tail[6], uint32_t counter)
@@ -97,7 +87,6 @@ void LAESLink_ccmBlocks(LAESLink_CcmBlocks *blocks, const uint8_t sid[3], const 
     blocks->a1[15] = 1U;
 
     memset(blocks->b1, 0, sizeof(blocks->b1));
-    blocks->b1[0] = 0U;
     blocks->b1[1] = LAESLINK_AAD_LEN;
 
     LAESLink_ccmSetCounter(blocks, counter);
@@ -112,19 +101,5 @@ void LAESLink_blockToWords(const uint8_t block[16], uint32_t words[4])
     {
         words[i] = (uint32_t)block[4U * i] | ((uint32_t)block[4U * i + 1U] << 8) |
                    ((uint32_t)block[4U * i + 2U] << 16) | ((uint32_t)block[4U * i + 3U] << 24);
-    }
-}
-
-/*
- *  ======== LAESLink_wordsToBlock ========
- */
-void LAESLink_wordsToBlock(const uint32_t words[4], uint8_t block[16])
-{
-    for (uint32_t i = 0U; i < 4U; i++)
-    {
-        block[4U * i]      = (uint8_t)words[i];
-        block[4U * i + 1U] = (uint8_t)(words[i] >> 8);
-        block[4U * i + 2U] = (uint8_t)(words[i] >> 16);
-        block[4U * i + 3U] = (uint8_t)(words[i] >> 24);
     }
 }

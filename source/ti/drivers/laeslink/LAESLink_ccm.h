@@ -86,17 +86,11 @@ void LAESLink_ccmBlocks(LAESLink_CcmBlocks *blocks, const uint8_t sid[3], const 
 /* Store counter into every block */
 void LAESLink_ccmSetCounter(LAESLink_CcmBlocks *blocks, uint32_t counter);
 
-/* The counter stored in the blocks */
-uint32_t LAESLink_ccmCounter(const LAESLink_CcmBlocks *blocks);
-
 /* The on-air header for counter: the counter, big endian */
 void LAESLink_ccmHeader(uint32_t counter, uint8_t header[LAESLINK_AAD_LEN]);
 
-/* A 16-byte block as the four little-endian words the LAES data registers
- * take, and back.
- */
+/* A 16-byte block as the four little-endian words the LAES data registers take */
 void LAESLink_blockToWords(const uint8_t block[16], uint32_t words[4]);
-void LAESLink_wordsToBlock(const uint32_t words[4], uint8_t block[16]);
 
 #ifdef __cplusplus
 }

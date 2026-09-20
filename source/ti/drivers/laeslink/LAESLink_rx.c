@@ -50,7 +50,10 @@
 
 /* The radio drain moves one committed entry per request through the PBE's
  * halfword read port: 28 bytes is 14 halfwords, and ARB_16 covers the entry
- * in one arbitration, which a pulse trigger needs.
+ * in one arbitration, which a pulse trigger needs. The port is
+ * LRFDPBE.RXFHRD and not the LRFDRXF alias region the Rust link read: the
+ * alias region carries the RCL-367 defect (a pop landing in the cycle after
+ * a FIFO command is lost), see the RX stream comment in RCL_Dma.c.
  */
 #define DRAIN_HALFWORDS (LAESLINK_FIFO_WORDS * 2U)
 
@@ -65,49 +68,10 @@ static struct
     LAESLink_RxCallback onPacket;
     uint32_t consumeSlot;  /* Next slot the doorbell consumes */
     uint32_t injectSlot;   /* Next slot an injection fills */
-    bool pending;          /* An injected packet has not reached its doorbell yet */
+    volatile bool pending; /* Set by an injection, cleared by the doorbell interrupt */
     bool haveAccepted;
     uint32_t lastAccepted;
 } rx;
-
-/*
- *  ======== setBlock ========
- */
-static void setBlock(volatile uint32_t *dst, const uint8_t block[16])
-{
-    uint32_t w[4];
-
-    LAESLink_blockToWords(block, w);
-    for (uint32_t i = 0U; i < 4U; i++)
-    {
-        dst[i] = w[i];
-    }
-}
-
-/*
- *  ======== setImage ========
- */
-static void setImage(volatile uint32_t *dst, LAESLink_Task t)
-{
-    dst[0] = t.srcEnd;
-    dst[1] = t.dstEnd;
-    dst[2] = t.control;
-    dst[3] = t.spare;
-}
-
-/*
- *  ======== imageTask ========
- */
-static LAESLink_Task imageTask(const volatile uint32_t *src)
-{
-    LAESLink_Task t;
-
-    t.srcEnd  = src[0];
-    t.dstEnd  = src[1];
-    t.control = src[2];
-    t.spare   = src[3];
-    return t;
-}
 
 /*
  *  ======== LAESLink_rxOpen ========
@@ -139,10 +103,10 @@ int_fast16_t LAESLink_rxOpen(const LAESLink_Config *cfg,
 
     /* Images: the counter word is replaced from the header before every packet */
     LAESLink_ccmBlocks(&blocks, cfg->sid, cfg->tail, 0U);
-    setBlock(rxState.b0, blocks.b0);
-    setBlock(rxState.b1, blocks.b1);
-    setBlock(rxState.a0, blocks.a0);
-    setBlock(rxState.a1, blocks.a1);
+    LAESLink_setBlock(rxState.b0, blocks.b0);
+    LAESLink_setBlock(rxState.b1, blocks.b1);
+    LAESLink_setBlock(rxState.a0, blocks.a0);
+    LAESLink_setBlock(rxState.a1, blocks.a1);
     rxState.s0[0] = 0U;
 
     c[LAESLINK_RXC_CFG_S]    = LAESLINK_CFG_S1;
@@ -155,7 +119,7 @@ int_fast16_t LAESLink_rxOpen(const LAESLink_Config *cfg,
     /* Channel 2 images: one basic drain of a whole entry per slot */
     for (uint32_t slot = 0U; slot < LAESLINK_SLOTS; slot++)
     {
-        setImage(&rxState.prim2[4U * slot],
+        LAESLink_setImage(&rxState.prim2[4U * slot],
                  LAESLink_transfer(LRFDPBE_BASE + LRFDPBE_O_RXFHRD, LAESLink_addr(&rxState.rx[slot * LAESLINK_FIFO_WORDS]),
                                    DRAIN_HALFWORDS, LAESLINK_SIZE_HALF, LAESLINK_INC_NONE, LAESLINK_INC_HALF,
                                    LAESLINK_ARB_X16, LAESLINK_MODE_BASIC));
@@ -164,18 +128,18 @@ int_fast16_t LAESLink_rxOpen(const LAESLink_Config *cfg,
     for (uint32_t slot = 0U; slot < LAESLINK_SLOTS; slot++)
     {
         n = LAESLink_buildRx(&rxState, slot, radio);
-        setImage(&rxState.prim[4U * slot],
+        LAESLink_setImage(&rxState.prim[4U * slot],
                  LAESLink_sgPrimary(LAESLink_taskSpareAddr(&rxState.lists[slot][n - 1U]),
                                     LAESLink_entrySpareAddr(LAESLink_alternate(9U)), n, true));
     }
     /* The relay marks "entry in RAM" on the stage pin and kicks the list */
     n = LAESLink_buildRelay(rxState.relay, LAESLINK_RELAY_TASKS, LAESLink_addr(&c[LAESLINK_RXC_KICK9]),
                             LAESLink_addr(&c[LAESLINK_RXC_GPIO]));
-    setImage(rxState.relayPrim,
+    LAESLink_setImage(rxState.relayPrim,
              LAESLink_sgPrimary(LAESLink_taskSpareAddr(&rxState.relay[n - 1U]),
                                 LAESLink_entrySpareAddr(LAESLink_alternate(10U)), n, true));
 
-    LAESLink_writeEntry(LAESLink_primary(9U), imageTask(rxState.prim));
+    LAESLink_writeEntry(LAESLink_primary(9U), LAESLink_imageTask(rxState.prim));
     LAESLink_clearEntry(LAESLink_alternate(9U));
     EVTSVTConfigureDma(EVTSVT_DMA_CH9, EVTSVT_PUB_AES_COMB);
     enable = LAESLINK_CH9;
@@ -187,8 +151,8 @@ int_fast16_t LAESLink_rxOpen(const LAESLink_Config *cfg,
          * relay listens to its completion on DMA_DONE_COMB, which the done
          * mask publishes.
          */
-        LAESLink_writeEntry(LAESLink_primary(2U), imageTask(rxState.prim2));
-        LAESLink_writeEntry(LAESLink_primary(10U), imageTask(rxState.relayPrim));
+        LAESLink_writeEntry(LAESLink_primary(2U), LAESLink_imageTask(rxState.prim2));
+        LAESLink_writeEntry(LAESLink_primary(10U), LAESLink_imageTask(rxState.relayPrim));
         LAESLink_clearEntry(LAESLink_alternate(10U));
         EVTSVTConfigureDma(EVTSVT_DMA_CH2, EVTSVT_DMA_TRIG_LRFDTRG);
         EVTSVTConfigureDma(EVTSVT_DMA_CH10, EVTSVT_PUB_DMA_DONE_COMB);

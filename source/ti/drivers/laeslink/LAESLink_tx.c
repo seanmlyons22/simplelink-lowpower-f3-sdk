@@ -63,45 +63,6 @@ static struct
 #define STOP_POLL_LIMIT (20000U)
 
 /*
- *  ======== setBlock ========
- */
-static void setBlock(volatile uint32_t *dst, const uint8_t block[16])
-{
-    uint32_t w[4];
-
-    LAESLink_blockToWords(block, w);
-    for (uint32_t i = 0U; i < 4U; i++)
-    {
-        dst[i] = w[i];
-    }
-}
-
-/*
- *  ======== setImage ========
- */
-static void setImage(volatile uint32_t *dst, LAESLink_Task t)
-{
-    dst[0] = t.srcEnd;
-    dst[1] = t.dstEnd;
-    dst[2] = t.control;
-    dst[3] = t.spare;
-}
-
-/*
- *  ======== imageTask ========
- */
-static LAESLink_Task imageTask(const volatile uint32_t *src)
-{
-    LAESLink_Task t;
-
-    t.srcEnd  = src[0];
-    t.dstEnd  = src[1];
-    t.control = src[2];
-    t.spare   = src[3];
-    return t;
-}
-
-/*
  *  ======== completedCounter ========
  *  A1 is updated only after the ciphertext and MIC reach the sink, so that
  *  DMA write doubles as the completion signal.
@@ -138,10 +99,10 @@ int_fast16_t LAESLink_txOpen(const LAESLink_Config *cfg, const uint8_t key[LAESL
 
     /* CCM images for the first packet */
     LAESLink_ccmBlocks(&blocks, cfg->sid, cfg->tail, cfg->initialCounter);
-    setBlock(txState.b0, blocks.b0);
-    setBlock(txState.b1, blocks.b1);
-    setBlock(txState.a0, blocks.a0);
-    setBlock(txState.a1, blocks.a1);
+    LAESLink_setBlock(txState.b0, blocks.b0);
+    LAESLink_setBlock(txState.b1, blocks.b1);
+    LAESLink_setBlock(txState.a0, blocks.a0);
+    LAESLink_setBlock(txState.a1, blocks.a1);
     txState.s0[0] = 0U;
 
     /* Constants read by the task lists */
@@ -157,20 +118,20 @@ int_fast16_t LAESLink_txOpen(const LAESLink_Config *cfg, const uint8_t key[LAESL
     for (uint32_t slot = 0U; slot < LAESLINK_SLOTS; slot++)
     {
         n = LAESLink_buildTx(&txState, slot, sink);
-        setImage(&txState.prim[4U * slot],
+        LAESLink_setImage(&txState.prim[4U * slot],
                  LAESLink_sgPrimary(LAESLink_taskSpareAddr(&txState.lists[slot][n - 1U]),
                                     LAESLink_entrySpareAddr(LAESLink_alternate(8U)), n, true));
         tx.tasks = n;
     }
     n = LAESLink_buildRelay(txState.relay, LAESLINK_RELAY_TASKS, LAESLink_addr(&c[LAESLINK_TXC_KICK8]), 0U);
-    setImage(txState.relayPrim,
+    LAESLink_setImage(txState.relayPrim,
              LAESLink_sgPrimary(LAESLink_taskSpareAddr(&txState.relay[n - 1U]),
                                 LAESLink_entrySpareAddr(LAESLink_alternate(9U)), n, true));
 
     /* Control table: slot 0 list on channel 8, relay on channel 9 */
-    LAESLink_writeEntry(LAESLink_primary(8U), imageTask(txState.prim));
+    LAESLink_writeEntry(LAESLink_primary(8U), LAESLink_imageTask(txState.prim));
     LAESLink_clearEntry(LAESLink_alternate(8U));
-    LAESLink_writeEntry(LAESLink_primary(9U), imageTask(txState.relayPrim));
+    LAESLink_writeEntry(LAESLink_primary(9U), LAESLink_imageTask(txState.relayPrim));
     LAESLink_clearEntry(LAESLink_alternate(9U));
 
     /* Event routing: the AESDONE edge paces the list, and a completion
@@ -229,7 +190,7 @@ bool LAESLink_txPacketInFlight(void)
  */
 void LAESLink_txWritePayload(uint32_t slot, const uint8_t payload[LAESLINK_PAYLOAD_LEN])
 {
-    setBlock(&txState.slots[4U * (slot % LAESLINK_SLOTS)], payload);
+    LAESLink_setBlock(&txState.slots[4U * (slot % LAESLINK_SLOTS)], payload);
 }
 
 /*
