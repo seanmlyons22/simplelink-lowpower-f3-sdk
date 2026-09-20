@@ -258,7 +258,10 @@ void RCL_Hal_enableGracefulStopTimeIrq(void)
 
 static void RCL_Hal_cancelLrfdSystim0(void)
 {
-    HWREG(SYSTIM_BASE + SYSTIM_O_CH2CC) = 0;
+    /* Disarm rather than write a compare value; see RCL_Hal_cancelGracefulStopTime.
+       The same immediate-compare rule applies to CH2, where the event lands in
+       LRFDPBE.EVT0.SYSTCMP0 and ends the operation with ERR_STOP. */
+    HWREG(SYSTIM_BASE + SYSTIM_O_ARMCLR) = SYSTIM_ARMCLR_CH2_CLR;
 #if (DeviceFamily_PARENT == DeviceFamily_PARENT_CC23X1)
     HWREG(SYSTIM_BASE + SYSTIM_O_CH2CFG) = SYSTIM_CH2CFG_MODE_CPT;
 #else
@@ -290,7 +293,13 @@ void RCL_Hal_cancelHardStopTime(void)
 
 void RCL_Hal_cancelGracefulStopTime(void)
 {
-    HWREG(SYSTIM_BASE + SYSTIM_O_CH3CC) = 0;
+    /* Disarm the channel rather than writing a compare value. Writing CH3CC
+       puts the channel back into compare mode, and SYSTIM fires a compare
+       immediately for any value less than 2^22 ticks in the past, so writing 0
+       raises the event for the first 2^22 ticks (1.048 s) after the SysTimer
+       starts from the RTC. That event reaches LRFDPBE.EVT0.SYSTCMP1, which the
+       PBE tests at every end of packet, and nothing clears it. */
+    HWREG(SYSTIM_BASE + SYSTIM_O_ARMCLR) = SYSTIM_ARMCLR_CH3_CLR;
 #if (DeviceFamily_PARENT == DeviceFamily_PARENT_CC23X1)
     HWREG(SYSTIM_BASE + SYSTIM_O_CH3CFG) = SYSTIM_CH3CFG_MODE_CPT;
 #else
