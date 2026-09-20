@@ -646,14 +646,26 @@ struct RCL_STATS_GENERIC_RX_BURST_t {
  *  off the transmit path: the defect needs a FIFO command and a data port
  *  access in consecutive cycles, and there is no FIFO command.
  *
- *  Post the first operation only after the command has started
- *  (%RCL_EventCmdStarted): the PBE takes the command's start time compare as
- *  the hard stop of an operation that is already running. Post the next only
- *  once the previous operation has ended: the PBE rejects an operation
- *  written while one is running as a bad operation, which ends the command.
- *  With %rfFrequency set every operation calibrates the synthesizer first;
- *  run an FS command before this one and leave %rfFrequency 0 for the
- *  operations to skip it.
+ *  With %rfFrequency set the command programs the frequency and runs one
+ *  synthesizer calibration of its own at setup, on the command's start time,
+ *  and only reports %RCL_EventCmdStarted once it has locked; the packet
+ *  operations then run without calibration on a synthesizer the same TOPSM
+ *  state locked, about 9 us from the API write to the first bit. Post the
+ *  first operation only after that event: before it the PBE is calibrating,
+ *  or holds the command's start compare, which it takes as the hard stop of
+ *  a running operation. Post the next only once the previous operation has
+ *  ended: the PBE rejects an operation written while one is running as a bad
+ *  operation, which ends the command.
+ *
+ *  With %rfFrequency 0 the command trusts the synthesizer to be locked, as
+ *  after an FS command, and calibrates nothing. That path is not
+ *  recommended: the FS command ends with FS_KEEPON off and powers the LRF
+ *  down, this command powers it up again and re-initialises the RFE, and
+ *  what the RFE then transmits with rests on calibration state the
+ *  re-initialisation did not redo, while the lock flag the check reads is
+ *  RFE firmware state that survives it. Measured: one CC2755P20 transmitted
+ *  correctly this way and another transmitted nothing a receiver could sync
+ *  to, with the same code and the lock flag set on both.
  *
  *  The command stays active until it is stopped, through the API or by a
  *  stop time, or the PBE reports an operation error. A graceful stop lets an

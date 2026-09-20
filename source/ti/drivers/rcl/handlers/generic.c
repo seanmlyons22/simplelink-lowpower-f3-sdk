@@ -111,6 +111,7 @@ struct
         } nesb;
         struct {
             RCL_StopType        stopType;
+            bool                calibrating;    /* TX: the synthesizer calibration operation is in flight */
             uint16_t            fifoCfg;        /* RX: FIFOCFG as the settings left it, restored at the end */
             uint16_t            extraBytes;     /* RX: EXTRABYTES likewise */
         } stream;
@@ -2273,6 +2274,30 @@ static RCL_CommandStatus rclGenericStreamEndStatus(LRF_Events lrfEvents)
 }
 
 /*
+ *  ======== rclGenericTxStreamConfigOp ========
+ *
+ *  The OPCFG every packet operation of a TX stream runs with: one packet per
+ *  operation, started by the API write itself rather than by a SysTimer
+ *  compare, so that the packet leaves a fixed time after whoever posts it
+ *  has written the register; the synthesizer already locked and kept on
+ *  between operations; and no FIFO command from the PBE at the end of a
+ *  packet, since with FCFG0.TXADEAL the FIFO frees the packet's space as it
+ *  is modulated, and a FIFO command from the PBE could land in the same cycle
+ *  as a data port push and be lost to it, which is RCL-367 on the transmit
+ *  side.
+ */
+static void rclGenericTxStreamConfigOp(void)
+{
+    HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_OPCFG) =
+        PBE_GENERIC_RAM_OPCFG_SINGLE_EN
+        | PBE_GENERIC_RAM_OPCFG_START_M
+        | PBE_GENERIC_RAM_OPCFG_FS_NOCAL_NOCAL
+        | PBE_GENERIC_RAM_OPCFG_FS_KEEPON_YES
+        | PBE_GENERIC_RAM_OPCFG_TXFCMD_NONE
+        | PBE_GENERIC_RAM_OPCFG_NEXTOP_SAME;
+}
+
+/*
  *  ======== RCL_Handler_Generic_TxStream ========
  *
  *  The handler configures the radio and the FIFO and then does nothing per
@@ -2320,36 +2345,25 @@ RCL_Events RCL_Handler_Generic_TxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
             }
             else
             {
-                /* One packet per operation, started by the API write itself
-                 * rather than by a SysTimer compare, so that the packet leaves a
-                 * fixed time after whoever posts it has written the register.
-                 * The PLL stays on between operations, and the PBE issues no
-                 * FIFO command at the end of a packet: with FCFG0.TXADEAL the
-                 * FIFO frees the packet's space as it is modulated, and a FIFO
-                 * command from the PBE could land in the same cycle as a data
-                 * port push and be lost to it, which is RCL-367 on the transmit
-                 * side.
-                 *
-                 * Every operation runs with the same OPCFG, so a synthesizer
-                 * calibration is either in every packet or in none. It is in
-                 * none when the synthesizer is already locked (rfFrequency 0,
-                 * after an FS command), which is what a stream wants: measured,
-                 * the calibration is most of the time from the API write to the
-                 * first bit. */
-                uint16_t opcfg = PBE_GENERIC_RAM_OPCFG_SINGLE_EN
-                               | PBE_GENERIC_RAM_OPCFG_START_M
-                               | PBE_GENERIC_RAM_OPCFG_FS_KEEPON_YES
-                               | PBE_GENERIC_RAM_OPCFG_TXFCMD_NONE
-                               | PBE_GENERIC_RAM_OPCFG_NEXTOP_SAME;
-                if (txCmd->rfFrequency != 0U)
+                /* Every packet operation runs with the same OPCFG, so a
+                 * synthesizer calibration would be in every packet or in
+                 * none; measured, it is most of the time from the API write
+                 * to the first bit, so it is in none. With a frequency to
+                 * program, the calibration is one FS operation of this
+                 * command's own, posted below and run by the same TOPSM
+                 * state the packets will use, and the packet OPCFG is only
+                 * written once it has locked. Without one the synthesizer
+                 * has to be locked already, see the command's description. */
+                genericHandlerState.stream.calibrating = (txCmd->rfFrequency != 0U);
+                if (genericHandlerState.stream.calibrating)
                 {
-                    opcfg |= PBE_GENERIC_RAM_OPCFG_FS_NOCAL_CAL;
+                    HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_OPCFG) =
+                        PBE_GENERIC_RAM_OPCFG_FS_NOCAL_CAL | PBE_GENERIC_RAM_OPCFG_FS_KEEPON_YES;
                 }
                 else
                 {
-                    opcfg |= PBE_GENERIC_RAM_OPCFG_FS_NOCAL_NOCAL;
+                    rclGenericTxStreamConfigOp();
                 }
-                HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_OPCFG) = opcfg;
 
                 /* Program fixed packet length */
                 HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_MAXLEN) = txCmd->packetLength;
@@ -2392,12 +2406,23 @@ RCL_Events RCL_Handler_Generic_TxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
                 else
                 {
                     /* An operation ends with every packet; only an error is of
-                     * interest. Nothing is posted here: the application posts
-                     * every operation. */
-                    LRF_enableHwInterrupt(LRF_EventOpError.value);
+                     * interest. Nothing is posted here for the packets: the
+                     * application posts every operation. The calibration is
+                     * the one operation this command posts, started on the
+                     * command's start time as any operation is, and its end
+                     * is waited for. */
                     Log_printf(LogModule_RCL, Log_INFO, "RCL_Handler_Generic_TxStream: Radio up (%u Hz)", txCmd->rfFrequency);
                     LRF_waitForTopsmReady();
                     RCL_Profiling_eventHook(RCL_ProfilingEvent_PreprocStop);
+                    if (genericHandlerState.stream.calibrating)
+                    {
+                        LRF_enableHwInterrupt(LRF_EventOpDone.value | LRF_EventOpError.value);
+                        LRF_Interface_Generic_sendOpFs();
+                    }
+                    else
+                    {
+                        LRF_enableHwInterrupt(LRF_EventOpError.value);
+                    }
                 }
             }
         }
@@ -2405,14 +2430,16 @@ RCL_Events RCL_Handler_Generic_TxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
 
     if (cmd->status == RCL_CommandStatus_Active)
     {
-        if (rclEventsIn.timerStart != 0U)
+        if ((rclEventsIn.timerStart != 0U) && !genericHandlerState.stream.calibrating)
         {
             /* The start time has passed and no operation was waiting for
              * it, so the compare event is still latched in the PBE. An
              * operation tests that event as its hard stop, and one started
              * asynchronously does not consume it, so the first packet would
              * end with ERR_STOP unless it is cleared here. This is why an
-             * operation may only be posted once the command has started. */
+             * operation may only be posted once the command has started.
+             * A calibration in flight has consumed the compare itself, and
+             * the command starts when it has locked. */
             HWREGH_WRITE_LRF(LRFDPBE_BASE + LRFDPBE_O_EVTCLR0) = LRFDPBE_EVTCLR0_SYSTCMP0_M;
             rclGenericStreamEnableStopTimeIrqs();
             rclEvents.cmdStarted = 1U;
@@ -2420,9 +2447,25 @@ RCL_Events RCL_Handler_Generic_TxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
 
         if ((lrfEvents.opDone != 0U) || (lrfEvents.opError != 0U))
         {
-            cmd->status = rclGenericStreamEndStatus(lrfEvents);
-            rclEvents.lastCmdDone = 1U;
-            RCL_Profiling_eventHook(RCL_ProfilingEvent_PostprocStart);
+            if (genericHandlerState.stream.calibrating && (lrfEvents.opError == 0U) &&
+                (genericHandlerState.stream.stopType == RCL_StopType_None))
+            {
+                /* Locked. From here the operations are the application's:
+                 * the packet OPCFG goes in, the operation done goes back
+                 * under its mask, and the command counts as started. */
+                genericHandlerState.stream.calibrating = false;
+                rclGenericTxStreamConfigOp();
+                LRF_disableHwInterrupt(LRF_EventOpDone.value);
+                LRF_clearHwInterrupt(LRF_EventOpDone.value);
+                rclGenericStreamEnableStopTimeIrqs();
+                rclEvents.cmdStarted = 1U;
+            }
+            else
+            {
+                cmd->status = rclGenericStreamEndStatus(lrfEvents);
+                rclEvents.lastCmdDone = 1U;
+                RCL_Profiling_eventHook(RCL_ProfilingEvent_PostprocStart);
+            }
         }
         else if ((rclEventsIn.gracefulStop != 0U) || (rclEventsIn.hardStop != 0U))
         {
