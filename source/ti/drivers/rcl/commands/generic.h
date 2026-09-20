@@ -45,10 +45,14 @@ typedef struct RCL_CMD_GENERIC_FS_t            RCL_CmdGenericFs;
 typedef struct RCL_CMD_GENERIC_FS_OFF_t        RCL_CmdGenericFsOff;
 typedef struct RCL_CMD_GENERIC_TX_t            RCL_CmdGenericTx;
 typedef struct RCL_CMD_GENERIC_TX_REPEAT_t     RCL_CmdGenericTxRepeat;
+typedef struct RCL_CMD_GENERIC_TX_BURST_t      RCL_CmdGenericTxBurst;
+typedef struct RCL_CMD_GENERIC_RX_BURST_t      RCL_CmdGenericRxBurst;
 typedef struct RCL_CMD_GENERIC_TX_TEST_t       RCL_CmdGenericTxTest;
 typedef struct RCL_CMD_GENERIC_RX_t            RCL_CmdGenericRx;
 typedef struct RCL_CMD_GENERIC_LRF_OPERATION_t RCL_CmdGenericLrfOperation;
 typedef struct RCL_STATS_GENERIC_t             RCL_StatsGeneric;
+typedef struct RCL_STATS_GENERIC_TX_BURST_t    RCL_StatsGenericTxBurst;
+typedef struct RCL_STATS_GENERIC_RX_BURST_t    RCL_StatsGenericRxBurst;
 typedef struct RCL_CMD_NESB_PTX_t              RCL_CmdNesbPtx;
 typedef struct RCL_CMD_NESB_PRX_t              RCL_CmdNesbPrx;
 typedef struct RCL_STATS_NESB_t                RCL_StatsNesb;
@@ -64,6 +68,8 @@ typedef struct RCL_CONFIG_ADDRESS_t            RCL_ConfigAddress;
 #define RCL_CMDID_GENERIC_LRF_OPERATION 0x0007U
 #define RCL_CMDID_NESB_PTX              0x0008U
 #define RCL_CMDID_NESB_PRX              0x0009U
+#define RCL_CMDID_GENERIC_TX_BURST      0x000DU
+#define RCL_CMDID_GENERIC_RX_BURST      0x000EU
 
 
 /**
@@ -469,6 +475,151 @@ struct RCL_STATS_NESB_t {
     .lastRssi = -128,               \
 }
 #define RCL_StatsNesb_DefaultRuntime() (RCL_StatsNesb) RCL_StatsNesb_Default()
+
+/*!
+ *  @brief Per-slot outcome after an RX burst completes
+ */
+typedef enum {
+    RCL_RX_BURST_SLOT_STATUS_PENDING  = 0, /*!< Slot not yet processed */
+    RCL_RX_BURST_SLOT_STATUS_OK       = 1, /*!< Packet received with correct CRC */
+    RCL_RX_BURST_SLOT_STATUS_CRC_FAIL = 2, /*!< Packet received but CRC error */
+    RCL_RX_BURST_SLOT_STATUS_TIMEOUT  = 3  /*!< No packet arrived within slot window */
+} RCL_RxBurstSlotStatus;
+
+/**
+ *  @brief RX burst command
+ *
+ *  Receives up to %numPackets packets back to back. The PBE re-arms sync
+ *  search after each packet on its own and the LRF DMA moves each received
+ *  entry out of the RX FIFO into the buffer posted with RCL_Dma_putRxBuffer()
+ *  as the PBE commits it, so the CPU is idle for the entire burst. The
+ *  inter-packet gap comes from the RF settings (PBE PRERXIFS), not from this
+ *  command.
+ *
+ *  The PBE ends the burst itself once %numPackets packets have arrived, good
+ *  or bad. A burst that loses a packet never reaches that count and ends on a
+ *  sync-search timeout instead (%firstPktTimeoutTicks for the first packet,
+ *  %slotTimeoutTicks for the following ones), or on the stop time in
+ *  %common.timing, whichever comes first.
+ *
+ *  @note CC27XX only. Other devices end the command with RCL_CommandStatus_Error_Param.
+ */
+struct RCL_CMD_GENERIC_RX_BURST_t {
+    RCL_Command             common;
+    uint32_t                rfFrequency;            /*!< RF frequency in Hz. 0: do not program frequency */
+    uint32_t                syncWord;               /*!< Sync word to match */
+    uint16_t                numPackets;             /*!< Packets in the burst. Sizes the %slotStatus array and the DMA transfer; the burst need not fit the RX FIFO, see RCL_Dma_armRxBurst */
+    uint16_t                packetLength;           /*!< Payload bytes per packet */
+    uint32_t                firstPktTimeoutTicks;   /*!< Max ticks to wait for first packet. 0: wait forever */
+    uint32_t                slotTimeoutTicks;       /*!< Max ticks to wait for each subsequent packet's sync. 0: wait forever. On timeout the burst ends on that slot and the remaining slots are marked TIMEOUT */
+    RCL_RxBurstSlotStatus  *slotStatus;             /*!< Caller-provided array [numPackets] for per-slot outcome */
+    RCL_StatsGenericRxBurst *stats;                 /*!< Pointer to statistics structure. NULL: Do not store statistics */
+    struct {
+        uint8_t             fsOff:     1;           /*!< 0: keep PLL after command. 1: turn off FS after command */
+        uint8_t             enableLRF: 1;           /*!< 0: assume the LRF is already enabled by a previous command (chained bursts). 1: call LRF_enable() at command start */
+        uint8_t             disableLRF:1;           /*!< 0: leave the LRF enabled for a following chained command. 1: call LRF_disable() at command end */
+        uint8_t             reconfigure:1;          /*!< 0: reuse the previous burst's static config and reprogram only the frequency. 1: program the static config (sync word, OPCFG, timeouts, packet length, packet count). */
+        uint8_t             reserved:  4;           /*!< Reserved, set to 0 */
+    } config;
+};
+
+#define RCL_CmdGenericRxBurst_Default()                                         \
+{                                                                               \
+    .common = RCL_Command_Default(RCL_CMDID_GENERIC_RX_BURST,                   \
+                                  RCL_Handler_Generic_RxBurst),                 \
+    .rfFrequency          = 2440000000U,                                        \
+    .syncWord             = 0x930B51DEU,                                        \
+    .numPackets           = 5U,                                                 \
+    .packetLength         = 22U,                                                \
+    .firstPktTimeoutTicks = 0U,                                                 \
+    .slotTimeoutTicks     = 0U,                                                 \
+    .slotStatus           = NULL,                                               \
+    .stats                = NULL,                                               \
+    .config = { .fsOff = 0, .enableLRF = 1, .disableLRF = 1,                    \
+                .reconfigure = 1, .reserved = 0 },                              \
+}
+#define RCL_CmdGenericRxBurst_DefaultRuntime() \
+    (RCL_CmdGenericRxBurst) RCL_CmdGenericRxBurst_Default()
+
+/**
+ *  @brief Multi-packet TX burst command
+ *
+ *  Transmits %numPackets distinct packets back to back, fed one packet at a
+ *  time by the LRF DMA as the PBE asks for it, from the entries posted with
+ *  RCL_Dma_putTxBurst(); an entry may be written up to the moment the FIFO
+ *  takes it. The CPU is idle for the burst; the inter-packet gap comes from
+ *  the RF settings (PBE PRETXIFS), not from this command. The PBE ends the
+ *  burst itself once it has sent %numPackets packets.
+ *
+ *  @note CC27XX only. Other devices end the command with RCL_CommandStatus_Error_Param.
+ */
+struct RCL_CMD_GENERIC_TX_BURST_t {
+    RCL_Command          common;
+    uint32_t             rfFrequency;     /*!< RF frequency in Hz to program. 0: Do not program frequency */
+    uint32_t             syncWord;        /*!< Sync word to transmit */
+    uint16_t             numPackets;      /*!< Number of packets to transmit */
+    uint16_t             packetLength;    /*!< Payload bytes per packet */
+    RCL_Command_TxPower  txPower;         /*!< Transmit power */
+    struct {
+        uint8_t          fsOff: 1;        /*!< 0: Keep PLL enabled after command. 1: Turn off FS after command. */
+        uint8_t          enableLRF: 1;    /*!< 1: call LRF_enable() at command start. 0: assume the LRF is already enabled by a previous command (chained bursts) */
+        uint8_t          disableLRF: 1;   /*!< 1: call LRF_disable() at command end. 0: leave the LRF enabled for a following chained command */
+        uint8_t          reconfigure: 1;  /*!< 1: program the static config (sync word, TX power, OPCFG, packet length, packet count). 0: reuse the previous burst's static config and reprogram only the frequency; %syncWord, %packetLength, %numPackets and %txPower must then match the previous burst */
+        uint8_t          reserved: 4;     /*!< Reserved, set to 0 */
+    } config;
+    RCL_StatsGenericTxBurst *stats;       /*!< Pointer to statistics structure. NULL: Do not store statistics */
+};
+#define RCL_CmdGenericTxBurst_Default()                          \
+{                                                                 \
+    .common = RCL_Command_Default(RCL_CMDID_GENERIC_TX_BURST,    \
+                                  RCL_Handler_Generic_TxBurst),  \
+    .rfFrequency = 2440000000U,                                  \
+    .syncWord = 0x930B51DE,                                      \
+    .numPackets = 5,                                             \
+    .packetLength = 22,                                          \
+    .txPower = {.dBm = 0, .fraction = 0},                        \
+    .config = {                                                  \
+        .fsOff = 0,                                              \
+        .enableLRF = 1,                                          \
+        .disableLRF = 1,                                         \
+        .reconfigure = 1,                                        \
+        .reserved = 0,                                           \
+    },                                                           \
+    .stats = NULL,                                               \
+}
+#define RCL_CmdGenericTxBurst_DefaultRuntime() (RCL_CmdGenericTxBurst) RCL_CmdGenericTxBurst_Default()
+
+struct RCL_STATS_GENERIC_TX_BURST_t {
+    struct
+    {
+        uint8_t accumulate : 1;  /*!< 0: Reset counter to 0 at start of command. 1: Add to incoming value of counter. */
+        uint8_t reserved : 7;    /*!< Reserved, set to 0 */
+    } config;                    /*!< Configuration provided to RCL */
+    uint16_t nTx;                /*!< Number of packets transmitted */
+};
+
+#define RCL_StatsGenericTxBurst_Default() \
+{                                         \
+    .config = { 0 },                      \
+    .nTx = 0,                             \
+}
+#define RCL_StatsGenericTxBurst_DefaultRuntime() (RCL_StatsGenericTxBurst) RCL_StatsGenericTxBurst_Default()
+
+struct RCL_STATS_GENERIC_RX_BURST_t {
+    struct
+    {
+        uint8_t accumulate : 1;  /*!< 0: Reset counter to 0 at start of command. 1: Add to incoming value of counter. */
+        uint8_t reserved : 7;    /*!< Reserved, set to 0 */
+    } config;                    /*!< Configuration provided to RCL */
+    uint16_t nRxOk;              /*!< Number of packets received with correct CRC */
+};
+
+#define RCL_StatsGenericRxBurst_Default() \
+{                                         \
+    .config = { 0 },                      \
+    .nRxOk = 0,                           \
+}
+#define RCL_StatsGenericRxBurst_DefaultRuntime() (RCL_StatsGenericRxBurst) RCL_StatsGenericRxBurst_Default()
 
 
 #endif /* ti_drivers_rcl_commands_generic__include */

@@ -49,6 +49,29 @@
 #include <ti/drivers/rcl/hal/RCL_Hal.h>
 #include <ti/drivers/rcl/commands/generic.h>
 
+#include <ti/devices/DeviceFamily.h>
+
+/* The generic burst commands run their data path on the LRF DMA, and exist
+ * only on the device family that has it. They program the generic PBE RAM
+ * directly.
+ */
+#if (DeviceFamily_PARENT == DeviceFamily_PARENT_CC27XX)
+#include DeviceFamily_constructPath(inc/hw_types.h)
+#include DeviceFamily_constructPath(inc/hw_memmap.h)
+#include DeviceFamily_constructPath(inc/pbe_generic_ram_regs.h)
+#include <ti/drivers/rcl/RCL_Dma.h>
+
+/* Packet count at which the PBE ends a burst of its own accord, one word per
+ * direction. Zero disables the stop, and the PBE zeroes both as it tears an
+ * operation down, so they are written on every burst.
+ *
+ * They sit past the end of the generated PBE_GENERIC_RAM map and are spelled
+ * out here rather than taken from pbe_generic_ram_regs.h, which does not carry
+ * them; the offsets are the PBE port numbers 0xdf and 0xe0 as BUFRAM byte
+ * offsets, (port - 0x80) * 2. */
+#define PBE_GENERIC_RAM_O_NTXTARGET 0x000000BEU
+#define PBE_GENERIC_RAM_O_NRXTARGET 0x000000C0U
+#endif
 
 struct
 {
@@ -93,6 +116,9 @@ static uint32_t RCL_Handler_Generic_prepareSynth(void);
 static void RCL_Handler_Generic_setSynthPowerState(bool fsOff);
 static void RCL_Handler_Generic_updateRxCurBufferAndFifo(List_List *rxBuffers);
 static RCL_CommandStatus RCL_Handler_Generic_mapLrfErrorStatusToRclStatus(void);
+#if (DeviceFamily_PARENT == DeviceFamily_PARENT_CC27XX)
+static uint32_t RCL_Handler_Generic_findRxStatusPositionFromEnd(void);
+#endif
 static uint32_t RCL_Handler_Generic_updateTxBuffers(List_List *txBuffers, uint32_t maxBuffers);
 static void RCL_Handler_Generic_updateRxStats(RCL_StatsGeneric *stats, uint32_t startTime);
 static void RCL_Handler_Generic_updateLongStats(void);
@@ -1518,6 +1544,656 @@ RCL_Events RCL_Handler_Nesb_Prx(RCL_Command *cmd, LRF_Events lrfEvents,  RCL_Eve
 
     return rclEvents;
 }
+
+#if (DeviceFamily_PARENT == DeviceFamily_PARENT_CC27XX)
+
+/*
+ *  ======== RCL_Handler_Generic_findRxStatusPositionFromEnd ========
+ *
+ *  Position of the PBE status byte counted back from the end of an RX FIFO
+ *  entry body, or 0 if the settings do not append a status byte.
+ *
+ *  The PBE appends the enabled fields in the order CRC, STATUS, LQI, FREQEST,
+ *  RSSI, TIMESTAMP, so the status byte is the first of them and its distance
+ *  from the end is its own size plus the size of everything after it. This is
+ *  the same rule RCL_Handler_BLE5_findNumExtraBytes and
+ *  RCL_Handler_Ieee_findNumExtraBytes apply for their appended fields.
+ */
+static uint32_t RCL_Handler_Generic_findRxStatusPositionFromEnd(void)
+{
+    uint16_t fifoCfg = HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_FIFOCFG);
+    uint32_t positionFromEnd = 0U;
+
+    if ((fifoCfg & PBE_GENERIC_RAM_FIFOCFG_APPENDSTATUS_M) == 0U)
+    {
+        return 0U;
+    }
+
+    if ((fifoCfg & PBE_GENERIC_RAM_FIFOCFG_APPENDTIMESTAMP_M) != 0U)
+    {
+        positionFromEnd += sizeof(uint32_t);
+    }
+    if ((fifoCfg & PBE_GENERIC_RAM_FIFOCFG_APPENDRSSI_M) != 0U)
+    {
+        positionFromEnd += 1U;
+    }
+    if ((fifoCfg & PBE_GENERIC_RAM_FIFOCFG_APPENDFREQEST_M) != 0U)
+    {
+        positionFromEnd += 1U;
+    }
+    if ((fifoCfg & PBE_GENERIC_RAM_FIFOCFG_APPENDLQI_M) != 0U)
+    {
+        positionFromEnd += 1U;
+    }
+
+    /* The status byte itself */
+    positionFromEnd += 1U;
+
+    return positionFromEnd;
+}
+
+/*
+ *  ======== rclGenericBurstForceNoTxFifoCmd ========
+ *
+ *  Hold OPCFG.TXFCMD at NONE, so that the PBE issues no TX FIFO command while
+ *  the DMA has the FIFO.
+ *
+ *  Written on every burst rather than only when the static configuration is
+ *  programmed. A chained burst (config.reconfigure == 0) does not rewrite
+ *  OPCFG, and the PBE does not clear it when it tears an operation down, so a
+ *  burst that follows an ordinary generic command would otherwise inherit that
+ *  command's TXFCMD and the PBE would issue a FIFO command per packet. Such a
+ *  command and the DMA's write to TXFHWR can fall in the same cycle, and the
+ *  port write is the one that wins, so the FIFO command is the one lost. That
+ *  is the RCL-367 failure mode on the transmit side.
+ */
+static void rclGenericBurstForceNoTxFifoCmd(void)
+{
+    uint16_t opcfg = HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_OPCFG);
+    HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_OPCFG) =
+        (uint16_t) ((opcfg & (uint16_t) ~PBE_GENERIC_RAM_OPCFG_TXFCMD_M)
+                    | PBE_GENERIC_RAM_OPCFG_TXFCMD_NONE);
+}
+
+/*
+ *  ======== RCL_Handler_Generic_TxBurst ========
+ */
+RCL_Events RCL_Handler_Generic_TxBurst(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Events rclEventsIn)
+{
+    RCL_CmdGenericTxBurst *txCmd = (RCL_CmdGenericTxBurst *) cmd;
+    RCL_Events rclEvents = {.value = 0U};
+
+    if (rclEventsIn.setup != 0U)
+    {
+        uint32_t earliestStartTime;
+
+        /* Start by enabling refsys */
+        earliestStartTime = RCL_Handler_Generic_prepareSynth();
+
+        if ((txCmd->rfFrequency == 0U) && (LRF_Interface_Generic_isFreqSynthLocked() == false))
+        {
+            /* Synth not to be programmed, but not already locked */
+            cmd->status = RCL_CommandStatus_Error_Synth;
+            rclEvents.lastCmdDone = 1U;
+        }
+        else
+        {
+            /* Mark as active */
+            cmd->status = RCL_CommandStatus_Active;
+            genericHandlerState.common.endStatus = RCL_CommandStatus_Finished;
+
+            /* Static per-configuration programming. These values are constant
+             * across a chain of bursts that share sync word, TX power, packet
+             * length and packet count, so a chained burst may skip them
+             * (config.reconfigure == 0) and reprogram only the frequency below.
+             * When reconfigure is 0 the caller guarantees those fields still
+             * match the previous burst. */
+            if (txCmd->config.reconfigure != 0U)
+            {
+                /* Program the sync word */
+                LRF_Interface_Generic_programSyncWordA(txCmd->syncWord);
+
+                /* Disable NESB. configOpTx is not called: its only other effect
+                 * is writing OPCFG, which the burst OPCFG below overwrites. */
+                HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NESB) = PBE_GENERIC_RAM_NESB_NESBMODE_OFF;
+
+                /* Program TX power */
+                if (LRF_programTxPower(txCmd->txPower, txCmd->rfFrequency) != TxPowerResult_Ok)
+                {
+                    cmd->status = RCL_CommandStatus_Error_Param;
+                    rclEvents.lastCmdDone = 1U;
+                }
+
+                /* Program OPCFG for autonomous burst operation */
+                uint16_t opcfg = PBE_GENERIC_RAM_OPCFG_SINGLE_DIS         /* SINGLE=0: multi-packet loop */
+                               | PBE_GENERIC_RAM_OPCFG_IFSPERIOD_EN       /* use PRETXIFS for inter-packet gap */
+                               | PBE_GENERIC_RAM_OPCFG_NEXTOP_SAME        /* stay on TX after each packet */
+                               | PBE_GENERIC_RAM_OPCFG_FS_KEEPON_YES      /* keep PLL on between packets */
+                               | PBE_GENERIC_RAM_OPCFG_FS_NOCAL_CAL;      /* calibrate FS (safe default) */
+
+                /* TXFCMD is left out here and forced to NONE on every burst
+                 * by rclGenericBurstForceNoTxFifoCmd below. How the space of a
+                 * sent packet is given back does not need a FIFO command:
+                 * FCFG0.TXADEAL keeps TXFSRP at TXFRP all the time, which is
+                 * what lets the FIFO ask for the next entry while the current
+                 * one drains, so the command would only repeat what the
+                 * hardware already does. */
+                HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_OPCFG) = opcfg;
+
+                /* Configure operation so that it doesn't stop after each TX_DONE */
+                HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_SEQSTAT0) = PBE_GENERIC_RAM_SEQSTAT0_STOPAUTO_NEVER;
+
+                /* Program fixed packet length */
+                HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_MAXLEN) = txCmd->packetLength;
+            }
+
+            /* Program frequency word. Reprogrammed every burst: the frequency may
+             * change from one chained burst to the next. */
+            if (txCmd->rfFrequency != 0U)
+            {
+                LRF_programFrequency(txCmd->rfFrequency, true);
+            }
+
+            /* Enable radio. Skipped for a chained burst that inherits an already
+             * enabled LRF from the previous command (config.enableLRF == 0). */
+            if (txCmd->config.enableLRF != 0U)
+            {
+                LRF_enable();
+            }
+
+            /* Initialize RF FIFO */
+            genericHandlerState.common.txFifoSize = (uint16_t) LRF_prepareTxFifo();
+
+            /* Reset the transmitted-packet counter. Required every burst: the PBE
+             * does not clear it between operations, the packet-count stop below
+             * counts on it, and it is reported through %stats. */
+            LRF_Interface_Generic_setNumOfTxPackets(0U);
+
+            /* Let the PBE end the burst itself once it has sent %numPackets.
+             * Without this the operation only ends on a stop time the submitter
+             * has to place inside a window one packet wide: too early and the
+             * burst is short, too late and the PBE reads a packet that is not
+             * there, which sends it into an error path that waits forever for a
+             * front end reply. */
+            HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NTXTARGET) = txCmd->numPackets;
+
+            rclGenericBurstForceNoTxFifoCmd();
+
+            /* Nothing is entered into the FIFO here. The DMA moves one entry
+             * in each time the FIFO asks for one, from the entries the
+             * application posted with RCL_Dma_putTxBurst(), so the FIFO
+             * holds no more than the packet on the air and the one after
+             * it. The TXFIFO_RESET that LRF_prepareTxFifo issued above is
+             * the one FIFO command the CPU writes per burst, written with
+             * the previous operation ended and the DMA channel released.
+             *
+             * The arm moves the first entry in now, and the operation is
+             * only posted once it is there: the PBE pops that entry's
+             * header as soon as it has the operation, without waiting for
+             * the FIFO, and an underflow there sends it into an error path
+             * that never returns. A burst that has not been posted by now
+             * is therefore missing its buffers, and one whose first entry
+             * the DMA has not delivered is a FIFO error, both reported
+             * here rather than found by the PBE. */
+            int_fast16_t armStatus = RCL_Dma_armTx();
+
+            if (armStatus != RCL_Dma_Status_Success)
+            {
+                cmd->status = (armStatus == RCL_Dma_Status_Error_Fifo) ? RCL_CommandStatus_Error_TxFifo
+                                                                       : RCL_CommandStatus_Error_MissingTxBuffer;
+                rclEvents.lastCmdDone = 1U;
+            }
+            else
+            {
+                RCL_CommandStatus startTimeStatus = RCL_Scheduler_setStartStopTimeEarliestStart(cmd, earliestStartTime);
+                if (startTimeStatus >= RCL_CommandStatus_Finished)
+                {
+                    cmd->status = startTimeStatus;
+                    rclEvents.lastCmdDone = 1U;
+                }
+                else
+                {
+                    /* Only the end of the operation is of interest; the CPU
+                     * is idle between packets. */
+                    LRF_enableHwInterrupt(LRF_EventOpDone.value | LRF_EventOpError.value);
+
+                    /* Submit burst to PBE */
+                    Log_printf(LogModule_RCL, Log_INFO, "RCL_Handler_Generic_TxBurst: Starting burst (%u packets, %u Hz)",
+                               txCmd->numPackets, txCmd->rfFrequency);
+                    LRF_waitForTopsmReady();
+                    RCL_Profiling_eventHook(RCL_ProfilingEvent_PreprocStop);
+                    LRF_Interface_Generic_sendOpTx();
+                }
+            }
+        }
+    }
+
+    if (cmd->status == RCL_CommandStatus_Active)
+    {
+        if (rclEventsIn.timerStart != 0U)
+        {
+            rclEvents.cmdStarted = 1U;
+        }
+
+        /* Handle burst completion or error. A commanded stop is reported
+         * through opDone, so the end cause decides the status, not which
+         * event fired; otherwise a graceful stop would be reported as
+         * Finished. */
+        if ((lrfEvents.opDone != 0U) || (lrfEvents.opError != 0U))
+        {
+            uint16_t endCause = LRF_Interface_getCmdEndCause();
+
+            switch (endCause)
+            {
+            case LRF_INTERFACE_ENDCAUSE_STAT_EOPSTOP:
+                cmd->status = RCL_Scheduler_findStopStatus(RCL_StopType_Graceful);
+                break;
+
+            case LRF_INTERFACE_ENDCAUSE_STAT_ERR_STOP:
+                cmd->status = RCL_Scheduler_findStopStatus(RCL_StopType_Hard);
+                break;
+
+            default:
+                if (lrfEvents.opError != 0U)
+                {
+                    cmd->status = RCL_Handler_Generic_mapLrfErrorStatusToRclStatus();
+                }
+                else
+                {
+                    cmd->status = genericHandlerState.common.endStatus;
+                }
+                break;
+            }
+            rclEvents.lastCmdDone = 1U;
+            RCL_Profiling_eventHook(RCL_ProfilingEvent_PostprocStart);
+        }
+        else if (rclEventsIn.gracefulStop != 0U)
+        {
+            LRF_sendGracefulStop();
+        }
+        else
+        {
+            /* Other events */
+        }
+    }
+
+    if (rclEvents.lastCmdDone != 0U)
+    {
+        if (txCmd->stats != NULL)
+        {
+            uint16_t nTx = (uint16_t) HWREG_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NTX);
+
+            if (txCmd->stats->config.accumulate == 0U)
+            {
+                txCmd->stats->nTx = nTx;
+            }
+            else
+            {
+                txCmd->stats->nTx += nTx;
+            }
+        }
+
+        /* Releases the DMA channel and hands the transmitted entries back */
+        RCL_Dma_stop();
+
+        /* Power down the LRF. Skipped when a chained burst follows and needs the
+         * LRF left enabled (config.disableLRF == 0). */
+        if (txCmd->config.disableLRF != 0U)
+        {
+            LRF_disable();
+        }
+        RCL_Handler_Generic_setSynthPowerState((bool) txCmd->config.fsOff);
+    }
+
+    return rclEvents;
+}
+
+/*
+ *  ======== RCL_Handler_Generic_RxBurst ========
+ *
+ *  The PBE re-arms sync search after each packet on its own and the DMA moves
+ *  each entry out of the RX FIFO as it is committed, so the CPU is idle for
+ *  the whole burst. The burst ends when numPackets packets have arrived, on a
+ *  sync-search timeout (FIRSTRXTIMEOUT/RXTIMEOUT) or on a commanded stop; the
+ *  handler then fills in the caller's slotStatus[] from the entries in RAM.
+ */
+RCL_Events RCL_Handler_Generic_RxBurst(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Events rclEventsIn)
+{
+    RCL_CmdGenericRxBurst *rxCmd = (RCL_CmdGenericRxBurst *) cmd;
+    RCL_Events rclEvents = {.value = 0U};
+
+    if (rclEventsIn.setup != 0U)
+    {
+        uint32_t earliestStartTime;
+
+        /* Start by enabling refsys */
+        earliestStartTime = RCL_Handler_Generic_prepareSynth();
+
+        /* Validate command parameters */
+        if (rxCmd->numPackets == 0U)
+        {
+            cmd->status = RCL_CommandStatus_Error_Param;
+            rclEvents.lastCmdDone = 1U;
+        }
+        else if (rxCmd->slotStatus == NULL)
+        {
+            cmd->status = RCL_CommandStatus_Error_Param;
+            rclEvents.lastCmdDone = 1U;
+        }
+        else if ((rxCmd->rfFrequency == 0U) && (LRF_Interface_Generic_isFreqSynthLocked() == false))
+        {
+            /* Synth not to be programmed, but not already locked */
+            cmd->status = RCL_CommandStatus_Error_Synth;
+            rclEvents.lastCmdDone = 1U;
+        }
+        else
+        {
+            /* Initialize all slotStatus entries to PENDING */
+            for (uint16_t i = 0; i < rxCmd->numPackets; i++)
+            {
+                rxCmd->slotStatus[i] = RCL_RX_BURST_SLOT_STATUS_PENDING;
+            }
+
+            /* Static per-configuration programming. These values are constant
+             * across a chain of bursts that share sync word, packet length,
+             * packet count and sync-search timeouts, so a chained burst may skip
+             * them (config.reconfigure == 0) and reprogram only the frequency
+             * below. When reconfigure is 0 the caller guarantees those fields
+             * still match the previous burst. */
+            if (rxCmd->config.reconfigure != 0U)
+            {
+                /* Program the sync word */
+                LRF_Interface_Generic_programSyncWordA(rxCmd->syncWord);
+
+                /* Configure LRF for a repeated (multi-packet) RX operation. The
+                 * inter-packet gap comes from the RF settings (PRERXIFS); the PBE
+                 * re-arms sync search after each packet and receives packets
+                 * whenever they arrive on air. */
+                LRF_Interface_Generic_configOpRx(rxCmd->config.fsOff, rxCmd->rfFrequency, 1, rxCmd->packetLength);
+
+                /* SEQSTAT0.STOPAUTO = NEVER (so the PBE does not stop after first packet) */
+                HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_SEQSTAT0) = PBE_GENERIC_RAM_SEQSTAT0_STOPAUTO_NEVER;
+
+                /* Program FIRSTRXTIMEOUT (max ticks to wait for the first packet; 0 = wait forever) */
+                HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_FIRSTRXTIMEOUT) = (uint16_t) rxCmd->firstPktTimeoutTicks;
+
+                /* Program RXTIMEOUT: max ticks to wait for each subsequent packet's
+                 * sync. 0 = wait forever. A non-zero value lets the PBE end the
+                 * burst when a slot's packet never arrives (TIMER0 -> NO_SYNC -> OP
+                 * end); the burst ends on that slot and the remaining slots are
+                 * marked TIMEOUT. Without it a lost packet stalls the burst until
+                 * the stop time. */
+                HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_RXTIMEOUT) = (uint16_t) rxCmd->slotTimeoutTicks;
+            }
+
+            /* Reset the received-packet counters. Required every burst: the PBE
+             * does not clear them between operations, the packet-count stop
+             * below counts on them, and NRXOK is reported through %stats. */
+            LRF_Interface_Generic_setNumOfRxOkPackets(0U);
+            LRF_Interface_Generic_setNumOfNotRxOkPackets(0U);
+
+            /* Let the PBE end the burst itself once %numPackets have arrived,
+             * counting both the good and the bad. A burst that loses a packet
+             * never reaches the target and still ends on the sync-search timeout
+             * programmed above, which is what bounds it; the target is what ends
+             * a complete burst at the last packet instead of one slot later. The
+             * drain still stops at %numPackets entries, so a burst that overruns
+             * cannot write past the caller's buffers or slotStatus[] array. */
+            HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NRXTARGET) = rxCmd->numPackets;
+
+            rclGenericBurstForceNoTxFifoCmd();
+
+            /* Mark as active */
+            cmd->status = RCL_CommandStatus_Active;
+            genericHandlerState.common.endStatus = RCL_CommandStatus_Finished;
+
+            /* Program frequency word */
+            if (rxCmd->rfFrequency != 0U)
+            {
+                LRF_programFrequency(rxCmd->rfFrequency, false);
+            }
+
+            /* Enable radio. Skipped for a chained burst that inherits an already
+             * enabled LRF from the previous command (config.enableLRF == 0). */
+            if (rxCmd->config.enableLRF != 0U)
+            {
+                LRF_enable();
+            }
+
+            /* Initialize RF FIFO, then work out the exact footprint of one
+             * entry as the PBE will write it, since one DMA arbitration has to
+             * be one entry. The value stored in the entry length field is:
+             *   numPad field (1) + optional padding + optional header + payload +
+             *   EXTRABYTES (appended status/LQI/FREQ/RSSI/timestamp).
+             * RCL_Buffer_DataEntry_paddedLen() then adds the 2-byte length field
+             * and rounds the entry up to the 32-bit boundary. The three envelope
+             * inputs (EXTRABYTES, LENOPTPAD, NUMHDRBITS) come from the settings-
+             * programmed registers (valid after configOpRx above), so nothing here
+             * is PHY-specific. An entry that comes to a power of two is exactly
+             * one arbitration; FIFOCFG.APPEND* and LENOPTPAD are the two settings
+             * that move it there. */
+            genericHandlerState.common.rxFifoSize = (uint16_t) LRF_prepareRxFifo();
+
+            uint32_t rxExtraBytes = HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_EXTRABYTES);
+            uint16_t rxFifoCfg = (uint16_t) HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_FIFOCFG);
+            uint32_t rxOptPad = ((uint32_t) rxFifoCfg & PBE_GENERIC_RAM_FIFOCFG_LENOPTPAD_M) >> PBE_GENERIC_RAM_FIFOCFG_LENOPTPAD_S;
+            uint32_t rxHdrBytes = 0U;
+            uint16_t rxOpCfg = (uint16_t) HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_OPCFG);
+
+            if ((rxOpCfg & PBE_GENERIC_RAM_OPCFG_RXINCLUDEHDR_M) != 0U)
+            {
+                uint16_t rxPktCfg = (uint16_t) HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_PKTCFG);
+                uint32_t rxNumHdrBits = ((uint32_t) rxPktCfg & PBE_GENERIC_RAM_PKTCFG_NUMHDRBITS_M) >> PBE_GENERIC_RAM_PKTCFG_NUMHDRBITS_S;
+                rxHdrBytes = (rxNumHdrBits + 7U) / 8U; /* ceil(NUMHDRBITS / 8) */
+            }
+
+            /* Entry length-field value = body bytes after the length field. */
+            uint32_t rxLenField = 1U + rxOptPad + rxHdrBytes + (uint32_t) rxCmd->packetLength + rxExtraBytes;
+            uint32_t rxPerPktBytes = RCL_Buffer_DataEntry_paddedLen(rxLenField);
+            /* The DMA takes each entry out of the FIFO as the PBE commits
+             * it, and what a burst that ended early left behind at op done,
+             * into the buffer the application posted with
+             * RCL_Dma_putRxBuffer(); see RCL_Dma_armRxBurst. The burst must
+             * fit one transfer and the posted buffer, which the arm checks;
+             * it need not fit the FIFO. No FIFO pointer is written while the
+             * burst is on the air. */
+            bool canStart = (RCL_Dma_armRxBurst(rxCmd->numPackets, rxPerPktBytes) == RCL_Dma_Status_Success);
+
+            /* A burst the DMA cannot be armed for is rejected with
+             * Error_Param rather than started. */
+            RCL_CommandStatus startTimeStatus = canStart ?
+                RCL_Scheduler_setStartStopTimeEarliestStart(cmd, earliestStartTime) :
+                RCL_CommandStatus_Error_Param;
+            if (startTimeStatus >= RCL_CommandStatus_Finished)
+            {
+                cmd->status = startTimeStatus;
+                rclEvents.lastCmdDone = 1U;
+            }
+            else
+            {
+                /* Only the end of the operation is of interest; the CPU is
+                 * idle between packets. */
+                LRF_enableHwInterrupt(LRF_EventOpDone.value | LRF_EventOpError.value);
+
+                /* Submit burst to PBE */
+                Log_printf(LogModule_RCL, Log_INFO, "RCL_Handler_Generic_RxBurst: Starting burst (%u packets, %u Hz)",
+                           rxCmd->numPackets, rxCmd->rfFrequency);
+                LRF_waitForTopsmReady();
+                RCL_Profiling_eventHook(RCL_ProfilingEvent_PreprocStop);
+                LRF_Interface_Generic_sendOpRx();
+            }
+        }
+    }
+
+    if (cmd->status == RCL_CommandStatus_Active)
+    {
+        if (rclEventsIn.timerStart != 0U)
+        {
+            rclEvents.cmdStarted = 1U;
+        }
+
+        /* Handle burst completion. A commanded graceful stop (EOPSTOP) or hard stop
+         * is delivered as opError with the stop cause in ENDCAUSE, not as opDone,
+         * so both events share this completion path: the FIFO must be drained and
+         * slotStatus[] populated whether the burst ended on a sync-search timeout
+         * or was bounded by a commanded stop. Only a genuinely fatal end cause is
+         * reported as an error below. */
+        if (lrfEvents.opDone != 0U || lrfEvents.opError != 0U)
+        {
+            uint16_t slotIndex = 0;
+
+            /* Whatever the stream did not reach is taken out of the FIFO now
+             * that the PBE has ended the operation. The entries then lie
+             * back to back in the posted RX buffer, already committed, and
+             * slotStatus[] is filled in from RAM. */
+            const uint8_t *entry;
+            uint32_t numBytes = RCL_Dma_finishRxBurst(&entry);
+            uint32_t statusFromEnd = RCL_Handler_Generic_findRxStatusPositionFromEnd();
+
+            while ((numBytes >= sizeof(uint16_t)) && (slotIndex < rxCmd->numPackets))
+            {
+                uint32_t lengthField = (uint32_t) entry[0] | ((uint32_t) entry[1] << 8);
+                uint32_t entryBytes = RCL_Buffer_DataEntry_paddedLen(lengthField);
+
+                if (entryBytes > numBytes)
+                {
+                    break;
+                }
+                rclEvents.rxEntryAvail = 1U;
+
+                uint8_t statusByte = ((statusFromEnd != 0U) && (lengthField >= statusFromEnd)) ?
+                    entry[sizeof(uint16_t) + lengthField - statusFromEnd] : 0U;
+
+                if ((statusByte & PBE_GENERIC_RAM_STATUSBYTE_CRCERROR_M) == 0U)
+                {
+                    rxCmd->slotStatus[slotIndex] = RCL_RX_BURST_SLOT_STATUS_OK;
+                }
+                else
+                {
+                    rxCmd->slotStatus[slotIndex] = RCL_RX_BURST_SLOT_STATUS_CRC_FAIL;
+                }
+                slotIndex++;
+                entry += entryBytes;
+                numBytes -= entryBytes;
+            }
+
+            /* Slots the burst never reached */
+            while (slotIndex < rxCmd->numPackets)
+            {
+                rxCmd->slotStatus[slotIndex] = RCL_RX_BURST_SLOT_STATUS_TIMEOUT;
+                slotIndex++;
+            }
+
+            /* Map the PBE end cause to a command status. A commanded stop (EOPSTOP
+             * graceful, ERR_STOP hard) or a slot sync-search timeout (RXTIMEOUT/
+             * NOSYNC) may be reported through either opDone or opError, so the end
+             * cause decides the status, not which event fired. Any other opError
+             * cause is a genuine fatal error; otherwise the burst ended normally. */
+            uint16_t endCause = LRF_Interface_getCmdEndCause();
+            switch (endCause)
+            {
+            case LRF_INTERFACE_ENDCAUSE_STAT_EOPSTOP:
+                cmd->status = RCL_Scheduler_findStopStatus(RCL_StopType_Graceful);
+                break;
+
+            case LRF_INTERFACE_ENDCAUSE_STAT_ERR_STOP:
+                cmd->status = RCL_Scheduler_findStopStatus(RCL_StopType_Hard);
+                break;
+
+            case LRF_INTERFACE_ENDCAUSE_STAT_RXTIMEOUT:
+            case LRF_INTERFACE_ENDCAUSE_STAT_NOSYNC:
+                /* A slot's sync search timed out (RXTIMEOUT for the first packet,
+                 * NOSYNC for a subsequent one). The burst ends on that slot; the
+                 * drain has already marked it and the rest TIMEOUT. */
+                cmd->status = RCL_CommandStatus_RxTimeout;
+                break;
+
+            default:
+                if (lrfEvents.opError != 0U)
+                {
+                    cmd->status = RCL_Handler_Generic_mapLrfErrorStatusToRclStatus();
+                }
+                else
+                {
+                    cmd->status = genericHandlerState.common.endStatus;
+                }
+                break;
+            }
+            rclEvents.lastCmdDone = 1U;
+            RCL_Profiling_eventHook(RCL_ProfilingEvent_PostprocStart);
+        }
+        else if (rclEventsIn.gracefulStop != 0U)
+        {
+            LRF_sendGracefulStop();
+        }
+        else
+        {
+            /* Other events need to be handled unconditionally */
+        }
+    }
+
+    if (rclEvents.lastCmdDone != 0U)
+    {
+        if (rxCmd->stats != NULL)
+        {
+            uint16_t nRxOk = HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NRXOK);
+
+            if (rxCmd->stats->config.accumulate == 0U)
+            {
+                rxCmd->stats->nRxOk = nRxOk;
+            }
+            else
+            {
+                rxCmd->stats->nRxOk += nRxOk;
+            }
+        }
+
+        /* Releases the DMA channel, the posted RX buffer stays posted */
+        RCL_Dma_stop();
+
+        /* Power down the LRF. Skipped when a chained burst follows and needs the
+         * LRF left enabled (config.disableLRF == 0). */
+        if (rxCmd->config.disableLRF != 0U)
+        {
+            LRF_disable();
+        }
+        RCL_Handler_Generic_setSynthPowerState((bool) rxCmd->config.fsOff);
+    }
+
+    return rclEvents;
+}
+
+#else /* No LRF DMA: the burst commands are not available */
+
+RCL_Events RCL_Handler_Generic_TxBurst(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Events rclEventsIn)
+{
+    RCL_Events rclEvents = {.value = 0U};
+    (void) lrfEvents;
+
+    if (rclEventsIn.setup != 0U)
+    {
+        cmd->status = RCL_CommandStatus_Error_Param;
+        rclEvents.lastCmdDone = 1U;
+    }
+
+    return rclEvents;
+}
+
+RCL_Events RCL_Handler_Generic_RxBurst(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Events rclEventsIn)
+{
+    RCL_Events rclEvents = {.value = 0U};
+    (void) lrfEvents;
+
+    if (rclEventsIn.setup != 0U)
+    {
+        cmd->status = RCL_CommandStatus_Error_Param;
+        rclEvents.lastCmdDone = 1U;
+    }
+
+    return rclEvents;
+}
+
+#endif /* DeviceFamily_PARENT == DeviceFamily_PARENT_CC27XX */
 
 /*
  *  ======== RCL_Handler_Generic_prepareSynth ========
