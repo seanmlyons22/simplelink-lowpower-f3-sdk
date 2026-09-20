@@ -16,8 +16,13 @@
       "name": "phyType2400",
       "displayName": "PHY Type",
       "description": "Selects the PHY setting",
-      "options": [],
-      "default": "",
+      "options": [
+        {
+          "name": "x1burst_2m",
+          "displayName": "VCC X1Burst, 2 Mbps"
+        }
+      ],
+      "default": "x1burst_2m",
       "hidden": true
     },
     {
@@ -132,7 +137,18 @@
     }
   ],
   "phys": {
-    "prop2400": []
+    "prop2400": [
+      {
+        "file8": "x1burst_2m_cc27xx.json",
+        "phy_files": {
+          "cc27xx": "x1burst_2m_cc27xx.phy"
+        },
+        "name": "x1burst_2m",
+        "label": "VCC X1Burst, 2 Mbps",
+        "protocol": "Proprietary",
+        "usage": "stack"
+      }
+    ]
   },
   "rcl_struct_defs": {
     "LRF_Events": {

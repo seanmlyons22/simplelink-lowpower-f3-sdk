@@ -24,6 +24,10 @@
         {
           "name": "wbms",
           "displayName": "wBMS, 2 Mbps / 1 Mbps, GFSK"
+        },
+        {
+          "name": "x1burst_2m",
+          "displayName": "VCC X1Burst, 2 Mbps"
         }
       ],
       "default": "nesb",
@@ -160,6 +164,16 @@
         },
         "name": "wbms",
         "label": "wBMS, 2 Mbps / 1 Mbps, GFSK",
+        "protocol": "Proprietary",
+        "usage": "stack"
+      },
+      {
+        "file8": "x1burst_2m_cc27xx.json",
+        "phy_files": {
+          "cc27xx": "x1burst_2m_cc27xx.phy"
+        },
+        "name": "x1burst_2m",
+        "label": "VCC X1Burst, 2 Mbps",
         "protocol": "Proprietary",
         "usage": "stack"
       }
