@@ -238,10 +238,12 @@ uint32_t LAESLink_buildTx(LAESLink_TxState *state, uint32_t slot, LAESLink_TxSin
     LAESLink_listPush(&b, LAESLink_word(LAESLink_addr(&consts[LAESLINK_TXC_GPIO]), GPIO_REG(GPIO_O_DOUTTGL31_0)),
                       LAESLink_Flow_Continue);
     /* Refresh the relay primary (channel 9) and then our own primary for the
-     * next slot, and stop until the next packet request.
+     * next slot, and stop until the next packet request. Both point at the
+     * next slot: the relay group and the packet list advance together.
      */
     LAESLink_listPush(&b,
-                      LAESLink_block(LAESLink_addr(state->relayPrim), LAESLink_entryStartAddr(LAESLink_primary(9U))),
+                      LAESLink_block(LAESLink_addr(&state->relayPrim[4U * next]),
+                                     LAESLink_entryStartAddr(LAESLink_primary(9U))),
                       LAESLink_Flow_Continue);
     LAESLink_listPush(&b,
                       LAESLink_block(LAESLink_addr(&state->prim[4U * next]),
@@ -267,6 +269,47 @@ uint32_t LAESLink_buildRelay(volatile LAESLink_Task *list, uint32_t n, uint32_t 
         }
         LAESLink_listPush(&b, kick, LAESLink_Flow_Wait);
     }
+    return b.n;
+}
+
+/*
+ *  ======== LAESLink_buildTxRelay ========
+ *  One group of the transmit relay (LAES design 6.5). The sample channel
+ *  runs in basic mode, so it completes and disables itself; the group puts
+ *  it back and takes the peripheral's event down before the packet list
+ *  starts. The housekeeping rows sit here rather than at the head of the
+ *  packet list so that the channel is listening to the sample source again
+ *  before the AES pipeline begins.
+ */
+uint32_t LAESLink_buildTxRelay(LAESLink_TxState *state, uint32_t slot, uint32_t ackRegister)
+{
+    LAESLink_ListBuilder b;
+    const volatile uint32_t *consts = state->consts;
+    uint32_t bit  = LAESLink_addr(&consts[LAESLINK_TXC_BIT_SAMPLE]);
+    uint32_t next = (slot + 1U) % LAESLINK_SLOTS;
+
+    LAESLink_listBegin(&b, &state->relay[LAESLINK_TX_RELAY_TASKS * slot], LAESLINK_TX_RELAY_TASKS);
+    /* Clear the sample channel's done flag, so that its next completion is a
+     * fresh edge on DMA_DONE_COMB.
+     */
+    LAESLink_listPush(&b, LAESLink_word(bit, DMA_REG(DMA_O_REQDONE)), LAESLink_Flow_Continue);
+    /* Re-arm it into the next slot, never the one about to be encrypted */
+    LAESLink_listPush(&b,
+                      LAESLink_block(LAESLink_addr(&state->prim1[4U * next]),
+                                     LAESLink_entryStartAddr(LAESLink_primary(LAESLINK_TX_SAMPLE_CH))),
+                      LAESLink_Flow_Continue);
+    LAESLink_listPush(&b, LAESLink_word(bit, DMA_REG(DMA_O_SETCHANNELEN)), LAESLink_Flow_Continue);
+    /* Take the peripheral's event down, with the channel already armed
+     * behind it. The event is latched, so until it is cleared the fabric
+     * sees no new edge and the next sample would never be asked for; and
+     * the sample it acknowledges is already out of the peripheral's FIFO,
+     * so nothing raises it again until the next one arrives.
+     */
+    LAESLink_listPush(&b, LAESLink_word(LAESLink_addr(&consts[LAESLINK_TXC_ACK]), ackRegister),
+                      LAESLink_Flow_Continue);
+    /* Start the packet, then wait for the next sample */
+    LAESLink_listPush(&b, LAESLink_word(LAESLink_addr(&consts[LAESLINK_TXC_KICK8]), DMA_REG(DMA_O_SOFTREQ)),
+                      LAESLink_Flow_Wait);
     return b.n;
 }
 

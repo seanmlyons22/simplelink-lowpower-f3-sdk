@@ -53,14 +53,18 @@ static LAESLink_TxState txState __attribute__((aligned(16)));
 static struct
 {
     LAESLink_Config cfg;
-    uint32_t tasks;     /* Entries in each slot's list */
-    uint32_t lastSeen;  /* Completed counter at the previous watchdog call */
+    uint32_t tasks;       /* Entries in each slot's list */
+    uint32_t lastSeen;    /* Completed counter at the previous watchdog call */
+    bool sampleAttached;  /* A sample source owns LAESLINK_TX_SAMPLE_CH */
 } tx;
 
 /* Bound on the wait for a packet in flight: a packet takes about 30 us, this
  * is well over a millisecond of register reads.
  */
 #define STOP_POLL_LIMIT (20000U)
+
+/* Channel mask of the sample source */
+#define LAESLINK_SAMPLE_MASK (1UL << LAESLINK_TX_SAMPLE_CH)
 
 /*
  *  ======== completedCounter ========
@@ -70,6 +74,37 @@ static struct
 static uint32_t completedCounter(void)
 {
     return LAESLink_swap32(txState.a1[LAESLINK_CCM_COUNTER_WORD]);
+}
+
+/*
+ *  ======== buildRelay ========
+ *  One relay group per ring slot, and the primary image that points at each.
+ *  With a sample source attached the group is the housekeeping of LAES
+ *  design 6.5 and the kick; without one it is the plain software kick that
+ *  LAESLink_txKick() and the tests drive the link with.
+ */
+static void buildRelay(uint32_t ackRegister, bool attached)
+{
+    for (uint32_t slot = 0U; slot < LAESLINK_SLOTS; slot++)
+    {
+        volatile LAESLink_Task *group = &txState.relay[LAESLINK_TX_RELAY_TASKS * slot];
+        uint32_t n;
+
+        if (attached)
+        {
+            n = LAESLink_buildTxRelay(&txState, slot, ackRegister);
+        }
+        else
+        {
+            n = LAESLink_buildRelay(group, LAESLINK_TX_RELAY_TASKS,
+                                    LAESLink_addr(&txState.consts[LAESLINK_TXC_KICK8]), 0U);
+        }
+        LAESLink_setImage(&txState.relayPrim[4U * slot],
+                          LAESLink_sgPrimary(LAESLink_taskSpareAddr(&group[n - 1U]),
+                                             LAESLink_entrySpareAddr(LAESLink_alternate(9U)), n, true));
+    }
+    LAESLink_writeEntry(LAESLink_primary(9U), LAESLink_imageTask(txState.relayPrim));
+    LAESLink_clearEntry(LAESLink_alternate(9U));
 }
 
 /*
@@ -123,16 +158,11 @@ int_fast16_t LAESLink_txOpen(const LAESLink_Config *cfg, const uint8_t key[LAESL
                                     LAESLink_entrySpareAddr(LAESLink_alternate(8U)), n, true));
         tx.tasks = n;
     }
-    n = LAESLink_buildRelay(txState.relay, LAESLINK_RELAY_TASKS, LAESLink_addr(&c[LAESLINK_TXC_KICK8]), 0U);
-    LAESLink_setImage(txState.relayPrim,
-             LAESLink_sgPrimary(LAESLink_taskSpareAddr(&txState.relay[n - 1U]),
-                                LAESLink_entrySpareAddr(LAESLink_alternate(9U)), n, true));
+    buildRelay(0U, false);
 
-    /* Control table: slot 0 list on channel 8, relay on channel 9 */
+    /* Control table: slot 0 list on channel 8, slot 0 relay group on 9 */
     LAESLink_writeEntry(LAESLink_primary(8U), LAESLink_imageTask(txState.prim));
     LAESLink_clearEntry(LAESLink_alternate(8U));
-    LAESLink_writeEntry(LAESLink_primary(9U), LAESLink_imageTask(txState.relayPrim));
-    LAESLink_clearEntry(LAESLink_alternate(9U));
 
     /* Event routing: the AESDONE edge paces the list, and a completion
      * published on DMA_DONE_COMB (the sample channel's, once the application
@@ -143,9 +173,34 @@ int_fast16_t LAESLink_txOpen(const LAESLink_Config *cfg, const uint8_t key[LAESL
     EVTSVTConfigureDma(EVTSVT_DMA_CH9, EVTSVT_PUB_DMA_DONE_COMB);
     LAESLink_channelsReset(LAESLINK_CH8 | LAESLINK_CH9);
 
-    tx.cfg      = *cfg;
-    tx.lastSeen = cfg->initialCounter;
+    tx.cfg            = *cfg;
+    tx.lastSeen       = cfg->initialCounter;
+    tx.sampleAttached = false;
     return LAESLINK_STATUS_SUCCESS;
+}
+
+/*
+ *  ======== LAESLink_txAttachSampleSource ========
+ */
+void LAESLink_txAttachSampleSource(uint32_t dataRegister, uint32_t ackRegister, uint32_t ackMask)
+{
+    txState.consts[LAESLINK_TXC_BIT_SAMPLE] = LAESLINK_SAMPLE_MASK;
+    txState.consts[LAESLINK_TXC_ACK]        = ackMask;
+
+    /* One payload per arbitration, because one event is one arbitration */
+    for (uint32_t slot = 0U; slot < LAESLINK_SLOTS; slot++)
+    {
+        LAESLink_setImage(&txState.prim1[4U * slot],
+                 LAESLink_transfer(dataRegister, LAESLink_addr(&txState.slots[4U * slot]),
+                                   LAESLINK_PAYLOAD_LEN / 2U, LAESLINK_SIZE_HALF, LAESLINK_INC_NONE,
+                                   LAESLINK_INC_HALF, LAESLINK_ARB_X8, LAESLINK_MODE_BASIC));
+    }
+    buildRelay(ackRegister, true);
+    LAESLink_writeEntry(LAESLink_primary(LAESLINK_TX_SAMPLE_CH), LAESLink_imageTask(txState.prim1));
+    /* The done mask is what the relay listens through */
+    LAESLink_channelsReset(LAESLINK_SAMPLE_MASK);
+    LAESLink_doneMaskSet(LAESLINK_SAMPLE_MASK);
+    tx.sampleAttached = true;
 }
 
 /*
@@ -258,6 +313,13 @@ void LAESLink_txClose(void)
     LAESLink_txStop();
     LAESLink_clearEntry(LAESLink_primary(8U));
     LAESLink_clearEntry(LAESLink_primary(9U));
+    if (tx.sampleAttached)
+    {
+        LAESLink_clearEntry(LAESLink_primary(LAESLINK_TX_SAMPLE_CH));
+        LAESLink_channelsReset(LAESLINK_SAMPLE_MASK);
+        EVTSVTConfigureDma(EVTSVT_DMA_CH10, EVTSVT_PUB_NONE);
+        tx.sampleAttached = false;
+    }
     LAESLink_channelsReset(LAESLINK_CH8 | LAESLINK_CH9);
     /* Channels off before abort: the LAES requires that order */
     LAESLink_laesClose();

@@ -63,10 +63,14 @@ extern "C" {
 /* Capacity of a transmit and of a receive task list, and the length of a
  * relay list. The relay primary is refreshed every packet, so its count only
  * needs to exceed one: a primary that ran out would disable the channel.
+ *
+ * The transmit relay is one group per ring slot, because re-arming the
+ * sample channel names the slot it is re-armed into.
  */
-#define LAESLINK_TX_LIST_CAP    (32U)
-#define LAESLINK_RX_LIST_CAP    (32U)
-#define LAESLINK_RELAY_TASKS    (8U)
+#define LAESLINK_TX_LIST_CAP      (32U)
+#define LAESLINK_RX_LIST_CAP      (32U)
+#define LAESLINK_RELAY_TASKS      (8U)
+#define LAESLINK_TX_RELAY_TASKS   (5U)
 
 _Static_assert((LAESLINK_RELAY_TASKS % 2U) == 0U, "the receive relay is built in toggle/kick pairs");
 _Static_assert(LAESLINK_TX_LIST_CAP * 4U <= LAESLINK_MAX_ITEMS, "a primary must cover the whole list");
@@ -112,7 +116,9 @@ _Static_assert(LAESLINK_CFG_MAC == 0x03000034U, "CFG_MAC");
 #define LAESLINK_TXC_LEN        (4U)  /* FIFO entry length word */
 #define LAESLINK_TXC_GPIO       (5U)  /* Stage pin toggle mask */
 #define LAESLINK_TXC_API        (6U)  /* OP_TX, written to LRFDPBE.API */
-#define LAESLINK_TXC_COUNT      (7U)
+#define LAESLINK_TXC_BIT_SAMPLE (7U)  /* Sample channel bit, for REQDONE and SETCHANNELEN */
+#define LAESLINK_TXC_ACK        (8U)  /* Written to the sample peripheral's event clear register */
+#define LAESLINK_TXC_COUNT      (9U)
 
 /* Indices into the receive constant block */
 #define LAESLINK_RXC_CFG_S      (0U)  /* AUTOCFG for S0 and S1 (no increment) */
@@ -139,9 +145,10 @@ _Static_assert(LAESLINK_CFG_MAC == 0x03000034U, "CFG_MAC");
 typedef struct
 {
     volatile LAESLink_Task lists[LAESLINK_SLOTS][LAESLINK_TX_LIST_CAP]; /* One task list per ring slot */
-    volatile LAESLink_Task relay[LAESLINK_RELAY_TASKS];                 /* Relay list for channel 9 */
+    volatile LAESLink_Task relay[LAESLINK_TX_RELAY_TASKS * LAESLINK_SLOTS]; /* Relay list for channel 9, one group per slot */
     volatile uint32_t prim[4U * LAESLINK_SLOTS];                        /* Channel 8 primary images, one per slot */
-    volatile uint32_t relayPrim[4];                                     /* Channel 9 primary image */
+    volatile uint32_t relayPrim[4U * LAESLINK_SLOTS];                   /* Channel 9 primary images, one per slot */
+    volatile uint32_t prim1[4U * LAESLINK_SLOTS];                       /* Sample channel primary images, one per slot */
     volatile uint32_t b0[4];                                            /* CCM B0 image */
     volatile uint32_t b1[4];                                            /* CCM B1 image */
     volatile uint32_t a0[4];                                            /* CCM A0 image */
@@ -221,6 +228,12 @@ uint32_t LAESLink_buildTx(LAESLink_TxState *state, uint32_t slot, LAESLink_TxSin
  * kick.
  */
 uint32_t LAESLink_buildRelay(volatile LAESLink_Task *list, uint32_t n, uint32_t kickSrc, uint32_t gpioSrc);
+
+/* Build one slot's group of the transmit relay: acknowledge the sample
+ * channel, re-arm it into the next slot, enable it and start the packet.
+ * Returns the number of entries.
+ */
+uint32_t LAESLink_buildTxRelay(LAESLink_TxState *state, uint32_t slot, uint32_t ackRegister);
 
 /* Build the receive list for slot. With radio set the list acknowledges and
  * re-arms channel 2 and refreshes the channel 10 relay. Returns the number of

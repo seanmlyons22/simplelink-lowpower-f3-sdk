@@ -71,6 +71,7 @@ extern "C" {
 #define LAESLINK_ARB_X1     (0U)
 #define LAESLINK_ARB_X2     (1U)
 #define LAESLINK_ARB_X4     (2U)
+#define LAESLINK_ARB_X8     (3U)
 #define LAESLINK_ARB_X16    (4U)
 
 /* Cycle type. A memory scatter-gather task (MEM_SG_ALT) auto-requests, so the

@@ -101,6 +101,13 @@ extern "C" {
 #define LAESLINK_FIFO_WORDS     (7U)
 #define LAESLINK_SLOTS          (2U)
 
+/*! @brief  uDMA channel the transmit sample source runs on
+ *
+ *  A fabric channel, so that the peripheral's event reaches it edge
+ *  detected; the link allocates its control table entry.
+ */
+#define LAESLINK_TX_SAMPLE_CH   (10U)
+
 _Static_assert(LAESLINK_AAD_LEN == 4U, "the B1 layout assumes a 4-byte header");
 _Static_assert(LAESLINK_PAYLOAD_LEN == 16U, "the datapath moves exactly one payload block");
 _Static_assert(LAESLINK_MIC_LEN == 4U, "the MIC is one word of TXT");
@@ -204,15 +211,57 @@ typedef void (*LAESLink_RxCallback)(LAESLink_RxStatus status, uint32_t counter, 
 int_fast16_t LAESLink_txOpen(const LAESLink_Config *cfg, const uint8_t key[LAESLINK_KEY_LEN], LAESLink_TxSink sink);
 
 /*!
+ *  @brief  Attach the sample channel that fills the plaintext ring
+ *
+ *  The sample source is uDMA channel #LAESLINK_TX_SAMPLE_CH, which moves one
+ *  payload, #LAESLINK_PAYLOAD_LEN bytes as 16-bit items in one arbitration,
+ *  from a fixed data register into the ring slot the next packet encrypts.
+ *  Its completion is what starts a packet, so the sample is the clock of the
+ *  link and there is no timer to drift against it.
+ *
+ *  The relay clears the channel's done flag, re-arms it into the next slot
+ *  and enables it again before it starts the packet list on this one, so
+ *  the list owns the ring index: a completion that is missed costs a sample
+ *  and can never leave the two channels encrypting and filling the same
+ *  slot.
+ *
+ *  The channel is a fabric channel, and the application subscribes it to the
+ *  peripheral's event with EVTSVTConfigureDma(). That event must be one the
+ *  peripheral raises once per payload, which for a FIFO means its level
+ *  interrupt with the trigger level set to a whole payload: the fabric
+ *  edge-detects, so one event is one arbitration, where a peripheral
+ *  request line is a level the arbitration has to take down and a level
+ *  that survives it parks the controller. Measured on a CC2755P20: SPI0's
+ *  own receive request line moves one arbitration and then waits for ever,
+ *  while SPI0_COMB published to this channel runs indefinitely.
+ *
+ *  Such an event is latched, so the relay clears it once per payload with
+ *  a write of %ackMask to %ackRegister, after the sample is out of the
+ *  peripheral and the channel is armed again.
+ *
+ *  This programs the channel's control table entry, its DMA.DONEMASK bit
+ *  (which is what publishes its completion to the fabric) and the relay.
+ *  The peripheral stays the application's: it routes the event, enables the
+ *  channel after LAESLink_txStart(), and disables it before
+ *  LAESLink_txStop().
+ *
+ *  @param  dataRegister  The peripheral's receive data register
+ *  @param  ackRegister   Register that clears the peripheral's event
+ *  @param  ackMask       Value written to it, once per payload
+ *
+ *  @pre    LAESLink_txOpen() has returned and LAESLink_txStart() has not
+ *          been called
+ */
+void LAESLink_txAttachSampleSource(uint32_t dataRegister, uint32_t ackRegister, uint32_t ackMask);
+
+/*!
  *  @brief  Enable channels 8 (the packet list) and 9 (the relay)
  *
- *  The relay subscribes to DMA_DONE_COMB by design: the sample channel's
- *  completion is what starts a packet, so the sample is the clock and there
- *  is no timer to drift against it. The application arms the sample channel
- *  after this returns, so that its first completion finds the relay ready,
- *  and sets that channel's bit in DMA.DONEMASK, which is what publishes its
- *  completion to the fabric. Its REQDONE bit is cleared once per packet by
- *  the relay list.
+ *  The relay subscribes to DMA_DONE_COMB by design: it is the sample
+ *  channel's completion that starts a packet. The application enables that
+ *  channel after this returns, so that its first completion finds the relay
+ *  ready; see LAESLink_txAttachSampleSource(). Without a sample source the
+ *  packets come from LAESLink_txKick().
  *
  *  @pre    With the radio sink, the radio command is running
  */
