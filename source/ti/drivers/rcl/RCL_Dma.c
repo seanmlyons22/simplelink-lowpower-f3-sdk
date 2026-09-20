@@ -331,14 +331,30 @@ static void rclDmaConfigureTrigger(uint32_t fcfg5)
  * for. */
 static void rclDmaQuiesce(void)
 {
-    HWREG_WRITE_LRF(LRFDDBELL_BASE + LRFDDBELL_O_DMACFG) = 0U;
-    HWREG_WRITE_LRF(LRFDPBE_BASE + LRFDPBE_O_FCFG5) = LRFDPBE_FCFG5_DMAREQ_NONE |
-                                                      LRFDPBE_FCFG5_DMASREQ_NONE;
+    RCL_Dma_disableTrigger();
 
     for (uint32_t i = 0U; i < RCL_DMA_SETTLE_SPINS; i++)
     {
         (void) uDMAGetChannelSize(RCL_dmaControlTableEntry);
     }
+}
+
+/*
+ *  ======== RCL_Dma_enableRxCommitTrigger ========
+ */
+void RCL_Dma_enableRxCommitTrigger(void)
+{
+    rclDmaConfigureTrigger(LRFDPBE_FCFG5_DMAREQ_RXFIFO_COMMIT | LRFDPBE_FCFG5_DMASREQ_NONE);
+}
+
+/*
+ *  ======== RCL_Dma_disableTrigger ========
+ */
+void RCL_Dma_disableTrigger(void)
+{
+    HWREG_WRITE_LRF(LRFDDBELL_BASE + LRFDDBELL_O_DMACFG) = 0U;
+    HWREG_WRITE_LRF(LRFDPBE_BASE + LRFDPBE_O_FCFG5) = LRFDPBE_FCFG5_DMAREQ_NONE |
+                                                      LRFDPBE_FCFG5_DMASREQ_NONE;
 }
 
 /*

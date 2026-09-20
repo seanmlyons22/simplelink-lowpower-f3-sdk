@@ -59,6 +59,7 @@
 #include DeviceFamily_constructPath(inc/hw_types.h)
 #include DeviceFamily_constructPath(inc/hw_memmap.h)
 #include DeviceFamily_constructPath(inc/pbe_generic_ram_regs.h)
+#include DeviceFamily_constructPath(inc/hw_lrfdpbe.h)
 #include <ti/drivers/rcl/RCL_Dma.h>
 
 /* Packet count at which the PBE ends a burst of its own accord, one word per
@@ -108,6 +109,9 @@ struct
             uint32_t            longRxBufFullCount;
             LRF_SyncSearchCtrl  syncSearchCtrl;
         } nesb;
+        struct {
+            RCL_StopType        stopType;
+        } stream;
     };
 } genericHandlerState;
 
@@ -2163,7 +2167,470 @@ RCL_Events RCL_Handler_Generic_RxBurst(RCL_Command *cmd, LRF_Events lrfEvents, R
     return rclEvents;
 }
 
-#else /* No LRF DMA: the burst commands are not available */
+/*
+ *  ======== rclGenericStreamRequestStop ========
+ *
+ *  Turn a stop request into something the PBE answers, whatever it is doing.
+ *
+ *  A stream keeps the operation-done interrupt masked, since an operation ends
+ *  with every packet and the CPU is not to be woken for it; only an operation
+ *  error is serviced. The end of a stream is therefore announced by nothing
+ *  unless the handler asks for it here. RCL has already written the stop to
+ *  LRFDPBE.API when this runs. The PBE answers a stop written while it runs an
+ *  operation with the operation's end, and a stop written while it is idle
+ *  with an immediate operation done that leaves ENDCAUSE untouched, so an
+ *  operation done is the answer in either case.
+ *
+ *  The dones of every packet sent so far are still latched in the doorbell,
+ *  masked, and would be taken for the answer the moment the mask is lifted,
+ *  so they are cleared first. That clear may also take the answer to the stop
+ *  RCL wrote, which an idle PBE gives within a few cycles, and so the stop is
+ *  written a second time after the mask is lifted: an idle PBE answers it
+ *  again, and a running one already holds it, the API register keeping the
+ *  last value written. At most one answer is left latched at the end of the
+ *  command, and RCL clears the doorbell when a command ends.
+ *
+ *  A hard stop supersedes a graceful one.
+ */
+static void rclGenericStreamRequestStop(RCL_Events rclEventsIn)
+{
+    RCL_StopType stopType = (rclEventsIn.hardStop != 0U) ? RCL_StopType_Hard : RCL_StopType_Graceful;
+
+    if (stopType > genericHandlerState.stream.stopType)
+    {
+        genericHandlerState.stream.stopType = stopType;
+    }
+    LRF_clearHwInterrupt(LRF_EventOpDone.value);
+    LRF_enableHwInterrupt(LRF_EventOpDone.value);
+    if (genericHandlerState.stream.stopType == RCL_StopType_Hard)
+    {
+        LRF_sendHardStop();
+    }
+    else
+    {
+        LRF_sendGracefulStop();
+    }
+}
+
+/*
+ *  ======== rclGenericStreamEndStatus ========
+ *
+ *  Status of a stream whose PBE has reported an operation end. A genuine
+ *  error is reported as such whether or not a stop was under way; otherwise
+ *  the requested stop decides, since the operation that answered it may have
+ *  ended normally, been cut short (ERR_STOP) or finished its packet first
+ *  (EOPSTOP), and all three are the same stop. An end cause of EOPSTOP or
+ *  ERR_STOP with no stop requested here comes from a stop time the scheduler
+ *  delivered straight to the PBE, and maps to the matching stop status.
+ */
+static RCL_CommandStatus rclGenericStreamEndStatus(LRF_Events lrfEvents)
+{
+    RCL_CommandStatus status;
+    uint16_t endCause = LRF_Interface_getCmdEndCause();
+    bool stopped = (endCause == LRF_INTERFACE_ENDCAUSE_STAT_EOPSTOP) ||
+                   (endCause == LRF_INTERFACE_ENDCAUSE_STAT_ERR_STOP);
+
+    if ((lrfEvents.opError != 0U) && !stopped)
+    {
+        status = RCL_Handler_Generic_mapLrfErrorStatusToRclStatus();
+    }
+    else if (genericHandlerState.stream.stopType != RCL_StopType_None)
+    {
+        status = RCL_Scheduler_findStopStatus(genericHandlerState.stream.stopType);
+    }
+    else
+    {
+        status = RCL_Handler_Generic_mapLrfErrorStatusToRclStatus();
+    }
+    return status;
+}
+
+/*
+ *  ======== RCL_Handler_Generic_TxStream ========
+ *
+ *  The handler configures the radio and the FIFO and then does nothing per
+ *  packet. Each packet is a single-packet operation the application starts
+ *  by writing OP_TX to LRFDPBE.API once the entry is in the TX FIFO; with
+ *  OPCFG.START asynchronous the PBE starts on that write. The command ends
+ *  only on a stop or on an operation error.
+ */
+RCL_Events RCL_Handler_Generic_TxStream(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Events rclEventsIn)
+{
+    RCL_CmdGenericTxStream *txCmd = (RCL_CmdGenericTxStream *) cmd;
+    RCL_Events rclEvents = {.value = 0U};
+
+    if (rclEventsIn.setup != 0U)
+    {
+        uint32_t earliestStartTime;
+
+        /* Start by enabling refsys */
+        earliestStartTime = RCL_Handler_Generic_prepareSynth();
+
+        if ((txCmd->rfFrequency == 0U) && (LRF_Interface_Generic_isFreqSynthLocked() == false))
+        {
+            /* Synth not to be programmed, but not already locked */
+            cmd->status = RCL_CommandStatus_Error_Synth;
+            rclEvents.lastCmdDone = 1U;
+        }
+        else
+        {
+            /* Mark as active */
+            cmd->status = RCL_CommandStatus_Active;
+            genericHandlerState.common.endStatus = RCL_CommandStatus_Finished;
+            genericHandlerState.stream.stopType = RCL_StopType_None;
+
+            /* Program the sync word */
+            LRF_Interface_Generic_programSyncWordA(txCmd->syncWord);
+
+            /* Disable NESB. configOpTx is not called: its only other effect
+             * is writing OPCFG, which the stream OPCFG below overwrites. */
+            HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NESB) = PBE_GENERIC_RAM_NESB_NESBMODE_OFF;
+
+            /* Program TX power */
+            if (LRF_programTxPower(txCmd->txPower, txCmd->rfFrequency) != TxPowerResult_Ok)
+            {
+                cmd->status = RCL_CommandStatus_Error_Param;
+                rclEvents.lastCmdDone = 1U;
+            }
+
+            /* One packet per operation, started by the API write itself
+             * rather than by a SysTimer compare, so that the packet leaves a
+             * fixed time after whoever posts it has written the register.
+             * The PLL stays on between operations, and the PBE issues no
+             * FIFO command at the end of a packet: with FCFG0.TXADEAL the
+             * FIFO frees the packet's space as it is modulated, and a FIFO
+             * command from the PBE could land in the same cycle as a data
+             * port push and be lost to it, which is RCL-367 on the transmit
+             * side.
+             *
+             * Every operation runs with the same OPCFG, so a synthesizer
+             * calibration is either in every packet or in none. It is in
+             * none when the synthesizer is already locked (rfFrequency 0,
+             * after an FS command), which is what a stream wants: measured,
+             * the calibration is most of the time from the API write to the
+             * first bit. */
+            uint16_t opcfg = PBE_GENERIC_RAM_OPCFG_SINGLE_EN
+                           | PBE_GENERIC_RAM_OPCFG_START_M
+                           | PBE_GENERIC_RAM_OPCFG_FS_KEEPON_YES
+                           | PBE_GENERIC_RAM_OPCFG_TXFCMD_NONE
+                           | PBE_GENERIC_RAM_OPCFG_NEXTOP_SAME;
+            if (txCmd->rfFrequency != 0U)
+            {
+                opcfg |= PBE_GENERIC_RAM_OPCFG_FS_NOCAL_CAL;
+            }
+            else
+            {
+                opcfg |= PBE_GENERIC_RAM_OPCFG_FS_NOCAL_NOCAL;
+            }
+            HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_OPCFG) = opcfg;
+
+            /* Program fixed packet length */
+            HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_MAXLEN) = txCmd->packetLength;
+
+            /* Program frequency word */
+            if (txCmd->rfFrequency != 0U)
+            {
+                LRF_programFrequency(txCmd->rfFrequency, true);
+            }
+
+            /* Enable radio */
+            if (txCmd->config.enableLRF != 0U)
+            {
+                LRF_enable();
+            }
+
+            /* Reset the FIFO, the one FIFO command of the command's life,
+             * written with the PBE idle. LRF_prepareTxFifo leaves auto
+             * deallocate off because the CPU path retries the FIFO to repeat
+             * a packet; nothing is repeated here, and without it the space of
+             * a sent packet would never come back. */
+            genericHandlerState.common.txFifoSize = (uint16_t) LRF_prepareTxFifo();
+            HWREG_WRITE_LRF(LRFDPBE_BASE + LRFDPBE_O_FCFG0) =
+                HWREG_READ_LRF(LRFDPBE_BASE + LRFDPBE_O_FCFG0) | LRFDPBE_FCFG0_TXADEAL_M;
+
+            /* Reset the transmitted-packet counter, reported through %stats.
+             * The PBE does not clear it between operations. NTXTARGET is
+             * zeroed as well: this PBE image ends an operation when the count
+             * reaches it, the word lies outside the settings image, and a
+             * stream is not to end on a count. */
+            LRF_Interface_Generic_setNumOfTxPackets(0U);
+            HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NTXTARGET) = 0U;
+
+            RCL_CommandStatus startTimeStatus = RCL_Scheduler_setStartStopTimeEarliestStart(cmd, earliestStartTime);
+            if (startTimeStatus >= RCL_CommandStatus_Finished)
+            {
+                cmd->status = startTimeStatus;
+                rclEvents.lastCmdDone = 1U;
+            }
+            else
+            {
+                /* An operation ends with every packet; only an error is of
+                 * interest. Nothing is posted here: the application posts
+                 * every operation. */
+                LRF_enableHwInterrupt(LRF_EventOpError.value);
+                Log_printf(LogModule_RCL, Log_INFO, "RCL_Handler_Generic_TxStream: Radio up (%u Hz)", txCmd->rfFrequency);
+                LRF_waitForTopsmReady();
+                RCL_Profiling_eventHook(RCL_ProfilingEvent_PreprocStop);
+            }
+        }
+    }
+
+    if (cmd->status == RCL_CommandStatus_Active)
+    {
+        if (rclEventsIn.timerStart != 0U)
+        {
+            /* The start time has passed and no operation was waiting for
+             * it, so the compare event is still latched in the PBE. An
+             * operation tests that event as its hard stop, and one started
+             * asynchronously does not consume it, so the first packet would
+             * end with ERR_STOP unless it is cleared here. This is why an
+             * operation may only be posted once the command has started. */
+            HWREGH_WRITE_LRF(LRFDPBE_BASE + LRFDPBE_O_EVTCLR0) = LRFDPBE_EVTCLR0_SYSTCMP0_M;
+            rclEvents.cmdStarted = 1U;
+        }
+
+        if ((lrfEvents.opDone != 0U) || (lrfEvents.opError != 0U))
+        {
+            cmd->status = rclGenericStreamEndStatus(lrfEvents);
+            rclEvents.lastCmdDone = 1U;
+            RCL_Profiling_eventHook(RCL_ProfilingEvent_PostprocStart);
+        }
+        else if ((rclEventsIn.gracefulStop != 0U) || (rclEventsIn.hardStop != 0U))
+        {
+            rclGenericStreamRequestStop(rclEventsIn);
+        }
+        else
+        {
+            /* Other events */
+        }
+    }
+
+    if (rclEvents.lastCmdDone != 0U)
+    {
+        if (txCmd->stats != NULL)
+        {
+            uint16_t nTx = (uint16_t) HWREG_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NTX);
+
+            if (txCmd->stats->config.accumulate == 0U)
+            {
+                txCmd->stats->nTx = nTx;
+            }
+            else
+            {
+                txCmd->stats->nTx += nTx;
+            }
+        }
+
+        if (txCmd->config.disableLRF != 0U)
+        {
+            LRF_disable();
+        }
+        RCL_Handler_Generic_setSynthPowerState((bool) txCmd->config.fsOff);
+    }
+
+    return rclEvents;
+}
+
+/*
+ *  ======== RCL_Handler_Generic_RxStream ========
+ *
+ *  One repeated RX operation for the life of the command. The PBE re-arms
+ *  sync search after every packet and commits each entry to the RX FIFO,
+ *  and the commit is routed to the LRF DMA trigger for the application's
+ *  channel to take the entry out. The command ends only on a stop or on an
+ *  operation error.
+ */
+RCL_Events RCL_Handler_Generic_RxStream(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Events rclEventsIn)
+{
+    RCL_CmdGenericRxStream *rxCmd = (RCL_CmdGenericRxStream *) cmd;
+    RCL_Events rclEvents = {.value = 0U};
+
+    if (rclEventsIn.setup != 0U)
+    {
+        uint32_t earliestStartTime;
+
+        /* Start by enabling refsys */
+        earliestStartTime = RCL_Handler_Generic_prepareSynth();
+
+        if ((rxCmd->rfFrequency == 0U) && (LRF_Interface_Generic_isFreqSynthLocked() == false))
+        {
+            /* Synth not to be programmed, but not already locked */
+            cmd->status = RCL_CommandStatus_Error_Synth;
+            rclEvents.lastCmdDone = 1U;
+        }
+        else
+        {
+            /* Mark as active */
+            cmd->status = RCL_CommandStatus_Active;
+            genericHandlerState.common.endStatus = RCL_CommandStatus_Finished;
+            genericHandlerState.stream.stopType = RCL_StopType_None;
+
+            /* Program the sync word */
+            LRF_Interface_Generic_programSyncWordA(rxCmd->syncWord);
+
+            /* A repeated RX operation with no timeouts: the PBE goes back to
+             * sync search after each packet and receives whatever arrives,
+             * for as long as the command runs. OPCFG.TXFCMD is left at NONE
+             * by this, so the PBE issues no TX FIFO command at the end of a
+             * packet.
+             *
+             * The operation always turns the synthesizer off when it ends,
+             * whatever config.fsOff says about the power state afterwards.
+             * There is only one operation, so nothing is kept on for; and a
+             * stop in sync search relies on it: the PBE's end routine waits
+             * for the RFE to report, the RFE reports its RX command only
+             * once told to stop, and it is told to stop only when the
+             * synthesizer is not kept on. With it kept on, a stop that lands
+             * in sync search leaves the PBE waiting forever; measured. */
+            LRF_Interface_Generic_configOpRx(1U, rxCmd->rfFrequency, 1U, rxCmd->packetLength);
+            HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_SEQSTAT0) = PBE_GENERIC_RAM_SEQSTAT0_STOPAUTO_NEVER;
+
+            /* Nothing is appended to an entry. The RF settings append status,
+             * RSSI and timestamp bytes; with them off an entry is the length
+             * field, the pad and the payload, which is what the application
+             * arms one transfer for. */
+            uint16_t fifoCfg = (uint16_t) HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_FIFOCFG);
+            fifoCfg &= (uint16_t) ~(PBE_GENERIC_RAM_FIFOCFG_APPENDCRC_M |
+                                    PBE_GENERIC_RAM_FIFOCFG_APPENDSTATUS_M |
+                                    PBE_GENERIC_RAM_FIFOCFG_APPENDLQI_M |
+                                    PBE_GENERIC_RAM_FIFOCFG_APPENDFREQEST_M |
+                                    PBE_GENERIC_RAM_FIFOCFG_APPENDRSSI_M |
+                                    PBE_GENERIC_RAM_FIFOCFG_APPENDTIMESTAMP_M);
+            HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_FIFOCFG) = fifoCfg;
+            HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_EXTRABYTES) = 0U;
+
+            /* Reset the received-packet counters, reported through %stats.
+             * NRXTARGET is zeroed as well: this PBE image ends an operation
+             * when the count reaches it, the word lies outside the settings
+             * image, and a stream is not to end on a count. */
+            LRF_Interface_Generic_setNumOfRxOkPackets(0U);
+            LRF_Interface_Generic_setNumOfNotRxOkPackets(0U);
+            HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NRXTARGET) = 0U;
+
+            /* Program frequency word */
+            if (rxCmd->rfFrequency != 0U)
+            {
+                LRF_programFrequency(rxCmd->rfFrequency, false);
+            }
+
+            /* Enable radio */
+            if (rxCmd->config.enableLRF != 0U)
+            {
+                LRF_enable();
+            }
+
+            /* Reset the FIFO, then work out the footprint of one entry as
+             * the PBE will write it: the numPad field (1), the optional
+             * padding and header, the payload and whatever is appended, now
+             * nothing, plus the 2-byte length field, rounded up to a word.
+             * The envelope inputs come from the settings-programmed
+             * registers, so nothing here is PHY-specific. */
+            genericHandlerState.common.rxFifoSize = (uint16_t) LRF_prepareRxFifo();
+
+            uint16_t rxOpCfg = (uint16_t) HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_OPCFG);
+            uint32_t rxOptPad = ((uint32_t) fifoCfg & PBE_GENERIC_RAM_FIFOCFG_LENOPTPAD_M) >> PBE_GENERIC_RAM_FIFOCFG_LENOPTPAD_S;
+            uint32_t rxHdrBytes = 0U;
+
+            if ((rxOpCfg & PBE_GENERIC_RAM_OPCFG_RXINCLUDEHDR_M) != 0U)
+            {
+                uint16_t rxPktCfg = (uint16_t) HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_PKTCFG);
+                uint32_t rxNumHdrBits = ((uint32_t) rxPktCfg & PBE_GENERIC_RAM_PKTCFG_NUMHDRBITS_M) >> PBE_GENERIC_RAM_PKTCFG_NUMHDRBITS_S;
+                rxHdrBytes = (rxNumHdrBits + 7U) / 8U;
+            }
+            rxCmd->entryBytes = (uint16_t) RCL_Buffer_DataEntry_paddedLen(1U + rxOptPad + rxHdrBytes + (uint32_t) rxCmd->packetLength);
+
+            /* Give the PBE the whole FIFO with one pointer write now, while
+             * it is not running, and let auto deallocate keep the space
+             * open from then on: reading through the data port moves RXFRP
+             * but not RXFSRP, and FCFG0.RXADEAL moves RXFSRP after it. No
+             * FIFO pointer is written while a packet can be on the air. */
+            LRF_setRxFifoEffSz(genericHandlerState.common.rxFifoSize);
+            HWREG_WRITE_LRF(LRFDPBE_BASE + LRFDPBE_O_FCFG0) =
+                HWREG_READ_LRF(LRFDPBE_BASE + LRFDPBE_O_FCFG0) | LRFDPBE_FCFG0_RXADEAL_M;
+
+            /* One DMA request per committed entry, for the application's
+             * channel */
+            RCL_Dma_enableRxCommitTrigger();
+
+            RCL_CommandStatus startTimeStatus = RCL_Scheduler_setStartStopTimeEarliestStart(cmd, earliestStartTime);
+            if (startTimeStatus >= RCL_CommandStatus_Finished)
+            {
+                cmd->status = startTimeStatus;
+                rclEvents.lastCmdDone = 1U;
+            }
+            else
+            {
+                /* Only an operation error is of interest; the CPU is idle
+                 * between packets. */
+                LRF_enableHwInterrupt(LRF_EventOpError.value);
+
+                Log_printf(LogModule_RCL, Log_INFO, "RCL_Handler_Generic_RxStream: Starting RX (%u Hz)", rxCmd->rfFrequency);
+                LRF_waitForTopsmReady();
+                RCL_Profiling_eventHook(RCL_ProfilingEvent_PreprocStop);
+                LRF_Interface_Generic_sendOpRx();
+            }
+        }
+    }
+
+    if (cmd->status == RCL_CommandStatus_Active)
+    {
+        if (rclEventsIn.timerStart != 0U)
+        {
+            rclEvents.cmdStarted = 1U;
+        }
+
+        if ((lrfEvents.opDone != 0U) || (lrfEvents.opError != 0U))
+        {
+            cmd->status = rclGenericStreamEndStatus(lrfEvents);
+            rclEvents.lastCmdDone = 1U;
+            RCL_Profiling_eventHook(RCL_ProfilingEvent_PostprocStart);
+        }
+        else if ((rclEventsIn.gracefulStop != 0U) || (rclEventsIn.hardStop != 0U))
+        {
+            rclGenericStreamRequestStop(rclEventsIn);
+        }
+        else
+        {
+            /* Other events */
+        }
+    }
+
+    if (rclEvents.lastCmdDone != 0U)
+    {
+        /* The trigger has to go with the command: once the FIFO is empty
+         * the selected condition holds again and the request would stay
+         * asserted with nothing to serve. The channel is the
+         * application's and is left alone. */
+        RCL_Dma_disableTrigger();
+
+        if (rxCmd->stats != NULL)
+        {
+            uint16_t nRxOk = HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NRXOK);
+            uint16_t nRxNok = HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NRXNOK);
+
+            if (rxCmd->stats->config.accumulate == 0U)
+            {
+                rxCmd->stats->nRxOk = nRxOk;
+                rxCmd->stats->nRxNok = nRxNok;
+            }
+            else
+            {
+                rxCmd->stats->nRxOk += nRxOk;
+                rxCmd->stats->nRxNok += nRxNok;
+            }
+        }
+
+        if (rxCmd->config.disableLRF != 0U)
+        {
+            LRF_disable();
+        }
+        RCL_Handler_Generic_setSynthPowerState((bool) rxCmd->config.fsOff);
+    }
+
+    return rclEvents;
+}
+
+#else /* No LRF DMA: the burst and stream commands are not available */
 
 RCL_Events RCL_Handler_Generic_TxBurst(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Events rclEventsIn)
 {
@@ -2180,6 +2647,34 @@ RCL_Events RCL_Handler_Generic_TxBurst(RCL_Command *cmd, LRF_Events lrfEvents, R
 }
 
 RCL_Events RCL_Handler_Generic_RxBurst(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Events rclEventsIn)
+{
+    RCL_Events rclEvents = {.value = 0U};
+    (void) lrfEvents;
+
+    if (rclEventsIn.setup != 0U)
+    {
+        cmd->status = RCL_CommandStatus_Error_Param;
+        rclEvents.lastCmdDone = 1U;
+    }
+
+    return rclEvents;
+}
+
+RCL_Events RCL_Handler_Generic_TxStream(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Events rclEventsIn)
+{
+    RCL_Events rclEvents = {.value = 0U};
+    (void) lrfEvents;
+
+    if (rclEventsIn.setup != 0U)
+    {
+        cmd->status = RCL_CommandStatus_Error_Param;
+        rclEvents.lastCmdDone = 1U;
+    }
+
+    return rclEvents;
+}
+
+RCL_Events RCL_Handler_Generic_RxStream(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Events rclEventsIn)
 {
     RCL_Events rclEvents = {.value = 0U};
     (void) lrfEvents;

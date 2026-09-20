@@ -223,6 +223,35 @@ uint32_t RCL_Dma_finishRxBurst(const uint8_t **firstEntry);
  *  @note This function is intended as internal to RCL and its handlers
  */
 void RCL_Dma_stop(void);
+
+/**
+ *  @brief  Route the RX FIFO commit to the LRF DMA trigger
+ *
+ *  Selects FCFG5.DMAREQ = RXFIFO_COMMIT and enables the LRFD DMA trigger with
+ *  the FIFO as its source, so that the DMA channel subscribed to LRFDTRG gets
+ *  one request per entry the PBE commits. Nothing is done to any DMA channel:
+ *  the channel, its transfer and its re-arming belong to the caller. Used by
+ *  the RX stream command, whose drain is the application's.
+ *
+ *  These are LRF configuration registers and not FIFO accesses, so this may
+ *  be called with the PBE running.
+ *
+ *  @note This function is intended as internal to RCL and its handlers
+ */
+void RCL_Dma_enableRxCommitTrigger(void);
+
+/**
+ *  @brief  Take the LRF DMA trigger away
+ *
+ *  Disables the LRFD DMA trigger and selects no FIFO condition, to be called
+ *  when a command that routed the trigger ends. The selected condition is true
+ *  again as soon as the radio has drained the FIFO, so a trigger left routed
+ *  keeps its request asserted with nothing to serve and the channel waits on
+ *  it forever; see %RCL_Dma_stop.
+ *
+ *  @note This function is intended as internal to RCL and its handlers
+ */
+void RCL_Dma_disableTrigger(void);
 /** @}
  */
 

@@ -43,6 +43,8 @@ RCL_Events RCL_Handler_Generic_Tx(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Ev
 RCL_Events RCL_Handler_Generic_TxRepeat(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Events rclEventsIn);
 RCL_Events RCL_Handler_Generic_TxBurst(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Events rclEventsIn);
 RCL_Events RCL_Handler_Generic_RxBurst(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Events rclEventsIn);
+RCL_Events RCL_Handler_Generic_TxStream(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Events rclEventsIn);
+RCL_Events RCL_Handler_Generic_RxStream(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Events rclEventsIn);
 RCL_Events RCL_Handler_Generic_TxTest(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Events rclEventsIn);
 RCL_Events RCL_Handler_Generic_Rx(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Events rclEventsIn);
 RCL_Events RCL_Handler_Generic_LrfOperation(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Events rclEventsIn);

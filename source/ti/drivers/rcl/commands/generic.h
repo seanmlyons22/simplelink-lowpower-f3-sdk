@@ -47,12 +47,16 @@ typedef struct RCL_CMD_GENERIC_TX_t            RCL_CmdGenericTx;
 typedef struct RCL_CMD_GENERIC_TX_REPEAT_t     RCL_CmdGenericTxRepeat;
 typedef struct RCL_CMD_GENERIC_TX_BURST_t      RCL_CmdGenericTxBurst;
 typedef struct RCL_CMD_GENERIC_RX_BURST_t      RCL_CmdGenericRxBurst;
+typedef struct RCL_CMD_GENERIC_TX_STREAM_t     RCL_CmdGenericTxStream;
+typedef struct RCL_CMD_GENERIC_RX_STREAM_t     RCL_CmdGenericRxStream;
 typedef struct RCL_CMD_GENERIC_TX_TEST_t       RCL_CmdGenericTxTest;
 typedef struct RCL_CMD_GENERIC_RX_t            RCL_CmdGenericRx;
 typedef struct RCL_CMD_GENERIC_LRF_OPERATION_t RCL_CmdGenericLrfOperation;
 typedef struct RCL_STATS_GENERIC_t             RCL_StatsGeneric;
 typedef struct RCL_STATS_GENERIC_TX_BURST_t    RCL_StatsGenericTxBurst;
 typedef struct RCL_STATS_GENERIC_RX_BURST_t    RCL_StatsGenericRxBurst;
+typedef struct RCL_STATS_GENERIC_TX_STREAM_t   RCL_StatsGenericTxStream;
+typedef struct RCL_STATS_GENERIC_RX_STREAM_t   RCL_StatsGenericRxStream;
 typedef struct RCL_CMD_NESB_PTX_t              RCL_CmdNesbPtx;
 typedef struct RCL_CMD_NESB_PRX_t              RCL_CmdNesbPrx;
 typedef struct RCL_STATS_NESB_t                RCL_StatsNesb;
@@ -70,6 +74,8 @@ typedef struct RCL_CONFIG_ADDRESS_t            RCL_ConfigAddress;
 #define RCL_CMDID_NESB_PRX              0x0009U
 #define RCL_CMDID_GENERIC_TX_BURST      0x000DU
 #define RCL_CMDID_GENERIC_RX_BURST      0x000EU
+#define RCL_CMDID_GENERIC_TX_STREAM     0x000FU
+#define RCL_CMDID_GENERIC_RX_STREAM     0x0010U
 
 
 /**
@@ -620,6 +626,160 @@ struct RCL_STATS_GENERIC_RX_BURST_t {
     .nRxOk = 0,                           \
 }
 #define RCL_StatsGenericRxBurst_DefaultRuntime() (RCL_StatsGenericRxBurst) RCL_StatsGenericRxBurst_Default()
+
+/**
+ *  @brief TX stream command
+ *
+ *  Holds the radio up and configured for transmission and never posts an
+ *  operation of its own. Every packet is one single-packet PBE operation
+ *  that the application, or a DMA task working for it, starts by pushing an
+ *  entry into the TX FIFO through the LRFDTXF data port and writing OP_TX to
+ *  LRFDPBE.API; OPCFG.START is asynchronous, so the operation starts on that
+ *  write and not on a SysTimer compare, and the packet is on the air a fixed
+ *  time after the write. The CPU is not involved per packet: only the end of
+ *  the command is serviced.
+ *
+ *  The FIFO is prepared once and issues no command afterwards. FCFG0.TXACOM
+ *  commits every pushed word and FCFG0.TXADEAL frees a packet as the
+ *  modulator consumes it, so neither the PBE (OPCFG.TXFCMD is NONE) nor the
+ *  CPU writes LRFDPBE.FCMD while the command runs. That is what keeps RCL-367
+ *  off the transmit path: the defect needs a FIFO command and a data port
+ *  access in consecutive cycles, and there is no FIFO command.
+ *
+ *  Post the first operation only after the command has started
+ *  (%RCL_EventCmdStarted): the PBE takes the command's start time compare as
+ *  the hard stop of an operation that is already running. Post the next only
+ *  once the previous operation has ended: the PBE rejects an operation
+ *  written while one is running as a bad operation, which ends the command.
+ *  With %rfFrequency set every operation calibrates the synthesizer first;
+ *  run an FS command before this one and leave %rfFrequency 0 for the
+ *  operations to skip it.
+ *
+ *  The command stays active until it is stopped or the PBE reports an
+ *  operation error. A graceful stop lets an operation in flight finish; a
+ *  hard stop ends it. Stop posting before stopping the command: an operation
+ *  posted after the stop is requested is not accounted for, and a hard stop
+ *  that lands in the first microseconds of an operation, before the RFE has
+ *  brought the PA up (about 9 us after the API write), leaves the PBE
+ *  waiting in its end routine for an RFE report that never comes, with no
+ *  recovery short of resetting the LRF; measured. Prefer the graceful stop.
+ *
+ *  @note CC27XX only. Other devices end the command with RCL_CommandStatus_Error_Param.
+ */
+struct RCL_CMD_GENERIC_TX_STREAM_t {
+    RCL_Command          common;
+    uint32_t             rfFrequency;     /*!< RF frequency in Hz to program. 0: Do not program frequency */
+    uint32_t             syncWord;        /*!< Sync word to transmit */
+    uint16_t             packetLength;    /*!< Payload bytes per packet */
+    RCL_Command_TxPower  txPower;         /*!< Transmit power */
+    struct {
+        uint8_t          fsOff: 1;        /*!< 0: Keep PLL enabled after command. 1: Turn off FS after command. */
+        uint8_t          enableLRF: 1;    /*!< 1: call LRF_enable() at command start. 0: assume the LRF is already enabled by a previous command */
+        uint8_t          disableLRF: 1;   /*!< 1: call LRF_disable() at command end. 0: leave the LRF enabled for a following command */
+        uint8_t          reserved: 5;     /*!< Reserved, set to 0 */
+    } config;
+    RCL_StatsGenericTxStream *stats;      /*!< Pointer to statistics structure. NULL: Do not store statistics */
+};
+#define RCL_CmdGenericTxStream_Default()                          \
+{                                                                  \
+    .common = RCL_Command_Default(RCL_CMDID_GENERIC_TX_STREAM,    \
+                                  RCL_Handler_Generic_TxStream),  \
+    .rfFrequency = 2440000000U,                                   \
+    .syncWord = 0x930B51DE,                                       \
+    .packetLength = 24,                                           \
+    .txPower = {.dBm = 0, .fraction = 0},                         \
+    .config = {                                                   \
+        .fsOff = 0,                                               \
+        .enableLRF = 1,                                           \
+        .disableLRF = 1,                                          \
+        .reserved = 0,                                            \
+    },                                                            \
+    .stats = NULL,                                                \
+}
+#define RCL_CmdGenericTxStream_DefaultRuntime() (RCL_CmdGenericTxStream) RCL_CmdGenericTxStream_Default()
+
+/**
+ *  @brief RX stream command
+ *
+ *  Runs one repeated RX operation for as long as the command is active: the
+ *  PBE re-arms sync search after every packet on its own, without timeouts,
+ *  and commits each received entry to the RX FIFO. The command routes the RX
+ *  FIFO commit to the LRF DMA trigger, so the application's DMA channel gets
+ *  one request per committed entry and takes the entry out through
+ *  LRFDPBE.RXFHRD; the command itself never touches a DMA channel. The
+ *  appended status, RSSI, LQI, frequency estimate and timestamp bytes are
+ *  turned off, so an entry is the length field, the pad and the payload and
+ *  nothing else, and %entryBytes reports its size for the application to
+ *  check against what it arms.
+ *
+ *  FCFG0.RXADEAL gives the FIFO space back as the entry is read, so no FIFO
+ *  pointer is written while the operation is on the air. The CPU is not
+ *  involved per packet: only the end of the command is serviced.
+ *
+ *  @note CC27XX only. Other devices end the command with RCL_CommandStatus_Error_Param.
+ */
+struct RCL_CMD_GENERIC_RX_STREAM_t {
+    RCL_Command             common;
+    uint32_t                rfFrequency;            /*!< RF frequency in Hz. 0: do not program frequency */
+    uint32_t                syncWord;               /*!< Sync word to match */
+    uint16_t                packetLength;           /*!< Payload bytes per packet */
+    uint16_t                entryBytes;             /*!< Written by the handler at setup: bytes of one entry in the RX FIFO, padded to a word */
+    RCL_StatsGenericRxStream *stats;                /*!< Pointer to statistics structure. NULL: Do not store statistics */
+    struct {
+        uint8_t             fsOff:     1;           /*!< 0: keep PLL after command. 1: turn off FS after command */
+        uint8_t             enableLRF: 1;           /*!< 1: call LRF_enable() at command start. 0: assume the LRF is already enabled by a previous command */
+        uint8_t             disableLRF:1;           /*!< 1: call LRF_disable() at command end. 0: leave the LRF enabled for a following command */
+        uint8_t             reserved:  5;           /*!< Reserved, set to 0 */
+    } config;
+};
+
+#define RCL_CmdGenericRxStream_Default()                                        \
+{                                                                               \
+    .common = RCL_Command_Default(RCL_CMDID_GENERIC_RX_STREAM,                  \
+                                  RCL_Handler_Generic_RxStream),                \
+    .rfFrequency          = 2440000000U,                                        \
+    .syncWord             = 0x930B51DEU,                                        \
+    .packetLength         = 24U,                                                \
+    .entryBytes           = 0U,                                                 \
+    .stats                = NULL,                                               \
+    .config = { .fsOff = 0, .enableLRF = 1, .disableLRF = 1, .reserved = 0 },   \
+}
+#define RCL_CmdGenericRxStream_DefaultRuntime() \
+    (RCL_CmdGenericRxStream) RCL_CmdGenericRxStream_Default()
+
+struct RCL_STATS_GENERIC_TX_STREAM_t {
+    struct
+    {
+        uint8_t accumulate : 1;  /*!< 0: Reset counter to 0 at start of command. 1: Add to incoming value of counter. */
+        uint8_t reserved : 7;    /*!< Reserved, set to 0 */
+    } config;                    /*!< Configuration provided to RCL */
+    uint16_t nTx;                /*!< Number of packets transmitted */
+};
+
+#define RCL_StatsGenericTxStream_Default() \
+{                                          \
+    .config = { 0 },                       \
+    .nTx = 0,                              \
+}
+#define RCL_StatsGenericTxStream_DefaultRuntime() (RCL_StatsGenericTxStream) RCL_StatsGenericTxStream_Default()
+
+struct RCL_STATS_GENERIC_RX_STREAM_t {
+    struct
+    {
+        uint8_t accumulate : 1;  /*!< 0: Reset counters to 0 at start of command. 1: Add to incoming value of counters. */
+        uint8_t reserved : 7;    /*!< Reserved, set to 0 */
+    } config;                    /*!< Configuration provided to RCL */
+    uint16_t nRxOk;              /*!< Number of packets received with correct CRC */
+    uint16_t nRxNok;             /*!< Number of packets received with CRC error */
+};
+
+#define RCL_StatsGenericRxStream_Default() \
+{                                          \
+    .config = { 0 },                       \
+    .nRxOk = 0,                            \
+    .nRxNok = 0,                           \
+}
+#define RCL_StatsGenericRxStream_DefaultRuntime() (RCL_StatsGenericRxStream) RCL_StatsGenericRxStream_Default()
 
 
 #endif /* ti_drivers_rcl_commands_generic__include */
