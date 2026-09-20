@@ -213,6 +213,21 @@ uint8_t rclRegulatoryMask = `regulatoryMask`;
 %}
 %}
 
+%if (rclStatic.lrfDma) {
+/*
+ * ======== RCL DMA Channel Configuration ========
+ */
+#include <ti/drivers/dma/UDMALPF3.h>
+#include DeviceFamily_constructPath(driverlib/evtsvt.h)
+
+% let dmaChNumber = rclStatic.lrfDma.dmaChannel.$solution.devicePinName.replace("DMA_CH", "");
+ALLOCATE_CONTROL_TABLE_ENTRY(dmaChannel`dmaChNumber`ControlTableEntry, `dmaChNumber`);
+
+volatile uDMAControlTableEntry *RCL_dmaControlTableEntry = &dmaChannel`dmaChNumber`ControlTableEntry;
+uint32_t RCL_dmaChannelMask = (uint32_t)0x01UL << `dmaChNumber`;
+uint32_t RCL_dmaChannelSubscriberId = EVTSVT_DMA_CH`dmaChNumber`;
+%}
+
 %if (rclStatic.pbeGpoMask != 0) {
 /*
  * ======== RCL Antenna Configuration ========

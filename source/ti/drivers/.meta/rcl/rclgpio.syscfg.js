@@ -974,6 +974,27 @@ function pinmuxRequirements(inst) {
         rclArray.push(lrfGpio);
     }
 
+    /* On CC27XX the LRF FIFO data path is run by the system DMA. The LRF
+     * trigger reaches only DMA channel 2 and 4, so let the pinmux solver pick
+     * one and report a conflict if both are taken by other drivers.
+     */
+    if (getDeviceType() == "CC27"){
+        let lrfDma = {
+            name          : "lrfDma",
+            readOnly      : true,
+            displayName   : "LRF DMA",
+            interfaceName : "LRF",
+            canShareWith  : "LRF",
+            resources     : [{
+                name           : "dmaChannel",
+                displayName    : "DMA LRF Channel",
+                description    : "DMA channel used for the LRF TX and RX FIFO",
+                interfaceNames : ["TRG"]
+            }]
+        };
+        rclArray.push(lrfDma);
+    }
+
     return rclArray;
 }
 
@@ -1097,6 +1118,12 @@ function sharedModuleInstances(inst){
 function modules(inst) {
 
     let dependencies = ["Board", "Power", "Temperature"];
+
+    /* On CC27XX the LRF FIFO data path is run by the system DMA */
+    if (getDeviceType() == "CC27")
+    {
+        dependencies.push("DMA");
+    }
 
     /* For CC27XX P devices, the PA ESD protection feature requires
      * reading the VDDS voltage from BATMON. This adds a dependency
