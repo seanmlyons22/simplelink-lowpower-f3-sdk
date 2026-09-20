@@ -93,6 +93,15 @@ foreach(TI_PLATFORM ${SUPPORTED_PLATFORMS})
     target_compile_definitions(rcl_${TI_PLATFORM}_log PRIVATE ti_log_Log_ENABLE)
     # Set module-level Log include switch for this library
     target_compile_definitions(rcl_${TI_PLATFORM}_log PRIVATE ti_log_Log_ENABLE_LogModule_RCL=1)
+
+    # Optional scope instrumentation of the DMA data path, off by default: the
+    # burst is run as a uDMA task list that toggles a pin as each entry crosses
+    # the LRF FIFO. Configure with -DRCL_DMA_DEBUG=ON to build it in, and build
+    # the application with the same define. See RCL_Dma.h.
+    if(RCL_DMA_DEBUG)
+        target_compile_definitions(rcl_${TI_PLATFORM} PRIVATE RCL_DMA_DEBUG)
+        target_compile_definitions(rcl_${TI_PLATFORM}_log PRIVATE RCL_DMA_DEBUG)
+    endif()
 endforeach()
 
 ti_export_package()
