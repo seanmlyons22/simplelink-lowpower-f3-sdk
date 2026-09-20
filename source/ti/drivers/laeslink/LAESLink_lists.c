@@ -295,7 +295,7 @@ uint32_t LAESLink_buildTxRelay(LAESLink_TxState *state, uint32_t slot, uint32_t 
     LAESLink_listPush(&b, LAESLink_word(bit, DMA_REG(DMA_O_REQDONE)), LAESLink_Flow_Continue);
     /* Re-arm it into the next slot, never the one about to be encrypted */
     LAESLink_listPush(&b,
-                      LAESLink_block(LAESLink_addr(&state->prim1[4U * next]),
+                      LAESLink_block(LAESLink_addr(&state->primSample[4U * next]),
                                      LAESLink_entryStartAddr(LAESLink_primary(LAESLINK_TX_SAMPLE_CH))),
                       LAESLink_Flow_Continue);
     LAESLink_listPush(&b, LAESLink_word(bit, DMA_REG(DMA_O_SETCHANNELEN)), LAESLink_Flow_Continue);

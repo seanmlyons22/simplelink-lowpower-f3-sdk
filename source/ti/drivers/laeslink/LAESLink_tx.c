@@ -63,8 +63,11 @@ static struct
  */
 #define STOP_POLL_LIMIT (20000U)
 
-/* Channel mask of the sample source */
+/* Channel mask of the sample source. The event routing below names the
+ * fabric channel register by number.
+ */
 #define LAESLINK_SAMPLE_MASK (1UL << LAESLINK_TX_SAMPLE_CH)
+_Static_assert(LAESLINK_TX_SAMPLE_CH == 10U, "the sample event is routed through DMACH10SEL");
 
 /*
  *  ======== completedCounter ========
@@ -181,8 +184,15 @@ int_fast16_t LAESLink_txOpen(const LAESLink_Config *cfg, const uint8_t key[LAESL
 
 /*
  *  ======== LAESLink_txAttachSampleSource ========
+ *  Why a fabric channel and not the peripheral's own request line: a
+ *  peripheral request is a level the arbitration has to take down, and a
+ *  level that survives it parks the controller. Measured on a CC2755P20
+ *  against an SPI master at 5 kHz, SPI0's receive request line moved one
+ *  arbitration and then waited for ever, whatever the arbitration size and
+ *  the FIFO trigger level; SPI0_COMB published to channel 10, edge detected
+ *  by the fabric, ran indefinitely.
  */
-void LAESLink_txAttachSampleSource(uint32_t dataRegister, uint32_t ackRegister, uint32_t ackMask)
+void LAESLink_txAttachSampleSource(uint32_t dataRegister, uint32_t ackRegister, uint32_t ackMask, uint32_t publisher)
 {
     txState.consts[LAESLINK_TXC_BIT_SAMPLE] = LAESLINK_SAMPLE_MASK;
     txState.consts[LAESLINK_TXC_ACK]        = ackMask;
@@ -190,16 +200,19 @@ void LAESLink_txAttachSampleSource(uint32_t dataRegister, uint32_t ackRegister, 
     /* One payload per arbitration, because one event is one arbitration */
     for (uint32_t slot = 0U; slot < LAESLINK_SLOTS; slot++)
     {
-        LAESLink_setImage(&txState.prim1[4U * slot],
+        LAESLink_setImage(&txState.primSample[4U * slot],
                  LAESLink_transfer(dataRegister, LAESLink_addr(&txState.slots[4U * slot]),
                                    LAESLINK_PAYLOAD_LEN / 2U, LAESLINK_SIZE_HALF, LAESLINK_INC_NONE,
                                    LAESLINK_INC_HALF, LAESLINK_ARB_X8, LAESLINK_MODE_BASIC));
     }
     buildRelay(ackRegister, true);
-    LAESLink_writeEntry(LAESLink_primary(LAESLINK_TX_SAMPLE_CH), LAESLink_imageTask(txState.prim1));
-    /* The done mask is what the relay listens through */
+    LAESLink_writeEntry(LAESLink_primary(LAESLINK_TX_SAMPLE_CH), LAESLink_imageTask(txState.primSample));
+    /* The done mask is what the relay listens through. Writing DMACHnSEL
+     * clears EDGDETDIS, so the event becomes one request per rising edge.
+     */
     LAESLink_channelsReset(LAESLINK_SAMPLE_MASK);
     LAESLink_doneMaskSet(LAESLINK_SAMPLE_MASK);
+    EVTSVTConfigureDma(EVTSVT_DMA_CH10, publisher);
     tx.sampleAttached = true;
 }
 

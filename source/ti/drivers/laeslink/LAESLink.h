@@ -38,8 +38,10 @@
  *  @anchor ti_drivers_laeslink_Overview
  *  # Overview #
  *
- *  Transmit: a software request (from a relay channel, or from the CPU)
- *  starts a peripheral scatter-gather task list on uDMA channel 8. The list
+ *  Transmit: a sample source (a peripheral whose event, published to uDMA
+ *  channel 10, lands one payload in the plaintext ring; its completion runs
+ *  the relay on channel 9) or a software request starts a peripheral
+ *  scatter-gather task list on uDMA channel 8. The list
  *  writes the CCM blocks into the LAES, waits for each AESDONE through the
  *  event fabric, moves the ciphertext from TXT straight into the radio TX
  *  FIFO, forms the MIC with the TXTX hardware XOR, posts the PBE operation
@@ -225,34 +227,29 @@ int_fast16_t LAESLink_txOpen(const LAESLink_Config *cfg, const uint8_t key[LAESL
  *  and can never leave the two channels encrypting and filling the same
  *  slot.
  *
- *  The channel is a fabric channel, and the application subscribes it to the
- *  peripheral's event with EVTSVTConfigureDma(). That event must be one the
- *  peripheral raises once per payload, which for a FIFO means its level
- *  interrupt with the trigger level set to a whole payload: the fabric
- *  edge-detects, so one event is one arbitration, where a peripheral
- *  request line is a level the arbitration has to take down and a level
- *  that survives it parks the controller. Measured on a CC2755P20: SPI0's
- *  own receive request line moves one arbitration and then waits for ever,
- *  while SPI0_COMB published to this channel runs indefinitely.
- *
- *  Such an event is latched, so the relay clears it once per payload with
- *  a write of %ackMask to %ackRegister, after the sample is out of the
- *  peripheral and the channel is armed again.
+ *  The channel is a fabric channel and this routes the peripheral's event
+ *  to it. That event must be one the peripheral raises once per payload,
+ *  which for a FIFO means its level interrupt with the trigger level set to
+ *  a whole payload: the fabric edge-detects, so one event is one
+ *  arbitration. Such an event is latched, so the relay clears it once per
+ *  payload with a write of ackMask to ackRegister, after the sample is out
+ *  of the peripheral and the channel is armed again.
  *
  *  This programs the channel's control table entry, its DMA.DONEMASK bit
- *  (which is what publishes its completion to the fabric) and the relay.
- *  The peripheral stays the application's: it routes the event, enables the
- *  channel after LAESLink_txStart(), and disables it before
+ *  (which is what publishes its completion to the fabric), its event
+ *  routing and the relay. The peripheral stays the application's: it
+ *  enables the channel after LAESLink_txStart() and disables it before
  *  LAESLink_txStop().
  *
  *  @param  dataRegister  The peripheral's receive data register
  *  @param  ackRegister   Register that clears the peripheral's event
  *  @param  ackMask       Value written to it, once per payload
+ *  @param  publisher     The event, an EVTSVT_PUB_* publisher id
  *
  *  @pre    LAESLink_txOpen() has returned and LAESLink_txStart() has not
  *          been called
  */
-void LAESLink_txAttachSampleSource(uint32_t dataRegister, uint32_t ackRegister, uint32_t ackMask);
+void LAESLink_txAttachSampleSource(uint32_t dataRegister, uint32_t ackRegister, uint32_t ackMask, uint32_t publisher);
 
 /*!
  *  @brief  Enable channels 8 (the packet list) and 9 (the relay)
@@ -366,10 +363,13 @@ void LAESLink_txClose(void);
  *  @retval #LAESLINK_STATUS_ERROR_KEY     the key did not load
  *
  *  @pre    No transmit session is open on this device
- *  @pre    With the radio source, the radio command is running with its FIFO
- *          commit trigger routed to channel 2
- *  @pre    cfg->doorbellDio has LAESLink_rxDoorbell() registered as its GPIO
- *          callback with its interrupt enabled and no edge detection
+ *  @pre    RCL_init() has run: with the radio source the drain channel's
+ *          control table slot is the RCL's. The radio command has not been
+ *          submitted; it routes its FIFO commit trigger to channel 2 when it
+ *          starts, and the drain has to be armed before that.
+ *  @post   Register LAESLink_rxDoorbell() as cfg->doorbellDio's GPIO
+ *          callback, with its interrupt enabled and no edge detection, after
+ *          this returns and before the radio command is submitted
  */
 int_fast16_t LAESLink_rxOpen(const LAESLink_Config *cfg,
                              const uint8_t key[LAESLINK_KEY_LEN],

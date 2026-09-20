@@ -148,7 +148,7 @@ typedef struct
     volatile LAESLink_Task relay[LAESLINK_TX_RELAY_TASKS * LAESLINK_SLOTS]; /* Relay list for channel 9, one group per slot */
     volatile uint32_t prim[4U * LAESLINK_SLOTS];                        /* Channel 8 primary images, one per slot */
     volatile uint32_t relayPrim[4U * LAESLINK_SLOTS];                   /* Channel 9 primary images, one per slot */
-    volatile uint32_t prim1[4U * LAESLINK_SLOTS];                       /* Sample channel primary images, one per slot */
+    volatile uint32_t primSample[4U * LAESLINK_SLOTS];                  /* Sample channel primary images, one per slot */
     volatile uint32_t b0[4];                                            /* CCM B0 image */
     volatile uint32_t b1[4];                                            /* CCM B1 image */
     volatile uint32_t a0[4];                                            /* CCM A0 image */
