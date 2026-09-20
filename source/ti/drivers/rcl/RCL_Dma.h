@@ -226,6 +226,45 @@ void RCL_Dma_stop(void);
 /** @}
  */
 
+#ifdef RCL_DMA_DEBUG
+/** @defgroup dmaDebugFunctions DMA Data Path Instrumentation
+ *  Available only in a build with %RCL_DMA_DEBUG defined
+ *  @{
+ */
+
+/**
+ *  @brief  Name the GPIO the data path toggles on every transfer
+ *
+ *  The LRF DMA trigger reaches two DMA channels. The data path owns one of
+ *  them; a burst arms the other on the same trigger with a transfer that
+ *  writes a single word to the GPIO toggle register per arbitration. The pin
+ *  is therefore driven by the DMA and not by the CPU, which is the point: an
+ *  instrument the CPU had to service would be reporting on itself rather than
+ *  on the data path. The data path is unchanged by this.
+ *
+ *  One request is answered with exactly one arbitration on every channel
+ *  listening, so the pin changes state once per entry moved to or from the
+ *  FIFO, in both directions.
+ *
+ *  Neither direction waits on data. The transfer is armed over the whole
+ *  burst before the command is submitted, so an entry the application writes
+ *  late still goes out on the request its position earns, and the trace looks
+ *  the same as for a burst prepared in advance.
+ *
+ *  Nothing else may use that second channel in a build that defines
+ *  %RCL_DMA_DEBUG.
+ *
+ *  Call this before %RCL_open. With no pin named the burst runs with the pin
+ *  left alone and %rclDmaDebugUnavailable counts it.
+ *
+ *  @param  gpioIndex  GPIO driver index of an output pin, as SysConfig defines it
+ */
+void RCL_Dma_setDebugPin(uint_least8_t gpioIndex);
+
+/** @}
+ */
+#endif /* RCL_DMA_DEBUG */
+
 #endif /* DeviceFamily_PARENT == DeviceFamily_PARENT_CC27XX */
 
 #endif /* ti_drivers_rcl_RCL_Dma__include */

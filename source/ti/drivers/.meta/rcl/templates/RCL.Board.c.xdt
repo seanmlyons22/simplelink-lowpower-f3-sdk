@@ -226,6 +226,19 @@ ALLOCATE_CONTROL_TABLE_ENTRY(dmaChannel`dmaChNumber`ControlTableEntry, `dmaChNum
 volatile uDMAControlTableEntry *RCL_dmaControlTableEntry = &dmaChannel`dmaChNumber`ControlTableEntry;
 uint32_t RCL_dmaChannelMask = (uint32_t)0x01UL << `dmaChNumber`;
 uint32_t RCL_dmaChannelSubscriberId = EVTSVT_DMA_CH`dmaChNumber`;
+
+#ifdef RCL_DMA_DEBUG
+/* The LRF trigger reaches DMA channel 2 and 4. The data path took one of
+ * them above; the scope instrumentation listens to the same trigger on the
+ * other and toggles a pin once per FIFO request. Nothing else may use it in
+ * a build that defines RCL_DMA_DEBUG. */
+% let dmaDebugChNumber = (dmaChNumber == "2") ? "4" : "2";
+ALLOCATE_CONTROL_TABLE_ENTRY(dmaChannel`dmaDebugChNumber`ControlTableEntry, `dmaDebugChNumber`);
+
+volatile uDMAControlTableEntry *RCL_dmaDebugControlTableEntry = &dmaChannel`dmaDebugChNumber`ControlTableEntry;
+uint32_t RCL_dmaDebugChannelMask = (uint32_t)0x01UL << `dmaDebugChNumber`;
+uint32_t RCL_dmaDebugChannelSubscriberId = EVTSVT_DMA_CH`dmaDebugChNumber`;
+#endif
 %}
 
 %if (rclStatic.pbeGpoMask != 0) {
