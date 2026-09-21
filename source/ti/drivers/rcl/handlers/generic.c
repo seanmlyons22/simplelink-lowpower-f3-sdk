@@ -2865,33 +2865,33 @@ static bool rclGenericRxStreamContinue(void)
 void RCL_CmdGenericRxStream_hopSync(RCL_CmdGenericRxStream *cmd, uint32_t packetCounter)
 {
     uint32_t packetsPerHop = genericHandlerState.stream.packetsPerHop;
+    /* The whole of it with interrupts off, so that the command's own
+     * interrupt cannot end and re-post the operation, zero the counts, or
+     * record a stop and arm its own target, between the tests and the
+     * write */
+    uintptr_t key = HwiP_disable();
 
     /* Nothing to align once a stop is pending: the handler has armed the
      * count that ends the operation with the next packet */
-    if ((cmd->common.status != RCL_CommandStatus_Active) || (genericHandlerState.stream.numHops == 0U) ||
-        (genericHandlerState.stream.stopType != RCL_StopType_None))
+    if ((cmd->common.status == RCL_CommandStatus_Active) && (genericHandlerState.stream.numHops != 0U) &&
+        (genericHandlerState.stream.stopType == RCL_StopType_None))
     {
-        return;
+        uint32_t position = packetCounter % packetsPerHop;
+
+        if (position + 1U < packetsPerHop)
+        {
+            /* The packets of this operation so far, this one included by
+             * the time the entry has been drained, plus the rest of the
+             * dwell */
+            uint32_t target = HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NRXOK) +
+                              HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NRXNOK) +
+                              (packetsPerHop - 1U - position);
+
+            genericHandlerState.stream.target = (uint16_t) target;
+            HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NRXTARGET) = (uint16_t) target;
+        }
     }
-
-    uint32_t position = packetCounter % packetsPerHop;
-
-    if (position + 1U < packetsPerHop)
-    {
-        /* The packets of this operation so far, this one included by the
-         * time the entry has been drained, plus the rest of the dwell. Read
-         * and written with interrupts off, so that the command's own
-         * interrupt cannot end and re-post the operation, and zero the
-         * counts, between the read and the write. */
-        uintptr_t key = HwiP_disable();
-        uint32_t target = HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NRXOK) +
-                          HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NRXNOK) +
-                          (packetsPerHop - 1U - position);
-
-        genericHandlerState.stream.target = (uint16_t) target;
-        HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NRXTARGET) = (uint16_t) target;
-        HwiP_restore(key);
-    }
+    HwiP_restore(key);
 }
 
 /*

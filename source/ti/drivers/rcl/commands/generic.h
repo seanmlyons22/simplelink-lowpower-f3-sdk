@@ -856,7 +856,7 @@ struct RCL_CMD_GENERIC_TX_STREAM_t {
  *  stream; %rfFrequency is not used. NRXOK and NRXNOK restart at every
  *  operation and the handler accumulates them, so the target arithmetic
  *  never wraps; %stats.nRxOk and %stats.nRxNok report the totals and
- *  %stats.nHops the rows applied. A table without rows, with fewer than two
+ *  %stats.nHops the hops made. A table without rows, with fewer than two
  *  channels or a zero frequency in it, with %packetsPerHop or
  *  %packetPeriodTicks zero, with a dwell timeout under 128 us or over what
  *  16 bits hold, or with a stop time in %common.timing ends the command with
@@ -894,7 +894,7 @@ struct RCL_CMD_GENERIC_RX_STREAM_t {
     uint16_t                entryBytes;             /*!< Written by the handler at setup: bytes of one entry in the RX FIFO, padded to a word */
     RCL_StatsGenericRxStream *stats;                /*!< Pointer to statistics structure. NULL: Do not store statistics */
     struct {
-        uint8_t             fsOff:     1;           /*!< The synthesizer is always off after the command. 0: keep refsys and the power constraints for a following command that programs its frequency. 1: release them */
+        uint8_t             fsOff:     1;           /*!< Without a hop table: the synthesizer is always off after the command. 0: keep refsys and the power constraints for a following command that programs its frequency. 1: release them */
         uint8_t             enableLRF: 1;           /*!< 1: call LRF_enable() at command start. 0: assume the LRF is already enabled by a previous command */
         uint8_t             disableLRF:1;           /*!< 1: call LRF_disable() at command end. 0: leave the LRF enabled for a following command; not supported after a stop, see above */
         uint8_t             reserved:  5;           /*!< Reserved, set to 0 */
@@ -990,7 +990,7 @@ struct RCL_STATS_GENERIC_RX_STREAM_t {
     } config;                    /*!< Configuration provided to RCL */
     uint16_t nRxOk;              /*!< Number of packets received with correct CRC */
     uint16_t nRxNok;             /*!< Number of packets received with CRC error */
-    uint16_t nHops;              /*!< Number of hops applied, with a hop table */
+    uint16_t nHops;              /*!< Number of hops made, with a hop table; on the receive path a hop cannot miss its row */
 };
 
 #define RCL_StatsGenericRxStream_Default() \
