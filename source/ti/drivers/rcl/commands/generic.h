@@ -843,9 +843,12 @@ struct RCL_CMD_GENERIC_TX_STREAM_t {
  *  search waits for a report the RFE only gives when told to turn the
  *  synthesizer off, and never returns (measured). The handler tells RCL to
  *  post the stop as an event and write nothing to the PBE, and answers it at
- *  the next operation end, which the timeouts bound to 1.25 dwells: the
- *  operation in flight finishes, the handler does not post again and the
- *  command ends with the stop's status. A hard stop is therefore no sooner
+ *  the next operation end, which it brings about: it arms the packet count
+ *  so that the next packet ends the operation, and if none comes the
+ *  timeouts do, one period after the last packet or 1.25 dwells after the
+ *  post. The operation in flight ends, the handler does not post again and
+ *  the command ends with the stop's status, within a packet period under
+ *  traffic (measured: 100 to 200 us). A hard stop is therefore no sooner
  *  than a graceful one on a hopping command, and a stop time behaves the same
  *  way. The synthesizer is still on when the command ends: with
  *  %config.disableLRF set LRF_disable() takes it down with the front end,

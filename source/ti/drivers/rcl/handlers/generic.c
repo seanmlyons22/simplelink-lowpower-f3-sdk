@@ -2796,7 +2796,10 @@ void RCL_CmdGenericRxStream_hopSync(RCL_CmdGenericRxStream *cmd, uint32_t packet
 {
     uint32_t packetsPerHop = genericHandlerState.stream.packetsPerHop;
 
-    if ((cmd->common.status != RCL_CommandStatus_Active) || (genericHandlerState.stream.numHops == 0U))
+    /* Nothing to align once a stop is pending: the handler has armed the
+     * count that ends the operation with the next packet */
+    if ((cmd->common.status != RCL_CommandStatus_Active) || (genericHandlerState.stream.numHops == 0U) ||
+        (genericHandlerState.stream.stopType != RCL_StopType_None))
     {
         return;
     }
@@ -3028,9 +3031,16 @@ RCL_Events RCL_Handler_Generic_RxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
         {
             if (genericHandlerState.stream.numHops != 0U)
             {
-                /* Honoured when the operation ends: not posting again is
-                 * what ends the command */
+                /* Honoured when the operation ends, which is brought about
+                 * here rather than waited for: with packets arriving and no
+                 * count armed the operation would run on forever. The count
+                 * is armed so that the next packet ends it, and if no packet
+                 * comes the timeouts do. Not posting again is then what ends
+                 * the command. */
                 rclGenericStreamNoteStop(rclEventsIn);
+                HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NRXTARGET) =
+                    (uint16_t) (HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NRXOK) +
+                                HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NRXNOK) + 1U);
             }
             else
             {
