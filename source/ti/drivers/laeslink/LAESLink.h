@@ -41,10 +41,10 @@
  *  Transmit: a sample source (a peripheral whose event, published to uDMA
  *  channel 10, lands one payload in the plaintext ring; its completion runs
  *  the relay on channel 9) or a software request starts a peripheral
- *  scatter-gather task list on uDMA channel 8. The list
- *  writes the CCM blocks into the LAES, waits for each AESDONE through the
- *  event fabric, moves the ciphertext from TXT straight into the radio TX
- *  FIFO, forms the MIC with the TXTX hardware XOR, posts the PBE operation
+ *  scatter-gather task list on uDMA channel 8. The list writes the CCM
+ *  blocks into the LAES, waits for each AESDONE through the event fabric,
+ *  moves the ciphertext from TXT straight into the radio TX FIFO, forms the
+ *  MIC with the TXTX hardware XOR, posts the PBE operation
  *  and advances the packet counter with the LAES counter hardware. No CPU
  *  instruction runs per packet.
  *
@@ -92,9 +92,10 @@
 extern "C" {
 #endif
 
-/* Packet geometry. The datapath moves exactly one payload block, the B1
- * image assumes a 4-byte header and the nonce length follows from L = 2.
- */
+/*! @name Packet geometry
+ *  The datapath moves exactly one payload block, the B1 image assumes a
+ *  4-byte header and the nonce length follows from L = 2.
+ *  @{ */
 #define LAESLINK_AAD_LEN        (4U)
 #define LAESLINK_PAYLOAD_LEN    (16U)
 #define LAESLINK_MIC_LEN        (4U)
@@ -102,6 +103,7 @@ extern "C" {
 #define LAESLINK_KEY_LEN        (16U)
 #define LAESLINK_FIFO_WORDS     (7U)
 #define LAESLINK_SLOTS          (2U)
+/*! @} */
 
 /*! @brief  uDMA channel the transmit sample source runs on
  *
