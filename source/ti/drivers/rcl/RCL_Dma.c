@@ -56,23 +56,25 @@
 #include DeviceFamily_constructPath(inc/hw_memmap.h)
 #include DeviceFamily_constructPath(inc/hw_lrfdpbe.h)
 #include DeviceFamily_constructPath(inc/hw_lrfddbell.h)
-#ifdef RCL_DMA_DEBUG
 #include DeviceFamily_constructPath(inc/hw_gpio.h)
-#endif
 
 /* DMA control table entry, channel mask and EVTSVT subscriber from SysConfig */
 extern volatile uDMAControlTableEntry *RCL_dmaControlTableEntry;
 extern uint32_t RCL_dmaChannelMask;
 extern uint32_t RCL_dmaChannelSubscriberId;
 
-#ifdef RCL_DMA_DEBUG
 /* A second channel, its control table entry and EVTSVT subscriber, also from
  * SysConfig. The LRF trigger reaches two of the DMA channels and the data path
- * uses one of them; this is the other. */
-extern volatile uDMAControlTableEntry *RCL_dmaDebugControlTableEntry;
-extern uint32_t RCL_dmaDebugChannelMask;
-extern uint32_t RCL_dmaDebugChannelSubscriberId;
-#endif
+ * uses one of them; this is the other. SysConfig emits these only for an
+ * application built with RCL_DMA_DEBUG defined, so they are weak: in any other
+ * application they resolve to address 0, the second channel is never touched
+ * and the data path runs exactly as it does without this. */
+extern volatile uDMAControlTableEntry *RCL_dmaDebugControlTableEntry __attribute__((weak));
+extern uint32_t RCL_dmaDebugChannelMask __attribute__((weak));
+extern uint32_t RCL_dmaDebugChannelSubscriberId __attribute__((weak));
+
+/* Whether the application reserved the second channel */
+#define RCL_DMA_DEBUG_PRESENT()  (&RCL_dmaDebugChannelMask != NULL)
 
 /* Transfers are halfword wide against the FIFO data ports, which push or pop
  * two bytes on every access whatever the width of the bus access.
@@ -179,9 +181,7 @@ static void rclDmaQuiesce(void);
 static bool rclDmaStartTx(const void *source, uint32_t numBytes);
 static int_fast16_t rclDmaPostTx(const void *source, uint32_t numBytes, uint32_t stride);
 static void rclDmaRxAllowSpace(void);
-#ifdef RCL_DMA_DEBUG
 static void rclDmaDebugArm(uint32_t numRequests);
-#endif
 
 /* Counters for faults that are otherwise silent, read with a debugger.
  * A TX underflow is the only thing that separates a packet the PBE sent from
@@ -197,7 +197,6 @@ volatile uint32_t rclDmaRxOverflow = 0U;
 volatile uint32_t rclDmaRxBurstStray = 0U;
 volatile uint32_t rclDmaRxBurstStrayBytes = 0U;
 
-#ifdef RCL_DMA_DEBUG
 /* Bit of the named pin in GPIO.DOUTTGL31_0, and the source of the write that
  * toggles it. Read by the uDMA, not by the CPU. */
 static volatile uint32_t rclDmaDebugPinMask = 0U;
@@ -206,7 +205,6 @@ static volatile uint32_t rclDmaDebugPinMask = 0U;
  * with the pin left alone. A trace with fewer edges than packets is explained
  * here. */
 volatile uint32_t rclDmaDebugUnavailable = 0U;
-#endif
 
 /* ============================================================================
  * Implementations
@@ -233,7 +231,6 @@ static uint32_t rclDmaFillThreshold(uint32_t fifoSize, uint32_t arbBytes)
     return threshold;
 }
 
-#ifdef RCL_DMA_DEBUG
 /*
  *  ======== rclDmaDebugArm ========
  */
@@ -270,9 +267,22 @@ static uint32_t rclDmaFillThreshold(uint32_t fifoSize, uint32_t arbBytes)
  * waits for a peripheral request of its own, so it eats the request meant to
  * fetch the next entry and the burst stalls with the FIFO starved; one
  * carrying AUTO or BASIC does not wait, but ends the list, so only the first
- * entry is ever toggled. Both were measured on an LP_EM_CC2755P20. */
+ * entry is ever toggled. Both were measured on an LP_EM_CC2755P20.
+ *
+ * Both channels answer the same request, so the uDMA serves them one after
+ * the other. The data channel is given high priority whenever the debug
+ * channel is armed, so that it is always served first whichever of channel 2
+ * and 4 the pin solver gave it; the toggle then only follows the
+ * data, by one single word transfer. The attribute is written here on every
+ * arm and not once at open, since the uDMA is reinitialized on wake from
+ * standby, and taken off again in RCL_Dma_stop. */
 static void rclDmaDebugArm(uint32_t numRequests)
 {
+    if (!RCL_DMA_DEBUG_PRESENT())
+    {
+        return;
+    }
+
     if ((rclDmaDebugPinMask == 0U) || (numRequests == 0U) ||
         (numRequests > (uint32_t) UDMA_XFER_SIZE_MAX))
     {
@@ -287,7 +297,8 @@ static void rclDmaDebugArm(uint32_t numRequests)
                            (void *) &rclDmaDebugPinMask,
                            (void *) (GPIO_BASE + GPIO_O_DOUTTGL31_0),
                            numRequests);
-    uDMADisableChannelAttribute(RCL_dmaDebugChannelMask, UDMA_ATTR_USEBURST);
+    uDMADisableChannelAttribute(RCL_dmaDebugChannelMask, UDMA_ATTR_USEBURST | UDMA_ATTR_HIGH_PRIORITY);
+    uDMAEnableChannelAttribute(RCL_dmaChannelMask, UDMA_ATTR_HIGH_PRIORITY);
     UDMALPF3_channelEnable(RCL_dmaDebugChannelMask);
 }
 
@@ -297,10 +308,10 @@ static void rclDmaDebugArm(uint32_t numRequests)
 void RCL_Dma_setDebugPin(uint_least8_t gpioIndex)
 {
     /* The GPIO driver index is the DIO number on this device, and
-     * DOUTTGL31_0 has one bit per DIO. */
-    rclDmaDebugPinMask = (uint32_t) 1U << (uint32_t) gpioIndex;
+     * DOUTTGL31_0 has one bit per DIO. Anything else, GPIO_INVALID_INDEX
+     * included, leaves the pin alone. */
+    rclDmaDebugPinMask = (gpioIndex < 32U) ? ((uint32_t) 1U << (uint32_t) gpioIndex) : 0U;
 }
-#endif /* RCL_DMA_DEBUG */
 
 /*
  *  ======== rclDmaConfigureTrigger ========
@@ -380,10 +391,8 @@ static bool rclDmaStartTx(const void *source, uint32_t numBytes)
     rclDmaState.txStarted = true;
     UDMALPF3_channelEnable(RCL_dmaChannelMask);
 
-#ifdef RCL_DMA_DEBUG
     /* One edge per entry the FIFO asks for */
     rclDmaDebugArm((rclDmaTxArbBytes != 0U) ? (numBytes / rclDmaTxArbBytes) : 0U);
-#endif
 
     HWREG_WRITE_LRF(LRFDDBELL_BASE + LRFDDBELL_O_DMACFG) = 0U;
     rclDmaConfigureTrigger(LRFDPBE_FCFG5_DMAREQ_TXWRBTHR_MET | LRFDPBE_FCFG5_DMASREQ_NONE);
@@ -472,11 +481,12 @@ void RCL_Dma_open(void)
     /* Only the primary control structure is used */
     UDMALPF3_disableAttribute(RCL_dmaChannelMask, UDMA_ATTR_ALTSELECT);
 
-#ifdef RCL_DMA_DEBUG
-    /* The same trigger, on the other channel it reaches */
-    EVTSVTConfigureDma(RCL_dmaDebugChannelSubscriberId, EVTSVT_DMA_TRIG_LRFDTRG);
-    UDMALPF3_disableAttribute(RCL_dmaDebugChannelMask, UDMA_ATTR_ALTSELECT);
-#endif
+    if (RCL_DMA_DEBUG_PRESENT())
+    {
+        /* The same trigger, on the other channel it reaches */
+        EVTSVTConfigureDma(RCL_dmaDebugChannelSubscriberId, EVTSVT_DMA_TRIG_LRFDTRG);
+        UDMALPF3_disableAttribute(RCL_dmaDebugChannelMask, UDMA_ATTR_ALTSELECT);
+    }
 
     rclDmaState.txSource = NULL;
     rclDmaState.txHeaderBytes = 0U;
@@ -495,9 +505,10 @@ void RCL_Dma_close(void)
 {
     HWREG_WRITE_LRF(LRFDDBELL_BASE + LRFDDBELL_O_DMACFG) = 0U;
     UDMALPF3_channelDisable(RCL_dmaChannelMask);
-#ifdef RCL_DMA_DEBUG
-    UDMALPF3_channelDisable(RCL_dmaDebugChannelMask);
-#endif
+    if (RCL_DMA_DEBUG_PRESENT())
+    {
+        UDMALPF3_channelDisable(RCL_dmaDebugChannelMask);
+    }
     Power_releaseDependency(PowerLPF3_PERIPH_DMA);
 }
 
@@ -743,10 +754,8 @@ int_fast16_t RCL_Dma_armRxBurst(uint32_t numEntries, uint32_t entryBytes)
     uDMADisableChannelAttribute(RCL_dmaChannelMask, UDMA_ATTR_USEBURST);
     UDMALPF3_channelEnable(RCL_dmaChannelMask);
 
-#ifdef RCL_DMA_DEBUG
     /* One edge per committed entry; the receive trigger is a pulse */
     rclDmaDebugArm(numEntries);
-#endif
 
     rclDmaConfigureTrigger(LRFDPBE_FCFG5_DMAREQ_RXFIFO_COMMIT | LRFDPBE_FCFG5_DMASREQ_NONE);
 
@@ -856,9 +865,11 @@ void RCL_Dma_stop(void)
 
     uintptr_t key = HwiP_disable();
     UDMALPF3_channelDisable(RCL_dmaChannelMask);
-#ifdef RCL_DMA_DEBUG
-    UDMALPF3_channelDisable(RCL_dmaDebugChannelMask);
-#endif
+    if (RCL_DMA_DEBUG_PRESENT())
+    {
+        UDMALPF3_channelDisable(RCL_dmaDebugChannelMask);
+        uDMADisableChannelAttribute(RCL_dmaChannelMask, UDMA_ATTR_HIGH_PRIORITY);
+    }
     rclDmaState.txArmed = false;
     rclDmaState.txStarted = false;
     rclDmaState.rxArmed = false;

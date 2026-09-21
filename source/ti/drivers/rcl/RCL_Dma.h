@@ -226,14 +226,13 @@ void RCL_Dma_stop(void);
 /** @}
  */
 
-#ifdef RCL_DMA_DEBUG
 /** @defgroup dmaDebugFunctions DMA Data Path Instrumentation
- *  Available only in a build with %RCL_DMA_DEBUG defined
+ *  Active in an application built with %RCL_DMA_DEBUG defined
  *  @{
  */
 
 /**
- *  @brief  Name the GPIO the data path toggles on every transfer
+ *  @brief  Name the GPIO the data path toggles on every FIFO request
  *
  *  The LRF DMA trigger reaches two DMA channels. The data path owns one of
  *  them; a burst arms the other on the same trigger with a transfer that
@@ -251,11 +250,18 @@ void RCL_Dma_stop(void);
  *  late still goes out on the request its position earns, and the trace looks
  *  the same as for a burst prepared in advance.
  *
- *  Nothing else may use that second channel in a build that defines
- *  %RCL_DMA_DEBUG.
+ *  SysConfig allocates the second channel's control table entry when the
+ *  application is compiled with %RCL_DMA_DEBUG defined, and nothing else may
+ *  use that channel then. The pin solver does not know about it: another
+ *  driver placed on the same channel shows up as a duplicate control table
+ *  entry at link time, not as a SysConfig conflict.
+ *  The RCL library itself is built the same either way: in an application
+ *  without the define no channel is reserved, this call has no effect and
+ *  the data path runs exactly as it does without it.
  *
- *  Call this before %RCL_open. With no pin named the burst runs with the pin
- *  left alone and %rclDmaDebugUnavailable counts it.
+ *  Call this before the first command is submitted. When the channel is
+ *  allocated but no valid pin is named, the burst runs with the pin left
+ *  alone and %rclDmaDebugUnavailable counts it.
  *
  *  @param  gpioIndex  GPIO driver index of an output pin, as SysConfig defines it
  */
@@ -263,7 +269,6 @@ void RCL_Dma_setDebugPin(uint_least8_t gpioIndex);
 
 /** @}
  */
-#endif /* RCL_DMA_DEBUG */
 
 #endif /* DeviceFamily_PARENT == DeviceFamily_PARENT_CC27XX */
 
