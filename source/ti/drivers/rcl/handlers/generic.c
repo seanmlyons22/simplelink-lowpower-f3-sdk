@@ -2489,11 +2489,21 @@ static void rclGenericStreamProgramFrequency(uint32_t frequency, const uint32_t 
  *  alone while it runs, so a hop that finds it running skips the row and
  *  counts a miss; the channel moves on regardless, so that the schedule is
  *  kept and the miss costs the dwell and not the front end. Idle is read
- *  from LRFDPBE.RFEMSGBOX, the RFE's report of its last command: zero from
- *  the moment the PBE gives the RFE a command until the RFE reports it
- *  done, non-zero from then on (measured: 0 while a packet is on the air,
- *  1 at the hop interrupt and at the operation done). LRFDRFE32.RFSTATE
- *  reads IDLE throughout with this RFE image and tells nothing.
+ *  from LRFDPBE.RFEMSGBOX, the RFE's report of its last command: the RFE
+ *  clears it when it takes a command (rfe_ram_bank0.asm:117-121, outclr
+ *  MSGBOX), about a microsecond after the API write, and writes it when
+ *  the command is done. On the TX path the hop interrupt is raised from
+ *  the NTX store that TX_DONE reaches only after waiting for the modem's
+ *  and the RFE's reports (pbe_ram_bank0.asm:416-430), so the word is set
+ *  by then and a post the RFE has taken up since is seen, while one made
+ *  in the microsecond before it has is not, which is the application's
+ *  posting contract in the command's description. On the RX path the hop
+ *  runs after an operation done, and OP_COMMON_END's RESET_ALL has waited
+ *  for the RFE's report before writing ENDCAUSE
+ *  (pbe_commonlib_reset.asm:26-29), so the test is always true there.
+ *  Measured as corroboration: 0 while a packet is on the air, 1 at the hop
+ *  interrupt and at the operation done. LRFDRFE32.RFSTATE reads IDLE
+ *  throughout with this RFE image and tells nothing.
  */
 static void rclGenericStreamHop(void)
 {

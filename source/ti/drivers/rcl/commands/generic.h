@@ -707,15 +707,20 @@ struct RCL_STATS_GENERIC_RX_BURST_t {
  *  told, through NTXIRQ, a word of the patched generic image, to raise an
  *  interrupt after every %packetsPerHop-th packet, and on that interrupt the
  *  handler moves to the next channel and writes its row: the stores of the
- *  row, nothing computed. The RFE is idle when the interrupt is raised
- *  (measured: 3 us after the PA has gone down and 4 us before the operation
- *  done, its report of the operation in the PBE's RFEMSGBOX), and the row
- *  is written only if it still is; a hop that finds the RFE running,
- *  because the application posted the next operation first or the RCL's
- *  interrupt was held off until it did, skips the row and is counted in
- *  %stats.nHopsMissed (measured: one held hop, one miss), and the channel moves on regardless, so a
- *  late hop costs one dwell on the wrong channel and not the front end. The
- *  application owes the hop the gap: the first operation of a dwell is
+ *  row, nothing computed. The RFE is idle when the interrupt is raised:
+ *  the PBE's TX_DONE waits for the modem's and then the RFE's report before
+ *  the NTX store the interrupt is raised from, so the RFE's report of the
+ *  operation is in the PBE's RFEMSGBOX by then (measured as well: 3 us
+ *  after the PA has gone down and 4 us before the operation done). The row
+ *  is written only if that report is still there. The RFE clears the word
+ *  when it takes its next command, about a microsecond after the
+ *  application's API write, so a hop that finds it cleared, because the
+ *  application posted the next operation first or the RCL's interrupt was
+ *  held off until it did, skips the row and is counted in
+ *  %stats.nHopsMissed, and the channel moves on regardless, so a late hop
+ *  costs one dwell on the wrong channel and not the front end. A post made
+ *  in the microsecond before the RFE has taken it up is not seen; that
+ *  window is the application's contract: the first operation of a dwell is
  *  posted after the previous dwell's last operation has ended, as any
  *  operation is, and the RCL's interrupt is not held off across that gap.
  *  The application may see the hop itself by subscribing to doorbell bit 9,
