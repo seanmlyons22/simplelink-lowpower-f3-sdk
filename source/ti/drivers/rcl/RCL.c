@@ -1077,21 +1077,29 @@ static RCL_CommandStatus rclStop(RCL_Command_Handle c, RCL_StopType stopType, RC
             case RCL_StopType_Graceful:
                 rclEvent.gracefulStop = 1;
                 rclSchedulerState.gracefulStopInfo.stopReason = stopReason;
-                /* Do not send graceful stop if any stop is already sent */
+                /* Do not send graceful stop if any stop is already sent, or if the
+                 * handler has asked to answer stops itself and only wants the event */
                 if (rclSchedulerState.gracefulStopInfo.apiStopEnabled == 0U &&
                     rclSchedulerState.hardStopInfo.apiStopEnabled == 0U)
                 {
-                    LRF_sendGracefulStop();
+                    if (rclSchedulerState.handlerStops == 0U)
+                    {
+                        LRF_sendGracefulStop();
+                    }
                     rclSchedulerState.gracefulStopInfo.apiStopEnabled = 1;
                 }
                 break;
             case RCL_StopType_Hard:
-                /* Do not send hard stop if already sent (but send if graceful stop is sent) */
+                /* Do not send hard stop if already sent (but send if graceful stop is sent),
+                 * nor if the handler answers stops itself */
                 rclEvent.hardStop = 1;
                 rclSchedulerState.hardStopInfo.stopReason = stopReason;
                 if (rclSchedulerState.hardStopInfo.apiStopEnabled == 0U)
                 {
-                    LRF_sendHardStop();
+                    if (rclSchedulerState.handlerStops == 0U)
+                    {
+                        LRF_sendHardStop();
+                    }
                     rclSchedulerState.hardStopInfo.apiStopEnabled = 1;
                 }
                 break;

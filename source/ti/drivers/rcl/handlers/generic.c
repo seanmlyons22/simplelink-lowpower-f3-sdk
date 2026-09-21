@@ -60,18 +60,33 @@
 #include DeviceFamily_constructPath(inc/hw_memmap.h)
 #include DeviceFamily_constructPath(inc/pbe_generic_ram_regs.h)
 #include DeviceFamily_constructPath(inc/hw_lrfdpbe.h)
+#include DeviceFamily_constructPath(inc/hw_lrfdrfe.h)
+#include DeviceFamily_constructPath(inc/hw_lrfdrfe32.h)
+#include DeviceFamily_constructPath(inc/hw_lrfdmdm.h)
+#include DeviceFamily_constructPath(inc/hw_lrfdmdm32.h)
+#include DeviceFamily_constructPath(inc/rfe_common_ram_regs.h)
 #include <ti/drivers/rcl/RCL_Dma.h>
 
 /* Packet count at which the PBE ends a burst of its own accord, one word per
- * direction. Zero disables the stop, and the PBE zeroes both as it tears an
- * operation down, so they are written on every burst.
+ * direction, and the transmitted-packet count at which it writes NTX back to
+ * zero and raises its interrupt 9. Zero disables each. The PBE zeroes the two
+ * targets as it tears an operation down, so they are written on every burst;
+ * it never touches NTXIRQ, so every transmit command writes that one at
+ * setup, the stream with what it needs and the others with zero.
  *
  * They sit past the end of the generated PBE_GENERIC_RAM map and are spelled
  * out here rather than taken from pbe_generic_ram_regs.h, which does not carry
- * them; the offsets are the PBE port numbers 0xdf and 0xe0 as BUFRAM byte
- * offsets, (port - 0x80) * 2. */
+ * them; the offsets are the PBE port numbers 0xdf, 0xe0 and 0xe1 as BUFRAM
+ * byte offsets, (port - 0x80) * 2. */
 #define PBE_GENERIC_RAM_O_NTXTARGET 0x000000BEU
 #define PBE_GENERIC_RAM_O_NRXTARGET 0x000000C0U
+#define PBE_GENERIC_RAM_O_NTXIRQ    0x000000C2U
+
+/* The PBE's interrupt 9 reaches the CPU as doorbell bit 9, which the RCL
+ * names after what the BLE image raises it for. The generic image leaves it
+ * unused and its NTXIRQ patch raises it at every hop of a transmit stream;
+ * this is the bit's name for that. */
+#define LRF_EventStreamHop LRF_EventTxCtrl
 #endif
 
 struct
@@ -114,6 +129,14 @@ struct
             bool                calibrating;    /* TX: the synthesizer calibration operation is in flight */
             uint16_t            fifoCfg;        /* RX: FIFOCFG as the settings left it, restored at the end */
             uint16_t            extraBytes;     /* RX: EXTRABYTES likewise */
+            uint8_t             numHops;        /* Channels in the hop table; 0: no hopping */
+            uint8_t             packetsPerHop;
+            uint8_t             channel;        /* The row the radio is on */
+            uint16_t            target;         /* RX: the count the running operation ends on; 0: none armed */
+            uint32_t            hops;           /* Rows applied */
+            uint32_t            rxOk;           /* RX: the counts of the operations that have ended */
+            uint32_t            rxNok;
+            uint32_t            *rows;          /* The command's row storage */
         } stream;
     };
 } genericHandlerState;
@@ -339,6 +362,10 @@ RCL_Events RCL_Handler_Generic_Tx(RCL_Command *cmd, LRF_Events lrfEvents, RCL_Ev
 
             /* Initialize RF FIFO */
             genericHandlerState.common.txFifoSize = (uint16_t) LRF_prepareTxFifo();
+
+            /* No periodic interrupt from the packet count: the word outlives
+             * the stream that set it */
+            HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NTXIRQ) = 0U;
 
             /* Enter payload */
             uint32_t nBuffer = RCL_Handler_Generic_updateTxBuffers(&txCmd->txBuffers, 1U);
@@ -1724,6 +1751,11 @@ RCL_Events RCL_Handler_Generic_TxBurst(RCL_Command *cmd, LRF_Events lrfEvents, R
              * front end reply. */
             HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NTXTARGET) = txCmd->numPackets;
 
+            /* No periodic interrupt from the packet count: the word outlives
+             * the stream that set it, and with it set NTX would never reach
+             * the target above. */
+            HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NTXIRQ) = 0U;
+
             rclGenericBurstForceNoTxFifoCmd();
 
             /* Nothing is entered into the FIFO here. The DMA moves one entry
@@ -2220,7 +2252,7 @@ static void rclGenericStreamEnableStopTimeIrqs(void)
  *
  *  A hard stop supersedes a graceful one.
  */
-static void rclGenericStreamRequestStop(RCL_Events rclEventsIn)
+static void rclGenericStreamNoteStop(RCL_Events rclEventsIn)
 {
     RCL_StopType stopType = (rclEventsIn.hardStop != 0U) ? RCL_StopType_Hard : RCL_StopType_Graceful;
 
@@ -2228,6 +2260,11 @@ static void rclGenericStreamRequestStop(RCL_Events rclEventsIn)
     {
         genericHandlerState.stream.stopType = stopType;
     }
+}
+
+static void rclGenericStreamRequestStop(RCL_Events rclEventsIn)
+{
+    rclGenericStreamNoteStop(rclEventsIn);
     LRF_clearHwInterrupt(LRF_EventOpDone.value);
     LRF_enableHwInterrupt(LRF_EventOpDone.value);
     if (genericHandlerState.stream.stopType == RCL_StopType_Hard)
@@ -2249,14 +2286,21 @@ static void rclGenericStreamRequestStop(RCL_Events rclEventsIn)
  *  ended normally, been cut short (ERR_STOP) or finished its packet first
  *  (EOPSTOP), and all three are the same stop. An end cause of EOPSTOP or
  *  ERR_STOP with no stop requested here comes from a stop time the scheduler
- *  delivered straight to the PBE, and maps to the matching stop status.
+ *  delivered straight to the PBE, and maps to the matching stop status. On a
+ *  hopping command a stop is never written to the PBE, so the operation
+ *  that answers it ends as any other, on its count or on a timeout.
  */
 static RCL_CommandStatus rclGenericStreamEndStatus(LRF_Events lrfEvents)
 {
     RCL_CommandStatus status;
     uint16_t endCause = LRF_Interface_getCmdEndCause();
     bool stopped = (endCause == LRF_INTERFACE_ENDCAUSE_STAT_EOPSTOP) ||
-                   (endCause == LRF_INTERFACE_ENDCAUSE_STAT_ERR_STOP);
+                   (endCause == LRF_INTERFACE_ENDCAUSE_STAT_ERR_STOP) ||
+                   ((genericHandlerState.stream.numHops != 0U) &&
+                    (genericHandlerState.stream.stopType != RCL_StopType_None) &&
+                    ((endCause == LRF_INTERFACE_ENDCAUSE_STAT_ENDOK) ||
+                     (endCause == LRF_INTERFACE_ENDCAUSE_STAT_RXTIMEOUT) ||
+                     (endCause == LRF_INTERFACE_ENDCAUSE_STAT_NOSYNC)));
 
     if ((lrfEvents.opError != 0U) && !stopped)
     {
@@ -2271,6 +2315,154 @@ static RCL_CommandStatus rclGenericStreamEndStatus(LRF_Events lrfEvents)
         status = RCL_Handler_Generic_mapLrfErrorStatusToRclStatus();
     }
     return status;
+}
+
+/*
+ *  ======== rclGenericHopRegs ========
+ *
+ *  One row of a hop table is everything LRF_programFrequency writes for a
+ *  frequency, in the order it writes it: the RFE RAM frequency word K5 and
+ *  the coarse and mid calibration dividers; the demodulator resampler
+ *  fraction and its two shadow words, DEMCOHR3 and DEMCOHR4, which are only
+ *  written when LRFDMDM.BAUDCOMP has FRAC_SHADOW set and read zero
+ *  otherwise, carried so that the row is complete for any configuration; the
+ *  two PLL words, which also carry the HFXT compensation of the moment; the
+ *  RFE RAM IF words; the mixer word and its spare copy; the six TX filter
+ *  tap words, which depend on the frequency through the deviation scaling;
+ *  and the shaping gain in MOD0. One list both captures a row at setup and
+ *  applies it at a hop, so the two cannot drift apart. The RFE RAM words are
+ *  halfwords, the rest 32-bit registers.
+ */
+typedef struct {
+    uint32_t addr;
+    bool     halfword;
+} RclGenericHopReg;
+
+static const RclGenericHopReg rclGenericHopRegs[RCL_GENERIC_HOP_ROW_WORDS] = {
+    { LRFD_RFERAM_BASE + RFE_COMMON_RAM_O_K5,           true  },
+    { LRFDRFE32_BASE + LRFDRFE32_O_CALMMID_CALMCRS,     false },
+    { LRFDMDM32_BASE + LRFDMDM32_O_DEMFRAC1_DEMFRAC0,   false },
+    { LRFDMDM32_BASE + LRFDMDM32_O_DEMFRAC3_DEMFRAC2,   false },
+    { LRFDMDM_BASE + LRFDMDM_O_DEMCOHR3,                false },
+    { LRFDMDM_BASE + LRFDMDM_O_DEMCOHR4,                false },
+    { LRFDRFE32_BASE + LRFDRFE32_O_PLLM0,               false },
+    { LRFDRFE32_BASE + LRFDRFE32_O_PLLM1,               false },
+    { LRFD_RFERAM_BASE + RFE_COMMON_RAM_O_RXIF,         true  },
+    { LRFD_RFERAM_BASE + RFE_COMMON_RAM_O_TXIF,         true  },
+    { LRFDMDM_BASE + LRFDMDM_O_DEMMISC0,                false },
+    { LRFDMDM_BASE + LRFDMDM_O_SPARE3,                  false },
+    { LRFDRFE32_BASE + LRFDRFE32_O_DTX1_DTX0,           false },
+    { LRFDRFE32_BASE + LRFDRFE32_O_DTX3_DTX2,           false },
+    { LRFDRFE32_BASE + LRFDRFE32_O_DTX5_DTX4,           false },
+    { LRFDRFE32_BASE + LRFDRFE32_O_DTX7_DTX6,           false },
+    { LRFDRFE32_BASE + LRFDRFE32_O_DTX9_DTX8,           false },
+    { LRFDRFE32_BASE + LRFDRFE32_O_DTX11_DTX10,         false },
+    { LRFDRFE_BASE + LRFDRFE_O_MOD0,                    false },
+};
+
+static void rclGenericStreamCaptureRow(uint32_t *row)
+{
+    for (uint32_t i = 0U; i < RCL_GENERIC_HOP_ROW_WORDS; i++)
+    {
+        row[i] = rclGenericHopRegs[i].halfword ? HWREGH_READ_LRF(rclGenericHopRegs[i].addr)
+                                               : HWREG_READ_LRF(rclGenericHopRegs[i].addr);
+    }
+}
+
+static void rclGenericStreamApplyRow(const uint32_t *row)
+{
+    for (uint32_t i = 0U; i < RCL_GENERIC_HOP_ROW_WORDS; i++)
+    {
+        if (rclGenericHopRegs[i].halfword)
+        {
+            HWREGH_WRITE_LRF(rclGenericHopRegs[i].addr) = (uint16_t) row[i];
+        }
+        else
+        {
+            HWREG_WRITE_LRF(rclGenericHopRegs[i].addr) = row[i];
+        }
+    }
+}
+
+/*
+ *  ======== rclGenericStreamHopSetup ========
+ *
+ *  Take a stream's hop table into the handler state, or none, and start the
+ *  hop counters. Returns false for a table the handler cannot use.
+ */
+static bool rclGenericStreamHopSetup(const uint32_t *hopFrequencies, uint32_t *hopRows, uint8_t numHops, uint8_t packetsPerHop)
+{
+    genericHandlerState.stream.numHops = 0U;
+    genericHandlerState.stream.packetsPerHop = packetsPerHop;
+    genericHandlerState.stream.channel = 0U;
+    genericHandlerState.stream.target = 0U;
+    genericHandlerState.stream.hops = 0U;
+    genericHandlerState.stream.rxOk = 0U;
+    genericHandlerState.stream.rxNok = 0U;
+    genericHandlerState.stream.rows = hopRows;
+
+    if (hopFrequencies == NULL)
+    {
+        return true;
+    }
+    if ((hopRows == NULL) || (numHops < 2U) || (packetsPerHop == 0U))
+    {
+        return false;
+    }
+    genericHandlerState.stream.numHops = numHops;
+    return true;
+}
+
+/*
+ *  ======== rclGenericStreamProgramFrequency ========
+ *
+ *  Program a stream's frequency. With a hop table, every channel in turn,
+ *  the first one last, each row captured once LRF_programFrequency has
+ *  written it, so that the radio is left on the first channel for the
+ *  calibration of the setup; without one, the command's frequency if it has
+ *  one. Runs at setup with the front end idle, which is when its RAM can be
+ *  read back: while the RFE runs, the RAM is its alone and reads return
+ *  something else.
+ */
+static void rclGenericStreamProgramFrequency(uint32_t frequency, const uint32_t *hopFrequencies, bool tx)
+{
+    uint32_t numHops = genericHandlerState.stream.numHops;
+
+    if (numHops != 0U)
+    {
+        for (uint32_t i = numHops; i > 0U; i--)
+        {
+            LRF_programFrequency(hopFrequencies[i - 1U], tx);
+            rclGenericStreamCaptureRow(&genericHandlerState.stream.rows[(i - 1U) * RCL_GENERIC_HOP_ROW_WORDS]);
+        }
+    }
+    else if (frequency != 0U)
+    {
+        LRF_programFrequency(frequency, tx);
+    }
+    else
+    {
+        /* The synthesizer is already on the frequency */
+    }
+}
+
+/*
+ *  ======== rclGenericStreamHop ========
+ *
+ *  The next channel's row into the radio: the stores of the row and nothing
+ *  computed. To be called with the RFE idle.
+ */
+static void rclGenericStreamHop(void)
+{
+    uint32_t channel = (uint32_t) genericHandlerState.stream.channel + 1U;
+
+    if (channel >= genericHandlerState.stream.numHops)
+    {
+        channel = 0U;
+    }
+    genericHandlerState.stream.channel = (uint8_t) channel;
+    rclGenericStreamApplyRow(&genericHandlerState.stream.rows[channel * RCL_GENERIC_HOP_ROW_WORDS]);
+    genericHandlerState.stream.hops++;
 }
 
 /*
@@ -2314,11 +2506,14 @@ RCL_Events RCL_Handler_Generic_TxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
     if (rclEventsIn.setup != 0U)
     {
         uint32_t earliestStartTime;
+        /* With a hop table the command starts on its first channel */
+        uint32_t frequency = (txCmd->hopFrequencies != NULL) ? txCmd->hopFrequencies[0] : txCmd->rfFrequency;
+        bool hopOk = rclGenericStreamHopSetup(txCmd->hopFrequencies, txCmd->hopRows, txCmd->numHops, txCmd->packetsPerHop);
 
         /* Start by enabling refsys */
         earliestStartTime = RCL_Handler_Generic_prepareSynth();
 
-        if ((txCmd->rfFrequency == 0U) && (LRF_Interface_Generic_isFreqSynthLocked() == false))
+        if ((frequency == 0U) && (LRF_Interface_Generic_isFreqSynthLocked() == false))
         {
             /* Synth not to be programmed, but not already locked */
             cmd->status = RCL_CommandStatus_Error_Synth;
@@ -2338,7 +2533,7 @@ RCL_Events RCL_Handler_Generic_TxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
             HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NESB) = PBE_GENERIC_RAM_NESB_NESBMODE_OFF;
 
             /* Program TX power */
-            if (LRF_programTxPower(txCmd->txPower, txCmd->rfFrequency) != TxPowerResult_Ok)
+            if (!hopOk || (LRF_programTxPower(txCmd->txPower, frequency) != TxPowerResult_Ok))
             {
                 cmd->status = RCL_CommandStatus_Error_Param;
                 rclEvents.lastCmdDone = 1U;
@@ -2354,7 +2549,7 @@ RCL_Events RCL_Handler_Generic_TxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
                  * state the packets will use, and the packet OPCFG is only
                  * written once it has locked. Without one the synthesizer
                  * has to be locked already, see the command's description. */
-                genericHandlerState.stream.calibrating = (txCmd->rfFrequency != 0U);
+                genericHandlerState.stream.calibrating = (frequency != 0U);
                 if (genericHandlerState.stream.calibrating)
                 {
                     HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_OPCFG) =
@@ -2368,11 +2563,8 @@ RCL_Events RCL_Handler_Generic_TxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
                 /* Program fixed packet length */
                 HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_MAXLEN) = txCmd->packetLength;
 
-                /* Program frequency word */
-                if (txCmd->rfFrequency != 0U)
-                {
-                    LRF_programFrequency(txCmd->rfFrequency, true);
-                }
+                /* Program the frequency, or every channel of the hop table */
+                rclGenericStreamProgramFrequency(frequency, txCmd->hopFrequencies, true);
 
                 /* Enable radio */
                 if (txCmd->config.enableLRF != 0U)
@@ -2397,6 +2589,13 @@ RCL_Events RCL_Handler_Generic_TxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
                 LRF_Interface_Generic_setNumOfTxPackets(0U);
                 HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NTXTARGET) = 0U;
 
+                /* With a hop table, the PBE raises its interrupt 9 after
+                 * every packetsPerHop-th packet and restarts NTX; the hop
+                 * is done on that interrupt. Without one the word is zero:
+                 * the PBE never clears it. */
+                HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NTXIRQ) =
+                    (genericHandlerState.stream.numHops != 0U) ? txCmd->packetsPerHop : 0U;
+
                 RCL_CommandStatus startTimeStatus = RCL_Scheduler_setStartStopTimeEarliestStart(cmd, earliestStartTime);
                 if (startTimeStatus >= RCL_CommandStatus_Finished)
                 {
@@ -2411,7 +2610,7 @@ RCL_Events RCL_Handler_Generic_TxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
                      * the one operation this command posts, started on the
                      * command's start time as any operation is, and its end
                      * is waited for. */
-                    Log_printf(LogModule_RCL, Log_INFO, "RCL_Handler_Generic_TxStream: Radio up (%u Hz)", txCmd->rfFrequency);
+                    Log_printf(LogModule_RCL, Log_INFO, "RCL_Handler_Generic_TxStream: Radio up (%u Hz)", frequency);
                     LRF_waitForTopsmReady();
                     RCL_Profiling_eventHook(RCL_ProfilingEvent_PreprocStop);
                     if (genericHandlerState.stream.calibrating)
@@ -2457,6 +2656,14 @@ RCL_Events RCL_Handler_Generic_TxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
                 rclGenericTxStreamConfigOp();
                 LRF_disableHwInterrupt(LRF_EventOpDone.value);
                 LRF_clearHwInterrupt(LRF_EventOpDone.value);
+                if (genericHandlerState.stream.numHops != 0U)
+                {
+                    /* The hop interrupt latches in the doorbell whether or
+                     * not it is enabled, so whatever is latched from before
+                     * this command is cleared first */
+                    LRF_clearHwInterrupt(LRF_EventStreamHop.value);
+                    LRF_enableHwInterrupt(LRF_EventStreamHop.value);
+                }
                 rclGenericStreamEnableStopTimeIrqs();
                 rclEvents.cmdStarted = 1U;
             }
@@ -2466,6 +2673,15 @@ RCL_Events RCL_Handler_Generic_TxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
                 rclEvents.lastCmdDone = 1U;
                 RCL_Profiling_eventHook(RCL_ProfilingEvent_PostprocStart);
             }
+        }
+        else if ((lrfEvents.value & LRF_EventStreamHop.value) != 0U)
+        {
+            /* The packetsPerHop-th packet of the dwell has left the air. The
+             * RFE is idle by the time the interrupt is raised (measured:
+             * 3 us after the PA has gone down, 4 us before the operation
+             * done) and the application's next post is a packet gap away,
+             * so the next channel's row goes in here and now. */
+            rclGenericStreamHop();
         }
         else if ((rclEventsIn.gracefulStop != 0U) || (rclEventsIn.hardStop != 0U))
         {
@@ -2479,17 +2695,25 @@ RCL_Events RCL_Handler_Generic_TxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
 
     if (rclEvents.lastCmdDone != 0U)
     {
+        /* Leave no periodic interrupt behind for the next transmit command */
+        HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NTXIRQ) = 0U;
+
         if (txCmd->stats != NULL)
         {
-            uint16_t nTx = (uint16_t) HWREG_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NTX);
+            /* NTX restarts from zero at every hop, so the packets before the
+             * last hop are counted from the hops */
+            uint32_t nTx = (genericHandlerState.stream.hops * genericHandlerState.stream.packetsPerHop) +
+                           HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NTX);
 
             if (txCmd->stats->config.accumulate == 0U)
             {
-                txCmd->stats->nTx = nTx;
+                txCmd->stats->nTx = (uint16_t) nTx;
+                txCmd->stats->nHops = (uint16_t) genericHandlerState.stream.hops;
             }
             else
             {
-                txCmd->stats->nTx += nTx;
+                txCmd->stats->nTx += (uint16_t) nTx;
+                txCmd->stats->nHops += (uint16_t) genericHandlerState.stream.hops;
             }
         }
 
@@ -2504,9 +2728,100 @@ RCL_Events RCL_Handler_Generic_TxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
 }
 
 /*
+ *  ======== rclGenericRxStreamContinue ========
+ *
+ *  An operation of a hopping RX stream has ended; post the next one, or
+ *  return false if the command is to end instead: on a stop, honoured here
+ *  and never written into a running operation, or on a genuine error.
+ *
+ *  The dwell is over when the operation ended on the count hopSync armed,
+ *  or when it timed out with no count armed, or when the timeout leaves no
+ *  packet of the dwell to expect: a timeout is one packet lost, so the
+ *  packets still expected are the target less the count less the lost one.
+ *  Over, the next channel's row goes in and the operation is posted for the
+ *  new dwell with no count; not over, it is posted on the same channel for
+ *  the packets still expected. Either way the PBE and the RFE are idle for
+ *  the writes, which is the only time the RFE's RAM may be written, and the
+ *  post starts the operation at once, with the synthesizer kept on and no
+ *  calibration. The counts restart at zero for every operation so that the
+ *  target arithmetic never wraps; the ended operation's are added to the
+ *  totals here.
+ */
+static bool rclGenericRxStreamContinue(void)
+{
+    uint16_t endCause = LRF_Interface_getCmdEndCause();
+    bool normalEnd = (endCause == LRF_INTERFACE_ENDCAUSE_STAT_ENDOK) ||
+                     (endCause == LRF_INTERFACE_ENDCAUSE_STAT_RXTIMEOUT) ||
+                     (endCause == LRF_INTERFACE_ENDCAUSE_STAT_NOSYNC);
+
+    if (!normalEnd || (genericHandlerState.stream.stopType != RCL_StopType_None))
+    {
+        return false;
+    }
+
+    uint32_t nRxOk = HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NRXOK);
+    uint32_t nRxNok = HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NRXNOK);
+    uint32_t count = nRxOk + nRxNok;
+    uint32_t target = genericHandlerState.stream.target;
+    uint32_t remaining = 0U;
+
+    genericHandlerState.stream.rxOk += nRxOk;
+    genericHandlerState.stream.rxNok += nRxNok;
+    LRF_Interface_Generic_setNumOfRxOkPackets(0U);
+    LRF_Interface_Generic_setNumOfNotRxOkPackets(0U);
+
+    if ((endCause != LRF_INTERFACE_ENDCAUSE_STAT_ENDOK) && (target > count + 1U))
+    {
+        remaining = target - count - 1U;
+    }
+    if (remaining == 0U)
+    {
+        rclGenericStreamHop();
+    }
+    genericHandlerState.stream.target = (uint16_t) remaining;
+    HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NRXTARGET) = (uint16_t) remaining;
+
+    uint16_t opCfg = (uint16_t) HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_OPCFG);
+    opCfg &= (uint16_t) ~(PBE_GENERIC_RAM_OPCFG_FS_NOCAL_M | PBE_GENERIC_RAM_OPCFG_FS_KEEPON_M);
+    opCfg |= PBE_GENERIC_RAM_OPCFG_FS_NOCAL_NOCAL | PBE_GENERIC_RAM_OPCFG_FS_KEEPON_YES | PBE_GENERIC_RAM_OPCFG_START_M;
+    HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_OPCFG) = opCfg;
+    LRF_Interface_Generic_sendOpRx();
+    return true;
+}
+
+/*
+ *  ======== RCL_CmdGenericRxStream_hopSync ========
+ */
+void RCL_CmdGenericRxStream_hopSync(RCL_CmdGenericRxStream *cmd, uint32_t packetCounter)
+{
+    uint32_t packetsPerHop = genericHandlerState.stream.packetsPerHop;
+
+    if ((cmd->common.status != RCL_CommandStatus_Active) || (genericHandlerState.stream.numHops == 0U))
+    {
+        return;
+    }
+
+    uint32_t position = packetCounter % packetsPerHop;
+
+    if (position + 1U < packetsPerHop)
+    {
+        /* The packets of this operation so far, this one included by the
+         * time the entry has been drained, plus the rest of the dwell */
+        uint32_t target = HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NRXOK) +
+                          HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NRXNOK) +
+                          (packetsPerHop - 1U - position);
+
+        genericHandlerState.stream.target = (uint16_t) target;
+        HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NRXTARGET) = (uint16_t) target;
+    }
+}
+
+/*
  *  ======== RCL_Handler_Generic_RxStream ========
  *
- *  One repeated RX operation for the life of the command. The PBE re-arms
+ *  One repeated RX operation for the life of the command, or, with a hop
+ *  table, one per dwell, each posted by the handler when the previous has
+ *  ended. The PBE re-arms
  *  sync search after every packet and commits each entry to the RX FIFO,
  *  and the commit is routed to the LRF DMA trigger for the application's
  *  channel to take the entry out. The command ends only on a stop or on an
@@ -2520,14 +2835,33 @@ RCL_Events RCL_Handler_Generic_RxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
     if (rclEventsIn.setup != 0U)
     {
         uint32_t earliestStartTime;
+        /* With a hop table the command starts on its first channel */
+        uint32_t frequency = (rxCmd->hopFrequencies != NULL) ? rxCmd->hopFrequencies[0] : rxCmd->rfFrequency;
+        bool hopOk = rclGenericStreamHopSetup(rxCmd->hopFrequencies, rxCmd->hopRows, rxCmd->numHops, rxCmd->packetsPerHop);
+        bool hopping = (genericHandlerState.stream.numHops != 0U);
+        /* The timeouts of a hopping command: a packet one period late ends
+         * the operation, and an operation that hears nothing ends 1.25
+         * dwells after its post, see the command's description */
+        uint32_t rxTimeout = rxCmd->packetPeriodTicks;
+        uint32_t firstRxTimeout = ((uint32_t) rxCmd->packetsPerHop * rxTimeout * 5U) / 4U;
+
+        if (hopping && ((rxTimeout == 0U) || (firstRxTimeout > 0xFFFFU)))
+        {
+            hopOk = false;
+        }
 
         /* Start by enabling refsys */
         earliestStartTime = RCL_Handler_Generic_prepareSynth();
 
-        if ((rxCmd->rfFrequency == 0U) && (LRF_Interface_Generic_isFreqSynthLocked() == false))
+        if ((frequency == 0U) && (LRF_Interface_Generic_isFreqSynthLocked() == false))
         {
             /* Synth not to be programmed, but not already locked */
             cmd->status = RCL_CommandStatus_Error_Synth;
+            rclEvents.lastCmdDone = 1U;
+        }
+        else if (!hopOk)
+        {
+            cmd->status = RCL_CommandStatus_Error_Param;
             rclEvents.lastCmdDone = 1U;
         }
         else
@@ -2539,23 +2873,35 @@ RCL_Events RCL_Handler_Generic_RxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
             /* Program the sync word */
             LRF_Interface_Generic_programSyncWordA(rxCmd->syncWord);
 
-            /* A repeated RX operation with no timeouts: the PBE goes back to
-             * sync search after each packet and receives whatever arrives,
-             * for as long as the command runs. OPCFG.TXFCMD is left at NONE
-             * by this, so the PBE issues no TX FIFO command at the end of a
-             * packet.
+            /* A repeated RX operation: the PBE goes back to sync search
+             * after each packet and receives whatever arrives, for as long
+             * as the command runs. OPCFG.TXFCMD is left at NONE by this, so
+             * the PBE issues no TX FIFO command at the end of a packet.
              *
-             * The operation always turns the synthesizer off when it ends;
-             * config.fsOff only decides below whether refsys and the power
-             * constraints are kept for a following command. There is only
-             * one operation, so nothing is kept on for; and a stop in sync
-             * search relies on it: the PBE's end routine waits for the RFE
-             * to report, the RFE reports its RX command only once told to
-             * stop, and it is told to stop only when the synthesizer is not
-             * kept on. With it kept on, a stop that lands in sync search
-             * leaves the PBE waiting forever; measured. */
-            LRF_Interface_Generic_configOpRx(1U, rxCmd->rfFrequency, 1U, rxCmd->packetLength);
+             * Without a hop table there is one operation with no timeouts,
+             * and it turns the synthesizer off when it ends; config.fsOff
+             * only decides below whether refsys and the power constraints
+             * are kept for a following command. Nothing is kept on for, and
+             * a stop in sync search relies on it: the PBE's end routine
+             * waits for the RFE to report, the RFE reports its RX command
+             * only once told to stop, and it is told to stop only when the
+             * synthesizer is not kept on. With it kept on, a stop that
+             * lands in sync search leaves the PBE waiting forever; measured.
+             *
+             * With a hop table there is an operation per dwell and the
+             * synthesizer is kept on from the first, so that the later
+             * ones, posted without a calibration, find it running: the RFE
+             * does not start a synthesizer that has been turned off for an
+             * operation without a calibration. A stop is therefore never
+             * written into a running operation of a hopping command, see
+             * below; the timeouts bound every operation instead. */
+            LRF_Interface_Generic_configOpRx(hopping ? 0U : 1U, frequency, 1U, rxCmd->packetLength);
             HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_SEQSTAT0) = PBE_GENERIC_RAM_SEQSTAT0_STOPAUTO_NEVER;
+            if (hopping)
+            {
+                HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_RXTIMEOUT) = (uint16_t) rxTimeout;
+                HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_FIRSTRXTIMEOUT) = (uint16_t) firstRxTimeout;
+            }
 
             /* Nothing is appended to an entry. The RF settings append status,
              * RSSI and timestamp bytes; with them off an entry is the length
@@ -2584,11 +2930,8 @@ RCL_Events RCL_Handler_Generic_RxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
             LRF_Interface_Generic_setNumOfNotRxOkPackets(0U);
             HWREGH_WRITE_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NRXTARGET) = 0U;
 
-            /* Program frequency word */
-            if (rxCmd->rfFrequency != 0U)
-            {
-                LRF_programFrequency(rxCmd->rfFrequency, false);
-            }
+            /* Program the frequency, or every channel of the hop table */
+            rclGenericStreamProgramFrequency(frequency, rxCmd->hopFrequencies, false);
 
             /* Enable radio */
             if (rxCmd->config.enableLRF != 0U)
@@ -2638,10 +2981,21 @@ RCL_Events RCL_Handler_Generic_RxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
             else
             {
                 /* Only an operation error is of interest; the CPU is idle
-                 * between packets. */
-                LRF_enableHwInterrupt(LRF_EventOpError.value);
+                 * between packets. With a hop table the operation done is
+                 * too: it comes once per dwell and is where the hop is
+                 * made. A stop of a hopping command is answered at that
+                 * end as well, and RCL is told to write none to the PBE. */
+                if (hopping)
+                {
+                    LRF_enableHwInterrupt(LRF_EventOpDone.value | LRF_EventOpError.value);
+                    rclSchedulerState.handlerStops = 1U;
+                }
+                else
+                {
+                    LRF_enableHwInterrupt(LRF_EventOpError.value);
+                }
 
-                Log_printf(LogModule_RCL, Log_INFO, "RCL_Handler_Generic_RxStream: Starting RX (%u Hz)", rxCmd->rfFrequency);
+                Log_printf(LogModule_RCL, Log_INFO, "RCL_Handler_Generic_RxStream: Starting RX (%u Hz)", frequency);
                 LRF_waitForTopsmReady();
                 RCL_Profiling_eventHook(RCL_ProfilingEvent_PreprocStop);
                 LRF_Interface_Generic_sendOpRx();
@@ -2659,13 +3013,29 @@ RCL_Events RCL_Handler_Generic_RxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
 
         if ((lrfEvents.opDone != 0U) || (lrfEvents.opError != 0U))
         {
-            cmd->status = rclGenericStreamEndStatus(lrfEvents);
-            rclEvents.lastCmdDone = 1U;
-            RCL_Profiling_eventHook(RCL_ProfilingEvent_PostprocStart);
+            if ((genericHandlerState.stream.numHops != 0U) && rclGenericRxStreamContinue())
+            {
+                /* The next operation of the hopping command is posted */
+            }
+            else
+            {
+                cmd->status = rclGenericStreamEndStatus(lrfEvents);
+                rclEvents.lastCmdDone = 1U;
+                RCL_Profiling_eventHook(RCL_ProfilingEvent_PostprocStart);
+            }
         }
         else if ((rclEventsIn.gracefulStop != 0U) || (rclEventsIn.hardStop != 0U))
         {
-            rclGenericStreamRequestStop(rclEventsIn);
+            if (genericHandlerState.stream.numHops != 0U)
+            {
+                /* Honoured when the operation ends: not posting again is
+                 * what ends the command */
+                rclGenericStreamNoteStop(rclEventsIn);
+            }
+            else
+            {
+                rclGenericStreamRequestStop(rclEventsIn);
+            }
         }
         else
         {
@@ -2688,18 +3058,21 @@ RCL_Events RCL_Handler_Generic_RxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
 
         if (rxCmd->stats != NULL)
         {
-            uint16_t nRxOk = HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NRXOK);
-            uint16_t nRxNok = HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NRXNOK);
+            /* The last operation's counts on top of the ended ones' */
+            uint32_t nRxOk = genericHandlerState.stream.rxOk + HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NRXOK);
+            uint32_t nRxNok = genericHandlerState.stream.rxNok + HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_NRXNOK);
 
             if (rxCmd->stats->config.accumulate == 0U)
             {
-                rxCmd->stats->nRxOk = nRxOk;
-                rxCmd->stats->nRxNok = nRxNok;
+                rxCmd->stats->nRxOk = (uint16_t) nRxOk;
+                rxCmd->stats->nRxNok = (uint16_t) nRxNok;
+                rxCmd->stats->nHops = (uint16_t) genericHandlerState.stream.hops;
             }
             else
             {
-                rxCmd->stats->nRxOk += nRxOk;
-                rxCmd->stats->nRxNok += nRxNok;
+                rxCmd->stats->nRxOk += (uint16_t) nRxOk;
+                rxCmd->stats->nRxNok += (uint16_t) nRxNok;
+                rxCmd->stats->nHops += (uint16_t) genericHandlerState.stream.hops;
             }
         }
 
@@ -2769,6 +3142,12 @@ RCL_Events RCL_Handler_Generic_RxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
     }
 
     return rclEvents;
+}
+
+void RCL_CmdGenericRxStream_hopSync(RCL_CmdGenericRxStream *cmd, uint32_t packetCounter)
+{
+    (void) cmd;
+    (void) packetCounter;
 }
 
 #endif /* DeviceFamily_PARENT == DeviceFamily_PARENT_CC27XX */

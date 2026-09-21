@@ -92,6 +92,7 @@ typedef struct RCL_SchedulerState_s {
     RCL_Command  *currCmd;
     RCL_Command  *stopCmd;
     uint32_t nextWantsStop                      : 1;
+    uint32_t handlerStops                       : 1; /*!< The current command's handler answers stop requests itself: RCL posts the stop events and writes no stop to the PBE. Set by the handler at setup, cleared with the rest when the next command is adopted */
     RCL_SchedulerStopTimeState stopTimeState    : 2;
     RCL_SchedulerStopReason descheduleReason    : 2;
     RCL_Events postedRclEvents; /* Events to be handled by the command handler */
