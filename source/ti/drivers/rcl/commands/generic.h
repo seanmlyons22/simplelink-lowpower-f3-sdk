@@ -709,10 +709,11 @@ struct RCL_STATS_GENERIC_RX_BURST_t {
  *  handler moves to the next channel and writes its row: the stores of the
  *  row, nothing computed. The RFE is idle when the interrupt is raised
  *  (measured: 3 us after the PA has gone down and 4 us before the operation
- *  done), and the row is written only if it still is; a hop that finds the
- *  RFE running, because the application posted the next operation first or
- *  the RCL's interrupt was held off until it did, skips the row and is
- *  counted in %stats.nHopsMissed, and the channel moves on regardless, so a
+ *  done, its report of the operation in the PBE's RFEMSGBOX), and the row
+ *  is written only if it still is; a hop that finds the RFE running,
+ *  because the application posted the next operation first or the RCL's
+ *  interrupt was held off until it did, skips the row and is counted in
+ *  %stats.nHopsMissed (measured: one held hop, one miss), and the channel moves on regardless, so a
  *  late hop costs one dwell on the wrong channel and not the front end. The
  *  application owes the hop the gap: the first operation of a dwell is
  *  posted after the previous dwell's last operation has ended, as any
@@ -964,7 +965,7 @@ struct RCL_STATS_GENERIC_TX_STREAM_t {
     } config;                    /*!< Configuration provided to RCL */
     uint16_t nTx;                /*!< Number of packets transmitted */
     uint16_t nHops;              /*!< Number of hops made, with a hop table, the missed ones included */
-    uint16_t nHopsMissed;        /*!< Of those, hops whose row was not written because the RFE was not idle */
+    uint16_t nHopsMissed;        /*!< Of those, hops whose row was not written because the RFE was busy with the next operation */
 };
 
 #define RCL_StatsGenericTxStream_Default() \

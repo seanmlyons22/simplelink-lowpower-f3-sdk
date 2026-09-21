@@ -2488,7 +2488,12 @@ static void rclGenericStreamProgramFrequency(uint32_t frequency, const uint32_t 
  *  radio: the stores of the row and nothing computed. The RFE's RAM is its
  *  alone while it runs, so a hop that finds it running skips the row and
  *  counts a miss; the channel moves on regardless, so that the schedule is
- *  kept and the miss costs the dwell and not the front end.
+ *  kept and the miss costs the dwell and not the front end. Idle is read
+ *  from LRFDPBE.RFEMSGBOX, the RFE's report of its last command: zero from
+ *  the moment the PBE gives the RFE a command until the RFE reports it
+ *  done, non-zero from then on (measured: 0 while a packet is on the air,
+ *  1 at the hop interrupt and at the operation done). LRFDRFE32.RFSTATE
+ *  reads IDLE throughout with this RFE image and tells nothing.
  */
 static void rclGenericStreamHop(void)
 {
@@ -2500,7 +2505,7 @@ static void rclGenericStreamHop(void)
     }
     genericHandlerState.stream.channel = (uint8_t) channel;
     genericHandlerState.stream.hops++;
-    if ((HWREG_READ_LRF(LRFDRFE32_BASE + LRFDRFE32_O_RFSTATE) & LRFDRFE32_RFSTATE_VAL_M) == LRFDRFE32_RFSTATE_VAL_IDLE)
+    if (HWREG_READ_LRF(LRFDPBE_BASE + LRFDPBE_O_RFEMSGBOX) != 0U)
     {
         rclGenericStreamApplyRow(&genericHandlerState.stream.rows[channel * RCL_GENERIC_HOP_ROW_WORDS]);
     }
@@ -2902,6 +2907,13 @@ RCL_Events RCL_Handler_Generic_RxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
         uint32_t frequency = (rxCmd->hopFrequencies != NULL) ? rxCmd->hopFrequencies[0] : rxCmd->rfFrequency;
         bool hopOk = rclGenericStreamHopSetup(rxCmd->hopFrequencies, rxCmd->hopRows, rxCmd->numHops, rxCmd->packetsPerHop);
         bool hopping = (genericHandlerState.stream.numHops != 0U);
+
+        /* FIFOCFG and EXTRABYTES as the settings left them, taken before
+         * anything can fail: the end of the command puts them back however
+         * it ended, and a command refused at setup must put back what it
+         * found, not what an earlier one kept. */
+        genericHandlerState.stream.fifoCfg = (uint16_t) HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_FIFOCFG);
+        genericHandlerState.stream.extraBytes = (uint16_t) HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_EXTRABYTES);
         /* The timeouts of a hopping command: a packet one period late ends
          * the operation, and an operation that hears nothing ends 1.25
          * dwells after its post, see the command's description */
@@ -2980,13 +2992,12 @@ RCL_Events RCL_Handler_Generic_RxStream(RCL_Command *cmd, LRF_Events lrfEvents, 
             /* Nothing is appended to an entry. The RF settings append status,
              * RSSI and timestamp bytes; with them off an entry is the length
              * field, the pad and the payload, which is what the application
-             * arms one transfer for. The settings' values are kept and put
-             * back when the command ends: they are only reloaded when the
-             * radio is set up again, and the next RX command on the same
-             * configuration counts on them. */
-            uint16_t fifoCfg = (uint16_t) HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_FIFOCFG);
-            genericHandlerState.stream.fifoCfg = fifoCfg;
-            genericHandlerState.stream.extraBytes = (uint16_t) HWREGH_READ_LRF(LRFD_BUFRAM_BASE + PBE_GENERIC_RAM_O_EXTRABYTES);
+             * arms one transfer for. The settings' values, kept above, are
+             * put back when the command ends: they are only reloaded when
+             * the radio is set up again, and the next RX command on the
+             * same configuration counts on them. */
+            uint16_t fifoCfg = genericHandlerState.stream.fifoCfg;
+
             fifoCfg &= (uint16_t) ~(PBE_GENERIC_RAM_FIFOCFG_APPENDCRC_M |
                                     PBE_GENERIC_RAM_FIFOCFG_APPENDSTATUS_M |
                                     PBE_GENERIC_RAM_FIFOCFG_APPENDLQI_M |
