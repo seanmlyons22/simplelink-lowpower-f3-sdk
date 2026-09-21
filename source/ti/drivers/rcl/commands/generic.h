@@ -697,26 +697,40 @@ struct RCL_STATS_GENERIC_RX_BURST_t {
  *  dividers, the two PLL words, the demodulator resampler fraction and its
  *  shadow, the mixer word and its copy, the six TX filter tap words and the
  *  shaping gain. The rows are values of this device with the HFXT
- *  compensation of the moment, captured at setup, never constants. The
- *  programming ends on the first channel and the calibration of the setup
- *  runs there; %rfFrequency is not used. The PBE is then told, through
- *  NTXIRQ, a word of the patched generic image, to raise an interrupt after
- *  every %packetsPerHop-th packet, and on that interrupt the handler writes
- *  the next channel's row: the stores of the row, nothing computed, on a
- *  front end that is already idle (measured: the interrupt comes 3 us after
- *  the PA has gone down and 4 us before the operation done) and long before
- *  the application's next post. The synthesizer stays on and locked through
- *  the hop, and the first packet on the new channel goes out like any other.
- *  When the application counts its packets from 0 at the first one it posts,
- *  the channel of packet n is (n / packetsPerHop) mod numHops, which is what
- *  a hopping RX stream counts on. NTX restarts from zero at every hop, so
- *  %stats.nTx is recomputed from the hops, and %stats.nHops counts the rows
- *  applied. Stops are as without hopping. NTXIRQ is written back to zero
- *  when the command ends. It is zero unless a stream sets it, every transmit
- *  command zeroes it at setup, and NTXTARGET can only end a burst if it is
- *  smaller than NTXIRQ, so the burst commands are unaffected by it. A table
- *  without rows, with fewer than two channels or with %packetsPerHop zero
- *  ends the command with RCL_CommandStatus_Error_Param.
+ *  compensation of the moment, captured at setup, never constants; if the
+ *  compensation changes while the command runs the rows are stale, and the
+ *  command is to be submitted again to capture them anew. The setup grows
+ *  with %numHops, one LRF_programFrequency() and a row read per channel.
+ *  The programming ends on the first channel, the calibration of the setup
+ *  runs there, and the TX power is programmed for that channel; the table
+ *  is to stay within one band. %rfFrequency is not used. The PBE is then
+ *  told, through NTXIRQ, a word of the patched generic image, to raise an
+ *  interrupt after every %packetsPerHop-th packet, and on that interrupt the
+ *  handler moves to the next channel and writes its row: the stores of the
+ *  row, nothing computed. The RFE is idle when the interrupt is raised
+ *  (measured: 3 us after the PA has gone down and 4 us before the operation
+ *  done), and the row is written only if it still is; a hop that finds the
+ *  RFE running, because the application posted the next operation first or
+ *  the RCL's interrupt was held off until it did, skips the row and is
+ *  counted in %stats.nHopsMissed, and the channel moves on regardless, so a
+ *  late hop costs one dwell on the wrong channel and not the front end. The
+ *  application owes the hop the gap: the first operation of a dwell is
+ *  posted after the previous dwell's last operation has ended, as any
+ *  operation is, and the RCL's interrupt is not held off across that gap.
+ *  The application may see the hop itself by subscribing to doorbell bit 9,
+ *  %LRF_EventTxCtrl, in its lrfCallbackMask. The synthesizer stays on and
+ *  locked through the hop, and the first packet on the new channel goes
+ *  out like any other. When the application counts its packets from 0 at
+ *  the first one it posts, the channel of packet n is (n / packetsPerHop)
+ *  mod numHops, which is what a hopping RX stream counts on. NTX restarts
+ *  from zero at every hop, so %stats.nTx is recomputed from the hops, and
+ *  %stats.nHops counts the hops made. Stops are as without hopping. NTXIRQ
+ *  is written back to zero when the command ends. It is zero unless a
+ *  stream sets it, every transmit command zeroes it at setup, and NTXTARGET
+ *  can only end a burst if it is smaller than NTXIRQ, so the burst commands
+ *  are unaffected by it. A table without rows, with fewer than two
+ *  channels, with a zero frequency in it or with %packetsPerHop zero ends
+ *  the command with RCL_CommandStatus_Error_Param.
  *
  *  @note CC27XX only. Other devices end the command with RCL_CommandStatus_Error_Param.
  */
@@ -824,18 +838,22 @@ struct RCL_CMD_GENERIC_TX_STREAM_t {
  *  application calls from its per-packet callback with the transmitter's
  *  packet counter; that is what aligns the receiver's dwells with the
  *  transmitter's. Without it an operation ends only on the timeouts, which
- *  %packetPeriodTicks sets: a packet one period late ends the operation
- *  (RXTIMEOUT), so a lost packet costs one sync search and, if it was the
- *  dwell's last, nothing more; and an operation that hears nothing ends 1.25
- *  dwells after its post (FIRSTRXTIMEOUT), so a receiver that has not found
- *  the transmitter cycles the channels at 1.25 dwells per channel against
- *  the transmitter's 1.0, overlaps it within a few dwells, and is aligned
- *  exactly by the first packet's hopSync. NRXOK and NRXNOK restart at every
+ *  %packetPeriodTicks, the transmitter's packet period in 0.25 us ticks,
+ *  sets: RXTIMEOUT is one period, so a packet one period late ends the
+ *  operation and a lost packet costs one sync search and, if it was the
+ *  dwell's last, nothing more; FIRSTRXTIMEOUT is 1.25 times %packetsPerHop
+ *  periods, so an operation that hears nothing ends 1.25 dwells after its
+ *  post and a receiver that has not found the transmitter cycles the
+ *  channels at 1.25 dwells per channel against the transmitter's 1.0,
+ *  overlaps it within a few dwells, and is aligned exactly by the first
+ *  packet's hopSync. The rows are captured, and go stale, as on the TX
+ *  stream; %rfFrequency is not used. NRXOK and NRXNOK restart at every
  *  operation and the handler accumulates them, so the target arithmetic
  *  never wraps; %stats.nRxOk and %stats.nRxNok report the totals and
  *  %stats.nHops the rows applied. A table without rows, with fewer than two
- *  channels, with %packetsPerHop or %packetPeriodTicks zero, or with a dwell
- *  longer than the 16-bit timeout can hold ends the command with
+ *  channels or a zero frequency in it, with %packetsPerHop or
+ *  %packetPeriodTicks zero, with a dwell timeout under 128 us or over what
+ *  16 bits hold, or with a stop time in %common.timing ends the command with
  *  RCL_CommandStatus_Error_Param.
  *
  *  A stop of a hopping command is never written into the running operation:
@@ -849,8 +867,13 @@ struct RCL_CMD_GENERIC_TX_STREAM_t {
  *  post. The operation in flight ends, the handler does not post again and
  *  the command ends with the stop's status, within a packet period under
  *  traffic (measured: 100 to 200 us). A hard stop is therefore no sooner
- *  than a graceful one on a hopping command, and a stop time behaves the same
- *  way. The synthesizer is still on when the command ends: with
+ *  than a graceful one on a hopping command. Only the stop API is answered
+ *  this way: a stop time, the command's own or a scheduler's for a queued
+ *  successor, reaches the PBE through the SysTimer compares and would be
+ *  written into the running operation, so the command refuses stop times
+ *  at setup and a command queued behind it must use
+ *  RCL_ConflictPolicy_NeverInterrupt. The synthesizer is still on when the
+ *  command ends: with
  *  %config.disableLRF set LRF_disable() takes it down with the front end,
  *  and with it cleared it is left running, as after an FS command, for a
  *  following command that programs no frequency.
@@ -903,10 +926,17 @@ struct RCL_CMD_GENERIC_RX_STREAM_t {
  *  per-packet callback for every packet accepted, with the packet counter
  *  the transmitter put in it. The transmitter counts from 0 at the first
  *  packet it sends on the table's first channel, so counter / packetsPerHop
- *  is the dwell and counter mod packetsPerHop the position in it. The call
- *  arms NRXTARGET so that the running operation ends with the dwell's last
- *  packet: the packets counted in this operation so far, CRC failures
- *  included, plus those still to come. For the last packet itself it writes
+ *  is the dwell and counter mod packetsPerHop the position in it; only the
+ *  position is used, the dwell being implied by the channel the packet was
+ *  heard on. The call arms NRXTARGET so that the running operation ends
+ *  with the dwell's last packet: the packets counted in this operation so
+ *  far, CRC failures included, plus those still to come. The PBE ends the
+ *  operation at a packet's end when NRXOK + NRXNOK has reached NRXTARGET
+ *  (compared as not less than, PBE bank 0 at 0x27b). That the count
+ *  includes the packet in hand by the time the callback runs rests on
+ *  measurement, not on a reading of the image's order of count and commit:
+ *  the target so armed landed the operation on the dwell's last packet in
+ *  59 999 of 59 999 hops. For the last packet itself it writes
  *  nothing: the operation is ending on the count an earlier call armed, or,
  *  when no earlier packet of the dwell was heard, on the timeout one period
  *  later. The receiver's channel is the one the packet was heard on, so a
@@ -933,7 +963,8 @@ struct RCL_STATS_GENERIC_TX_STREAM_t {
         uint8_t reserved : 7;    /*!< Reserved, set to 0 */
     } config;                    /*!< Configuration provided to RCL */
     uint16_t nTx;                /*!< Number of packets transmitted */
-    uint16_t nHops;              /*!< Number of hops applied, with a hop table */
+    uint16_t nHops;              /*!< Number of hops made, with a hop table, the missed ones included */
+    uint16_t nHopsMissed;        /*!< Of those, hops whose row was not written because the RFE was not idle */
 };
 
 #define RCL_StatsGenericTxStream_Default() \
@@ -941,6 +972,7 @@ struct RCL_STATS_GENERIC_TX_STREAM_t {
     .config = { 0 },                       \
     .nTx = 0,                              \
     .nHops = 0,                            \
+    .nHopsMissed = 0,                      \
 }
 #define RCL_StatsGenericTxStream_DefaultRuntime() (RCL_StatsGenericTxStream) RCL_StatsGenericTxStream_Default()
 

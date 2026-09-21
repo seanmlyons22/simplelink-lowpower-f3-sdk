@@ -619,7 +619,10 @@ __attribute__((weak)) RCL_CommandStatus RCL_stopNextCmdHook(RCL_Command *cmd, RC
             as command stop time must have been passed */
             if (rclSchedulerState.hardStopInfo.apiStopEnabled == 0U)
             {
-                LRF_sendHardStop();
+                if (rclSchedulerState.handlerStops == 0U)
+                {
+                    LRF_sendHardStop();
+                }
                 rclSchedulerState.hardStopInfo.apiStopEnabled = 1;
             }
             (void) RCL_Scheduler_postEvent(rclSchedulerState.currCmd, RCL_EventHardStop);
@@ -635,7 +638,10 @@ __attribute__((weak)) RCL_CommandStatus RCL_stopNextCmdHook(RCL_Command *cmd, RC
                 if (rclSchedulerState.gracefulStopInfo.apiStopEnabled == 0U &&
                     rclSchedulerState.hardStopInfo.apiStopEnabled == 0U)
                 {
-                    LRF_sendGracefulStop();
+                    if (rclSchedulerState.handlerStops == 0U)
+                    {
+                        LRF_sendGracefulStop();
+                    }
                     rclSchedulerState.gracefulStopInfo.apiStopEnabled = 1;
                 }
                 (void) RCL_Scheduler_postEvent(rclSchedulerState.currCmd, RCL_EventGracefulStop);
